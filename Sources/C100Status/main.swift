@@ -1,0 +1,686 @@
+import Darwin
+import Foundation
+
+enum CLIError: Error, CustomStringConvertible {
+    case usage(String)
+    case runtime(String)
+
+    var description: String {
+        switch self {
+        case .usage(let message), .runtime(let message): message
+        }
+    }
+}
+
+struct Options {
+    var dryRun = false
+    var locationID: Int?
+    var socketPath = RuntimePaths.socket()
+    var logPath = RuntimePaths.log()
+    var grabberSocketPath = RuntimePaths.grabberSocket()
+    var ownerUID: uid_t?
+    var ownerGID: gid_t?
+}
+
+enum C100StatusCLI {
+    static func run(_ arguments: [String]) throws {
+        guard let command = arguments.first else {
+            printHelp()
+            return
+        }
+        let (positionals, options) = try parseOptions(Array(arguments.dropFirst()))
+        switch command {
+        case "run":
+            let daemon = try StatusDaemon(
+                socketPath: options.socketPath,
+                logURL: URL(fileURLWithPath: options.logPath),
+                locationID: options.locationID,
+                grabberSocketPath: options.grabberSocketPath,
+                dryRun: options.dryRun
+            )
+            try daemon.run()
+        case "grabber-service":
+            guard let ownerUID = options.ownerUID,
+                  let ownerGID = options.ownerGID,
+                  let locationID = options.locationID else {
+                throw CLIError.usage("grabber-service requires --owner-uid, --owner-gid, and --location")
+            }
+            let service = PrivilegedGrabberService(
+                socketPath: options.grabberSocketPath,
+                ownerUID: ownerUID,
+                ownerGID: ownerGID,
+                allowedLocationID: locationID
+            )
+            try service.run()
+        case "install-helper":
+            guard let locationID = options.locationID else {
+                throw CLIError.usage("install-helper requires --location")
+            }
+            let ownerUID = options.ownerUID ?? RuntimePaths.ownerUID
+            let ownerGID = options.ownerGID ?? RuntimePaths.ownerGID
+            try HelperInstaller.install(
+                sourceExecutable: HelperInstaller.currentExecutableURL(),
+                ownerUID: ownerUID,
+                ownerGID: ownerGID,
+                locationID: locationID
+            )
+            print("helper=installed label=\(HelperInstaller.label) owner_uid=\(ownerUID) location=0x\(hex(locationID, width: 6))")
+            print("c100-status run can now start without sudo")
+        case "uninstall-helper":
+            try HelperInstaller.uninstall()
+            print("helper=uninstalled label=\(HelperInstaller.label)")
+        case "grabber-status":
+            let response = try UnixSocketServer.send(
+                GrabberRequest.ping,
+                path: options.grabberSocketPath,
+                response: GrabberResponse.self
+            )
+            try requireGrabberSuccess(response)
+            print("\(response.message) capturing=\(response.capturing)")
+        case "list":
+            let descriptors = try C100Connection.descriptors()
+            guard !descriptors.isEmpty else {
+                throw CLIError.runtime("Keychron C100 8K vendor HID was not found")
+            }
+            for descriptor in descriptors {
+                print("\(descriptor.product) vid=0x\(hex(descriptor.vendorID, width: 4)) pid=0x\(hex(descriptor.productID, width: 4)) location=0x\(hex(descriptor.locationID, width: 6)) registry=0x\(String(descriptor.registryEntryID, radix: 16))")
+            }
+        case "catalog":
+            let layout = try CodexCatalog.layout()
+            for (project, row) in layout.projectRows.sorted(by: { $0.value < $1.value }) {
+                print("row=\(row) project=\(project)")
+                for placement in layout.placements.filter({ $0.row == row }) {
+                    let session = placement.session
+                    print("  key=\(placement.keyIndex) col=\(placement.column) session=\(session.sessionID) cwd=\(session.cwd)")
+                }
+            }
+        case "request-input-access":
+            let before = C100InputCapture.accessDescription
+            let granted = C100InputCapture.requestAccess()
+            let after = C100InputCapture.accessDescription
+            print("input-monitoring before=\(before) request-returned=\(granted) after=\(after)")
+            if after != "granted" {
+                print("Enable c100-status (or its launching terminal app) in System Settings > Privacy & Security > Input Monitoring, then restart run.")
+            }
+        case "watch-input":
+            let seconds = positionals.first.flatMap(Double.init) ?? 20
+            guard seconds > 0 && seconds <= 300 else {
+                throw CLIError.usage("watch-input seconds must be between 1 and 300")
+            }
+            let connection = try C100Connection.connect(locationID: options.locationID)
+            print("watching C100 vendor HID reports for \(seconds) seconds; press C100 keys now")
+            connection.watchReports(seconds: seconds)
+        case "watch-matrix":
+            let seconds = positionals.first.flatMap(Double.init) ?? 20
+            guard seconds > 0 && seconds <= 300 else {
+                throw CLIError.usage("watch-matrix seconds must be between 1 and 300")
+            }
+            let connection = try C100Connection.connect(locationID: options.locationID)
+            print("polling C100 10x10 matrix for \(seconds) seconds; press C100 keys now")
+            try connection.watchMatrix(seconds: seconds)
+        case "status":
+            guard let value = positionals.first, let status = AgentStatus(rawValue: value) else {
+                throw CLIError.usage("status requires one of: \(AgentStatus.allCases.map(\.rawValue).joined(separator: ", "))")
+            }
+            let response = try send(.manual(status), options: options)
+            try requireSuccess(response)
+            print("status=\(response.status?.rawValue ?? status.rawValue) daemon=accepted")
+        case "key":
+            guard positionals.count == 2,
+                  let index = parseInteger(positionals[0]),
+                  (0..<100).contains(index),
+                  let color = LEDColorName(rawValue: positionals[1]) else {
+                throw CLIError.usage(
+                    "key requires an index from 0 to 99 and one of: \(LEDColorName.allCases.map(\.rawValue).joined(separator: ", "))"
+                )
+            }
+            let response = try send(.key(index: index, color: color.color), options: options)
+            try requireSuccess(response)
+            print("key=\(index) color=\(color.rawValue) daemon=accepted")
+        case "apply":
+            guard let value = positionals.first, let status = AgentStatus(rawValue: value) else {
+                throw CLIError.usage("apply requires one of: \(AgentStatus.allCases.map(\.rawValue).joined(separator: ", "))")
+            }
+            if options.dryRun {
+                let color = status.color
+                print("status=\(status.rawValue) hsv=\(color.hue),\(color.saturation),\(color.value) device-write=skipped")
+            } else {
+                try OperationLock().withLock {
+                    let connection = try C100Connection.connect(locationID: options.locationID)
+                    try connection.apply(status: status)
+                }
+                print("status=\(status.rawValue) applied-directly persistence=volatile")
+            }
+        case "hook":
+            try runHook(options: options)
+        case "clear":
+            let response = try send(.clear, options: options)
+            try requireSuccess(response)
+            print("state=cleared status=idle daemon=accepted")
+        case "ping":
+            let response = try send(.ping, options: options)
+            try requireSuccess(response)
+            print(response.message)
+        case "logs":
+            let data = try Data(contentsOf: URL(fileURLWithPath: options.logPath))
+            FileHandle.standardOutput.write(data)
+        case "log-path":
+            print(options.logPath)
+        case "self-test":
+            try selfTest()
+        case "help", "--help", "-h":
+            printHelp()
+        default:
+            throw CLIError.usage("Unknown command: \(command)")
+        }
+    }
+
+    private static func runHook(options: Options) throws {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        let input = try JSONDecoder().decode(HookInput.self, from: data)
+        if options.dryRun {
+            if input.endsSession {
+                writeDiagnostic("event=SessionEnd session=\(input.sessionID) daemon-send=skipped")
+            } else if let status = input.status {
+                writeDiagnostic("event=\(input.hookEventName) status=\(status.rawValue) daemon-send=skipped")
+            }
+            print("{}")
+            return
+        }
+
+        do {
+            let response = try send(.hook(input), options: options)
+            if !response.ok {
+                writeDiagnostic("daemon rejected hook: \(response.message)")
+            }
+        } catch {
+            // LED status must never block or alter the Codex agentic loop.
+            writeDiagnostic("daemon unavailable; hook ignored: \(error)")
+        }
+        print("{}")
+    }
+
+    private static func send(_ request: DaemonRequest, options: Options) throws -> DaemonResponse {
+        try UnixSocketServer.send(request, path: options.socketPath, response: DaemonResponse.self)
+    }
+
+    private static func requireSuccess(_ response: DaemonResponse) throws {
+        guard response.ok else { throw CLIError.runtime(response.message) }
+    }
+
+    private static func requireGrabberSuccess(_ response: GrabberResponse) throws {
+        guard response.ok else { throw CLIError.runtime(response.message) }
+    }
+
+    private static func parseOptions(_ arguments: [String]) throws -> ([String], Options) {
+        var options = Options()
+        var positionals: [String] = []
+        var index = 0
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--dry-run":
+                options.dryRun = true
+            case "--location":
+                index += 1
+                guard index < arguments.count, let location = parseInteger(arguments[index]) else {
+                    throw CLIError.usage("--location requires a decimal or 0x-prefixed integer")
+                }
+                options.locationID = location
+            case "--socket":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.usage("--socket requires a path")
+                }
+                options.socketPath = arguments[index]
+            case "--log-file":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.usage("--log-file requires a path")
+                }
+                options.logPath = arguments[index]
+            case "--grabber-socket":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.usage("--grabber-socket requires a path")
+                }
+                options.grabberSocketPath = arguments[index]
+            case "--owner-uid":
+                index += 1
+                guard index < arguments.count, let value = UInt32(arguments[index]) else {
+                    throw CLIError.usage("--owner-uid requires a numeric uid")
+                }
+                options.ownerUID = uid_t(value)
+            case "--owner-gid":
+                index += 1
+                guard index < arguments.count, let value = UInt32(arguments[index]) else {
+                    throw CLIError.usage("--owner-gid requires a numeric gid")
+                }
+                options.ownerGID = gid_t(value)
+            default:
+                positionals.append(arguments[index])
+            }
+            index += 1
+        }
+        return (positionals, options)
+    }
+
+    private static func parseInteger(_ value: String) -> Int? {
+        if value.lowercased().hasPrefix("0x") {
+            return Int(value.dropFirst(2), radix: 16)
+        }
+        return Int(value)
+    }
+
+    private static func selfTest() throws {
+        let decoder = JSONDecoder()
+        let samples: [(String, AgentStatus)] = [
+            ("SessionStart", .idle),
+            ("UserPromptSubmit", .working),
+            ("PermissionRequest", .approval),
+            ("PreToolUse", .working),
+            ("PostToolUse", .working),
+            ("Stop", .done),
+            ("SessionEnd", .idle),
+        ]
+        for (event, expected) in samples {
+            let json = #"{"session_id":"self-test","cwd":"/tmp/example/../project","hook_event_name":"EVENT"}"#
+                .replacingOccurrences(of: "EVENT", with: event)
+            let input = try decoder.decode(HookInput.self, from: Data(json.utf8))
+            guard input.status == expected,
+                  input.projectKey == "/tmp/project",
+                  input.endsSession == (event == "SessionEnd") else {
+                throw CLIError.runtime("Hook mapping self-test failed for \(event)")
+            }
+            let request = DaemonRequest.hook(input)
+            let roundTrip = try decoder.decode(DaemonRequest.self, from: JSONEncoder().encode(request))
+            guard roundTrip.hook?.hookEventName == event else {
+                throw CLIError.runtime("Daemon request self-test failed for \(event)")
+            }
+        }
+
+        let diagnosticJSON = #"{"session_id":"deferred","cwd":"/tmp/project","hook_event_name":"PostToolUse","turn_id":"turn-1","agent_id":"agent-1","agent_type":"executor","transcript_path":"/tmp/transcript.jsonl","permission_mode":"default","tool_name":"exec_command"}"#
+        let diagnosticInput = try decoder.decode(HookInput.self, from: Data(diagnosticJSON.utf8))
+        guard diagnosticInput.turnID == "turn-1",
+              diagnosticInput.agentID == "agent-1",
+              diagnosticInput.agentType == "executor",
+              diagnosticInput.transcriptPath == "/tmp/transcript.jsonl",
+              diagnosticInput.permissionMode == "default",
+              diagnosticInput.toolName == "exec_command" else {
+            throw CLIError.runtime("Hook diagnostic metadata self-test failed")
+        }
+        let permissionJSON = diagnosticJSON
+            .replacingOccurrences(of: "PostToolUse", with: "PermissionRequest")
+        let permissionInput = try decoder.decode(HookInput.self, from: Data(permissionJSON.utf8))
+        guard !permissionInput.directlyRequestsUserPermission else {
+            throw CLIError.runtime("Generic PermissionRequest routing self-test failed")
+        }
+        let requestPermissionsJSON = permissionJSON
+            .replacingOccurrences(of: "exec_command", with: "request_permissions")
+        let requestPermissionsInput = try decoder.decode(
+            HookInput.self,
+            from: Data(requestPermissionsJSON.utf8)
+        )
+        guard requestPermissionsInput.directlyRequestsUserPermission,
+              CodexApprovalRouting.displayRoute(
+                for: requestPermissionsInput,
+                homeDirectory: "/private/nonexistent"
+              ) == .user(reason: "request_permissions") else {
+            throw CLIError.runtime("Direct request_permissions routing self-test failed")
+        }
+        let reviewerLines = [
+            #"{"type":"turn_context","payload":{"approvals_reviewer":"user"}}"#,
+            #"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"approvals_reviewer":"auto_review"}}}"#,
+        ]
+        guard CodexApprovalRouting.latestApprovalsReviewer(in: reviewerLines) == .autoReview else {
+            throw CLIError.runtime("Approval reviewer rollout parsing self-test failed")
+        }
+        var pendingApprovals = PendingApprovalBuffer()
+        pendingApprovals.record(permissionInput, at: Date(timeIntervalSince1970: 100))
+        guard pendingApprovals.due(
+            now: Date(timeIntervalSince1970: 100.499),
+            delay: 0.5
+        ).isEmpty,
+              pendingApprovals.count == 1,
+              pendingApprovals.cancel(sessionID: permissionInput.sessionID) != nil,
+              pendingApprovals.count == 0 else {
+            throw CLIError.runtime("Approval debounce cancellation self-test failed")
+        }
+        pendingApprovals.record(permissionInput, at: Date(timeIntervalSince1970: 200))
+        guard pendingApprovals.due(
+            now: Date(timeIntervalSince1970: 200.5),
+            delay: 0.5
+        ).map(\.hook.sessionID) == ["deferred"],
+              pendingApprovals.count == 0 else {
+            throw CLIError.runtime("Approval debounce expiry self-test failed")
+        }
+        var deferredHooks = DeferredHookBuffer()
+        deferredHooks.record(
+            diagnosticInput,
+            status: .working,
+            at: Date(timeIntervalSince1970: 100)
+        )
+        let waitingDrain = deferredHooks.drain(
+            catalogSessionIDs: [],
+            now: Date(timeIntervalSince1970: 105),
+            maxAge: 6
+        )
+        guard waitingDrain.promoted.isEmpty,
+              waitingDrain.expired.isEmpty,
+              deferredHooks.count == 1 else {
+            throw CLIError.runtime("Deferred hook waiting self-test failed")
+        }
+        let promotedDrain = deferredHooks.drain(
+            catalogSessionIDs: ["deferred"],
+            now: Date(timeIntervalSince1970: 105),
+            maxAge: 6
+        )
+        guard promotedDrain.promoted.map(\.hook.sessionID) == ["deferred"],
+              promotedDrain.expired.isEmpty,
+              deferredHooks.count == 0 else {
+            throw CLIError.runtime("Deferred hook promotion self-test failed")
+        }
+        deferredHooks.record(
+            diagnosticInput,
+            status: .working,
+            at: Date(timeIntervalSince1970: 200)
+        )
+        let expiredDrain = deferredHooks.drain(
+            catalogSessionIDs: [],
+            now: Date(timeIntervalSince1970: 206),
+            maxAge: 6
+        )
+        guard expiredDrain.promoted.isEmpty,
+              expiredDrain.expired.map(\.hook.sessionID) == ["deferred"],
+              deferredHooks.count == 0 else {
+            throw CLIError.runtime("Deferred hook expiry self-test failed")
+        }
+
+        let migrationDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-state-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: migrationDirectory) }
+        try FileManager.default.createDirectory(at: migrationDirectory, withIntermediateDirectories: true)
+        let migrationUID: uid_t = 1234
+        let legacyEndedSessionsURL = migrationDirectory
+            .appendingPathComponent("keychron-c100-status-\(migrationUID)-ended-sessions.json")
+        try Data(#"["stale-session"]"#.utf8).write(to: legacyEndedSessionsURL)
+        let migrationStore = StateStore(uid: migrationUID, runtimeDirectory: migrationDirectory)
+        try migrationStore.discardLegacyEndedSessions()
+        guard !FileManager.default.fileExists(atPath: legacyEndedSessionsURL.path) else {
+            throw CLIError.runtime("Legacy SessionEnd tombstone migration self-test failed")
+        }
+
+        var socketPair = [Int32](repeating: -1, count: 2)
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketPair) == 0 else {
+            throw CLIError.runtime("Unix socket framing self-test could not create socketpair")
+        }
+        defer {
+            Darwin.close(socketPair[0])
+            Darwin.close(socketPair[1])
+        }
+        try UnixSocketServer.write(DaemonRequest.ping, to: socketPair[0])
+        let framedRequest = try UnixSocketServer.readRequest(
+            from: socketPair[1],
+            timeoutMilliseconds: 100
+        )
+        guard try decoder.decode(DaemonRequest.self, from: framedRequest).kind == .ping else {
+            throw CLIError.runtime("Unix socket newline framing self-test failed")
+        }
+        var socketReadTimedOut = false
+        do {
+            _ = try UnixSocketServer.readRequest(from: socketPair[1], timeoutMilliseconds: 20)
+        } catch {
+            socketReadTimedOut = String(describing: error).contains("timed out")
+        }
+        guard socketReadTimedOut else {
+            throw CLIError.runtime("Unix socket timeout self-test failed")
+        }
+
+        var grid = GridState()
+        let a0 = try grid.update(sessionID: "a0", projectKey: "/project/a", status: .idle)
+        let a1 = try grid.update(sessionID: "a1", projectKey: "/project/a", status: .working)
+        let b0 = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .approval)
+        let b0Done = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .done)
+        let b0Acknowledged = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .idle)
+        _ = try grid.update(sessionID: "a0", projectKey: "/project/a", status: nil, remove: true)
+        let a2 = try grid.update(sessionID: "a2", projectKey: "/project/a", status: .idle)
+        guard a0.slot?.keyIndex == 0,
+              a1.slot?.keyIndex == 1,
+              b0.slot?.keyIndex == 10,
+              b0Done.slot?.status == .done,
+              b0Acknowledged.slot?.status == .idle,
+              b0Acknowledged.changed,
+              a2.slot?.keyIndex == 0,
+              grid.projectRows["/project/a"] == 0,
+              grid.projectRows["/project/b"] == 1 else {
+            throw CLIError.runtime("Project-row/session-column allocation self-test failed")
+        }
+
+        let catalogLayout = CodexCatalog.orderedLayout([
+            CatalogSession(sessionID: "a-new", cwd: "/worktree/a", projectID: "shared", recency: 4, createdAt: 4),
+            CatalogSession(sessionID: "a-old", cwd: "/repo/a", projectID: "shared", recency: 3, createdAt: 3),
+            CatalogSession(sessionID: "b", cwd: "/repo/b", projectID: nil, recency: 2, createdAt: 2),
+        ], sidebar: CodexSidebarOrdering(
+            projectIDs: ["empty", "shared"],
+            threadIDsByProject: ["shared": ["a-old", "a-new"]],
+            pinnedThreadIDs: [],
+            projectAssignments: [:]
+        ))
+        guard catalogLayout.projectRows["project:empty"] == 0,
+              catalogLayout.projectRows["project:shared"] == 1,
+              catalogLayout.projectRows[CodexCatalog.projectlessKey] == 2,
+              catalogLayout.placements.map(\.session.sessionID) == ["a-old", "a-new", "b"],
+              catalogLayout.placements.map(\.keyIndex) == [10, 11, 20] else {
+            throw CLIError.runtime("Codex sidebar-order/projectless-row self-test failed")
+        }
+
+        let forkSessionMeta = Data(#"{"type":"session_meta","payload":{"id":"fork","forked_from_id":"subagent"}}"#.utf8)
+        let forkProject = CodexCatalog.resolvedForkProjectID(
+            explicitProjectID: nil,
+            forkedFromID: CodexCatalog.forkedFromID(sessionMetaLine: forkSessionMeta),
+            parentByChild: ["subagent": "parent"],
+            projectBySession: ["parent": "shared"]
+        )
+        let explicitForkProject = CodexCatalog.resolvedForkProjectID(
+            explicitProjectID: "worktree-project",
+            forkedFromID: "subagent",
+            parentByChild: ["subagent": "parent"],
+            projectBySession: ["parent": "shared"]
+        )
+        guard forkProject == "shared", explicitForkProject == "worktree-project" else {
+            throw CLIError.runtime("Codex fork ancestry/project inheritance self-test failed")
+        }
+
+        let interruptedLines = [
+            #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","text":"turn_aborted"}}"#,
+            #"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+        ]
+        let resumedLines = interruptedLines + [
+            #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]
+        guard CodexTurnMonitor.latestTurnSignal(in: interruptedLines) == .aborted,
+              CodexTurnMonitor.latestTurnSignal(in: resumedLines) == .started else {
+            throw CLIError.runtime("Codex interrupted-turn monitor self-test failed")
+        }
+
+        let monitorHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-turn-monitor-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: monitorHome) }
+        let rolloutDirectory = monitorHome
+            .appendingPathComponent(".codex/sessions/1970/01/01")
+        try FileManager.default.createDirectory(at: rolloutDirectory, withIntermediateDirectories: true)
+        let monitorSessionID = "00000000-0000-0000-0000-000000000001"
+        let rolloutURL = rolloutDirectory
+            .appendingPathComponent("rollout-1970-01-01T00-00-00-\(monitorSessionID).jsonl")
+        try Data((interruptedLines[0] + "\n").utf8).write(to: rolloutURL)
+        let monitorSession = CatalogSession(
+            sessionID: monitorSessionID,
+            cwd: "/tmp",
+            projectID: nil,
+            recency: 1,
+            createdAt: 0
+        )
+        let turnMonitor = CodexTurnMonitor()
+        guard turnMonitor.interruptedSessionIDs(
+            in: [monitorSession],
+            homeDirectory: monitorHome.path
+        ).isEmpty else {
+            throw CLIError.runtime("Codex interrupted-turn monitor reported a false positive")
+        }
+        let rolloutHandle = try FileHandle(forWritingTo: rolloutURL)
+        try rolloutHandle.seekToEnd()
+        try rolloutHandle.write(contentsOf: Data((interruptedLines[2] + "\n").utf8))
+        try rolloutHandle.close()
+        guard turnMonitor.interruptedSessionIDs(
+            in: [monitorSession],
+            homeDirectory: monitorHome.path
+        ) == [monitorSessionID] else {
+            throw CLIError.runtime("Codex interrupted-turn monitor missed an appended abort")
+        }
+
+        let grabberRequest = GrabberRequest.acquire(locationID: 0x110000)
+        let grabberRoundTrip = try decoder.decode(
+            GrabberRequest.self,
+            from: JSONEncoder().encode(grabberRequest)
+        )
+        let helperPlistData = Data(
+            HelperInstaller.plist(
+                ownerUID: 502,
+                ownerGID: 20,
+                locationID: 0x110000,
+                socketPath: "/var/run/keychron-c100-grabber-502.sock"
+            ).utf8
+        )
+        let helperPlist = try PropertyListSerialization.propertyList(from: helperPlistData, format: nil) as? [String: Any]
+        let helperArguments = helperPlist?["ProgramArguments"] as? [String]
+        let helperAppInfoData = Data(HelperInstaller.appInfoPlist().utf8)
+        let helperAppInfo = try PropertyListSerialization.propertyList(from: helperAppInfoData, format: nil) as? [String: Any]
+        let allowedGrabberLocation = try PrivilegedGrabberService.validateRequestedLocation(
+            grabberRoundTrip.locationID,
+            allowedLocationID: 0x110000
+        )
+        let rejectedGrabberLocation: Bool
+        do {
+            _ = try PrivilegedGrabberService.validateRequestedLocation(0x220000, allowedLocationID: 0x110000)
+            rejectedGrabberLocation = false
+        } catch {
+            rejectedGrabberLocation = true
+        }
+        let loggerSafetyDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-logger-safety-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: loggerSafetyDirectory) }
+        try FileManager.default.createDirectory(at: loggerSafetyDirectory, withIntermediateDirectories: false)
+        let loggerTarget = loggerSafetyDirectory.appendingPathComponent("target.log")
+        let loggerSymlink = loggerSafetyDirectory.appendingPathComponent("status.log")
+        try Data().write(to: loggerTarget)
+        try FileManager.default.createSymbolicLink(at: loggerSymlink, withDestinationURL: loggerTarget)
+        let rejectedLoggerSymlink: Bool
+        do {
+            _ = try StatusLogger(fileURL: loggerSymlink)
+            rejectedLoggerSymlink = false
+        } catch {
+            rejectedLoggerSymlink = true
+        }
+        guard grabberRoundTrip.kind == .acquire,
+              grabberRoundTrip.locationID == 0x110000,
+              allowedGrabberLocation == 0x110000,
+              rejectedGrabberLocation,
+              rejectedLoggerSymlink,
+              helperPlist?["Label"] as? String == HelperInstaller.label,
+              helperArguments?.first == HelperInstaller.executablePath,
+              helperArguments?.contains("grabber-service") == true,
+              helperArguments?.contains("1114112") == true,
+              helperAppInfo?["CFBundleIdentifier"] as? String == HelperInstaller.label,
+              helperAppInfo?["CFBundleExecutable"] as? String == "c100-status-grabber",
+              helperAppInfo?["LSBackgroundOnly"] as? Bool == true else {
+            throw CLIError.runtime("Privileged grabber protocol/LaunchDaemon plist self-test failed")
+        }
+
+        let reports = KeychronProtocol.setColorReports(
+            ledCount: 100,
+            color: AgentStatus.working.color
+        )
+        var frame = [HSVColor](repeating: LEDColorName.off.color, count: 100)
+        frame[0] = AgentStatus.idle.color
+        frame[99] = AgentStatus.done.color
+        let frameReports = KeychronProtocol.setColorReports(colors: frame)
+        let regionReports = KeychronProtocol.setRegionsReports(assignedIndexes: [0, 99], ledCount: 100)
+        let mixedEffectReports = KeychronProtocol.mixedEffectListReports()
+        let effectReport = KeychronProtocol.setEffectReport()
+        let oneKeyReport = KeychronProtocol.setColorReport(index: 42, color: LEDColorName.red.color)
+        let keymapReport = KeychronProtocol.keymapBufferReport(offset: 28, keyCount: 14)
+        let physicalMap = PhysicalKeyMap(qmkKeycodes: [4, 5, 4, 0x612C])
+        guard reports.count == 12,
+              frameReports.count == 12,
+              regionReports.count == 4,
+              mixedEffectReports.count == 4,
+              reports.allSatisfy({ $0.count == KeychronProtocol.reportLength }),
+              frameReports.allSatisfy({ $0.count == KeychronProtocol.reportLength }),
+              reports.first?[0] == KeychronProtocol.keychronRGB,
+              reports.first?[1] == KeychronProtocol.RGBCommand.setLEDColor.rawValue,
+              reports.first?[2] == 0,
+              reports.first?[3] == 9,
+              reports.last?[2] == 99,
+              reports.last?[3] == 1,
+              Array(frameReports.first!.prefix(10)) == [0xA8, 10, 0, 9, 0, 0, 24, 0, 0, 0],
+              Array(frameReports.last!.prefix(7)) == [0xA8, 10, 99, 1, 85, 255, 112],
+              Array(regionReports.first!.prefix(8)) == [0xA8, 13, 0, 28, 0, 1, 1, 1],
+              Array(regionReports.last!.prefix(8)) == [0xA8, 13, 84, 16, 1, 1, 1, 1],
+              Array(mixedEffectReports[0].prefix(8)) == [0xA8, 15, 0, 0, 3, 23, 0, 0],
+              effectReport.count == KeychronProtocol.reportLength,
+              Array(effectReport.prefix(4)) == [7, 3, 2, KeychronProtocol.perKeyEffect],
+              Array(oneKeyReport.prefix(7)) == [KeychronProtocol.keychronRGB, 10, 42, 1, 0, 255, 144],
+              Array(keymapReport.prefix(4)) == [18, 0, 28, 28],
+              physicalMap.resolve(usage: 4) == .ambiguous([0, 2]),
+              physicalMap.resolve(usage: 5) == .key(1),
+              physicalMap.resolve(usage: 44) == .key(3),
+              physicalMap.resolve(usage: 99) == .unmapped else {
+            throw CLIError.runtime("Keychron report self-test failed")
+        }
+        print("self-test passed: hooks, Codex catalog, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
+    }
+
+    private static func writeDiagnostic(_ message: String) {
+        FileHandle.standardError.write(Data("c100-status: \(message)\n".utf8))
+    }
+
+    private static func hex(_ value: Int, width: Int) -> String {
+        String(format: "%0*X", width, value)
+    }
+
+    private static func printHelp() {
+        print("""
+        Usage:
+          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run]
+          sudo c100-status install-helper --location 0x110000
+          sudo c100-status uninstall-helper
+          c100-status grabber-status [--grabber-socket PATH]
+          c100-status status <idle|working|approval|done|error> [--socket PATH]
+          c100-status key <0...99> <off|white|red|green|blue|amber> [--socket PATH]
+          c100-status hook [--socket PATH] [--dry-run]   # reads Codex hook JSON on stdin
+          c100-status clear [--socket PATH]
+          c100-status ping [--socket PATH]
+          c100-status logs [--log-file PATH]
+          c100-status log-path [--log-file PATH]
+          c100-status list
+          c100-status catalog
+          c100-status request-input-access
+          c100-status watch-input [SECONDS] [--location 0x110000]
+          c100-status watch-matrix [SECONDS] [--location 0x110000]
+          c100-status apply <status> [--location 0x110000] [--dry-run]
+          c100-status self-test
+
+        `install-helper` performs the one-time root-owned LaunchDaemon installation.
+        `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.
+        While `run` is active, normal C100 keystrokes are suppressed and assigned keys navigate Codex tasks.
+        HID writes are volatile; SaveLedConf is never sent.
+        """)
+    }
+}
+
+do {
+    try C100StatusCLI.run(Array(CommandLine.arguments.dropFirst()))
+} catch {
+    FileHandle.standardError.write(Data("c100-status: \(error)\n".utf8))
+    Darwin.exit(1)
+}
