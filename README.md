@@ -42,17 +42,38 @@ After installation, open **System Settings > Privacy & Security > Input Monitori
 sudo launchctl kickstart -k system/com.kotainaba.c100-status.grabber
 ```
 
-After that, run without `sudo`:
+After that, install `run` itself as a per-user LaunchAgent so it starts at login and restarts if it crashes, instead of running it by hand in a terminal:
 
 ```sh
-.build/release/c100-status run --location 0x110000
+c100-status install-agent --location 0x110000
 ```
 
-`run` deliberately refuses to start as root. Administrative privileges are used only by `install-helper` and `uninstall-helper`.
+`run` deliberately refuses to start as root. Administrative privileges are used only by `install-helper` and `uninstall-helper`; `install-agent` also refuses to run as root, since it manages your per-user (`gui/<uid>`) launchd domain, not the root helper.
 
-Re-run `install-helper` after rebuilding or updating the executable. Because the locally built App Bundle is ad-hoc signed, macOS may ask you to enable Input Monitoring again after replacement.
+Re-run `install-helper` after rebuilding or updating the executable. Because the locally built App Bundle is ad-hoc signed, macOS may ask you to enable Input Monitoring again after replacement. `install-agent` also picks up a rebuilt executable's new absolute path on re-run (see "Development loop" below).
 
-`run` stays in the foreground as the logged-in user. While it renews the helper lease, normal keystrokes from the C100 are suppressed; other keyboards are unaffected. Press Ctrl-C to release the lease and stop the daemon. A crash releases the lease within three seconds. It logs to both the terminal and `/tmp/keychron-c100-status-<uid>.log`.
+`install-agent` writes `~/Library/LaunchAgents/com.kotainaba.c100-status.run.plist` (override the label with `--label`) with `ProgramArguments` set to `[binary, "run"]` plus `--location <hex>` when given, `RunAtLoad`/`KeepAlive` true, and `ProcessType` `Interactive` (`run` needs an interactive-class process to receive HID/AppKit events). It then loads it with `launchctl bootstrap gui/<uid>`; re-running is idempotent -- an unchanged plist is just restarted (`bootout`+`bootstrap`), a changed one (e.g. a new `--location` or a rebuilt binary path) is rewritten and reloaded, both distinguished in the printed `status=`. `--dry-run` prints the plist and the `launchctl` commands that would run without writing anything or touching launchd. `--uninstall` runs `launchctl bootout` and deletes the plist:
+
+```sh
+c100-status install-agent --dry-run     # preview only, zero side effects
+c100-status install-agent --uninstall   # stop and remove the LaunchAgent
+```
+
+Once installed, stdout/stderr are discarded (the daemon logs to `/tmp/keychron-c100-status-<uid>.log` regardless); use `c100-status logs` / `log-path` rather than the LaunchAgent's own output.
+
+**If you were previously starting `run` by hand** (e.g. `nohup .build/release/c100-status run --location 0x110000 &`), stop that process first. Two `run` instances fight over the same grabber lease/socket and both lose it, so starting the LaunchAgent while a manual instance still holds the lease is a known way to make both stop working; if you need both running at once (e.g. one manual `--dry-run` instance for testing alongside the installed one), give the manual instance a different `--socket`/`--grabber-socket`, or use a different `--location` if you have more than one C100 connected.
+
+`run` stays in the foreground as the logged-in user (or, once installed, as the LaunchAgent's child process). While it renews the helper lease, normal keystrokes from the C100 are suppressed; other keyboards are unaffected. Press Ctrl-C (or `launchctl bootout` the LaunchAgent) to release the lease and stop the daemon. A crash releases the lease within three seconds. It logs to both the terminal (when run manually) and `/tmp/keychron-c100-status-<uid>.log`.
+
+### Development loop
+
+After changing and rebuilding the daemon, restart the installed LaunchAgent to pick up the new binary without re-running `install-agent` (which is also safe to re-run, but `kickstart -k` is faster when the plist itself -- the binary's absolute path, `--location`, or `--label` -- hasn't changed):
+
+```sh
+swift build -c release && launchctl kickstart -k gui/$(id -u)/com.kotainaba.c100-status.run
+```
+
+If the plist itself needs to change (moved the build to a new absolute path, changed `--location`), re-run `install-agent` instead -- it rewrites the plist and reloads it in one step.
 
 The local daemon protocol is newline-framed. A client that connects but does not finish a request is disconnected after 500 ms, so it cannot block HID polling or helper lease renewal. If any other synchronous operation stalls the main loop for at least 750 ms, the daemon logs `daemon loop delayed duration_ms=...` after it recovers.
 
@@ -221,7 +242,13 @@ A session counts as alive if it isn't archived (`isArchived: false`) and at leas
 
 ## Uninstall
 
-Stop the foreground daemon, then remove the root helper, LaunchDaemon, and helper log:
+If `run` was installed as a LaunchAgent, remove it first:
+
+```sh
+.build/release/c100-status install-agent --uninstall
+```
+
+Otherwise stop the foreground daemon (Ctrl-C), then remove the root helper, LaunchDaemon, and helper log:
 
 ```sh
 sudo .build/release/c100-status uninstall-helper

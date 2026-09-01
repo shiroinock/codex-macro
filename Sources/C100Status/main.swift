@@ -26,8 +26,9 @@ struct Options {
     var claudeConfigDirs: [String] = []
     var claudeDesktopDir: String?
     var installClaudeHooksConfigDirs: [String] = []
-    var installClaudeHooksBinaryPath: String?
-    var uninstallClaudeHooks = false
+    var binaryPathOverride: String?
+    var uninstall = false
+    var agentLabel: String?
 }
 
 enum C100StatusCLI {
@@ -202,17 +203,31 @@ enum C100StatusCLI {
             let configDirs = options.installClaudeHooksConfigDirs.isEmpty
                 ? ClaudeHooksInstaller.defaultInstallConfigDirs()
                 : options.installClaudeHooksConfigDirs
-            let binaryPath = options.installClaudeHooksBinaryPath ?? HelperInstaller.currentExecutableURL().path
+            let binaryPath = options.binaryPathOverride ?? HelperInstaller.currentExecutableURL().path
             let results = ClaudeHooksInstaller.run(
                 configDirs: configDirs,
                 binaryPath: binaryPath,
                 dryRun: options.dryRun,
-                uninstall: options.uninstallClaudeHooks
+                uninstall: options.uninstall
             )
             for result in results {
                 print("config_dir=\(result.configDir) settings=\(result.settingsPath) status=\(result.status.rawValue) \(result.message)")
             }
             print("summary: \(ClaudeHooksInstaller.summarize(results)) binary=\(binaryPath)")
+        case "install-agent":
+            let label = options.agentLabel ?? AgentInstaller.defaultLabel
+            let binaryPath = options.binaryPathOverride ?? HelperInstaller.currentExecutableURL().path
+            let result = try AgentInstaller.run(
+                label: label,
+                binaryPath: binaryPath,
+                locationID: options.locationID,
+                dryRun: options.dryRun,
+                uninstall: options.uninstall
+            )
+            print("label=\(result.label) plist=\(result.plistPath) status=\(result.status.rawValue) \(result.message)")
+            if let preview = result.dryRunPreview {
+                print(preview)
+            }
         case "hook":
             try runHook(options: options)
         case "clear":
@@ -402,9 +417,15 @@ enum C100StatusCLI {
                 guard index < arguments.count, !arguments[index].isEmpty else {
                     throw CLIError.usage("--binary requires a path")
                 }
-                options.installClaudeHooksBinaryPath = arguments[index]
+                options.binaryPathOverride = arguments[index]
             case "--uninstall":
-                options.uninstallClaudeHooks = true
+                options.uninstall = true
+            case "--label":
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else {
+                    throw CLIError.usage("--label requires an identifier")
+                }
+                options.agentLabel = arguments[index]
             default:
                 positionals.append(arguments[index])
             }
@@ -1635,8 +1656,9 @@ enum C100StatusCLI {
         }
 
         try selfTestClaudeHooksInstaller()
+        try selfTestAgentInstaller()
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, and install-claude-hooks")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, and install-agent")
     }
 
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end
@@ -1794,6 +1816,136 @@ enum C100StatusCLI {
         }
     }
 
+    /// M-install-agent: exercises `AgentInstaller` end to end against a
+    /// synthetic `$HOME/Library/LaunchAgents` under a temporary directory (a
+    /// real `~/Library/LaunchAgents` is never touched) and a stubbed
+    /// `launchctl` runner (the real `/bin/launchctl` is never invoked).
+    /// Covers: plist content (ProgramArguments/KeepAlive/RunAtLoad round
+    /// trip), label/binary-path validation, `--dry-run` being a true no-op
+    /// (no file written, no launchctl call recorded), install writing +
+    /// bootstrapping, a same-content re-run being reported as `.restarted`
+    /// (still reloaded), a `--location` change being reported as `.updated`,
+    /// and `--uninstall` booting the job out and removing the plist.
+    private static func selfTestAgentInstaller() throws {
+        // 1. plist content round-trips through PropertyListSerialization
+        // with the expected keys/values.
+        let plistWithLocation = AgentInstaller.plist(label: "com.example.agent-test", binaryPath: "/tmp/c100-status", locationID: 0x110000)
+        guard let data = plistWithLocation.data(using: .utf8),
+              let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            throw CLIError.runtime("install-agent self-test: generated plist did not parse as a property list")
+        }
+        guard parsed["Label"] as? String == "com.example.agent-test",
+              parsed["ProgramArguments"] as? [String] == ["/tmp/c100-status", "run", "--location", "0x110000"],
+              parsed["RunAtLoad"] as? Bool == true,
+              parsed["KeepAlive"] as? Bool == true,
+              parsed["ProcessType"] as? String == "Interactive" else {
+            throw CLIError.runtime("install-agent self-test: generated plist had unexpected ProgramArguments/RunAtLoad/KeepAlive/ProcessType")
+        }
+        let plistWithoutLocation = AgentInstaller.plist(label: "com.example.agent-test", binaryPath: "/tmp/c100-status", locationID: nil)
+        guard let dataNoLocation = plistWithoutLocation.data(using: .utf8),
+              let parsedNoLocation = try? PropertyListSerialization.propertyList(from: dataNoLocation, options: [], format: nil) as? [String: Any],
+              parsedNoLocation["ProgramArguments"] as? [String] == ["/tmp/c100-status", "run"] else {
+            throw CLIError.runtime("install-agent self-test: omitting --location did not omit it from ProgramArguments")
+        }
+
+        // 2. Label / binary-path validation.
+        for validLabel in ["com.kotainaba.c100-status.run", "a", "a.b-c_d9"] {
+            try AgentInstaller.validateLabel(validLabel)
+        }
+        for invalidLabel in ["", "has space", ".leadingdot", "trailing/slash"] {
+            var threw = false
+            do { try AgentInstaller.validateLabel(invalidLabel) } catch { threw = true }
+            guard threw else {
+                throw CLIError.runtime("install-agent self-test: invalid label \"\(invalidLabel)\" was not rejected")
+            }
+        }
+        try AgentInstaller.validateBinaryPath("/tmp/c100-status")
+        var relativePathThrew = false
+        do { try AgentInstaller.validateBinaryPath("relative/path") } catch { relativePathThrew = true }
+        guard relativePathThrew else {
+            throw CLIError.runtime("install-agent self-test: a relative --binary path was not rejected")
+        }
+
+        // Fixture home directory + stub launchctl runner shared by 3-6 below.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-agent-install-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let label = "com.example.c100-status-selftest"
+        let plistPath = AgentInstaller.plistPath(label: label, homeDirectory: root.path)
+
+        final class RecordedCalls: @unchecked Sendable {
+            var arguments: [[String]] = []
+        }
+        let recorded = RecordedCalls()
+        func stubLaunchctl(_ arguments: [String]) throws -> String {
+            recorded.arguments.append(arguments)
+            return ""
+        }
+
+        // 3. --dry-run is a true no-op: no plist written, no launchctl call.
+        let dryRunResult = try AgentInstaller.run(
+            label: label, binaryPath: "/tmp/c100-status", locationID: 0x110000,
+            dryRun: true, uninstall: false, homeDirectory: root.path, uid: 501, launchctl: stubLaunchctl
+        )
+        guard dryRunResult.status == .installed,
+              dryRunResult.dryRunPreview != nil,
+              !FileManager.default.fileExists(atPath: plistPath),
+              recorded.arguments.isEmpty else {
+            throw CLIError.runtime("install-agent self-test: --dry-run wrote a plist or invoked launchctl")
+        }
+
+        // 4. Install for real: plist written, bootout (best-effort) + bootstrap issued.
+        let installResult = try AgentInstaller.run(
+            label: label, binaryPath: "/tmp/c100-status", locationID: 0x110000,
+            dryRun: false, uninstall: false, homeDirectory: root.path, uid: 501, launchctl: stubLaunchctl
+        )
+        guard installResult.status == .installed, FileManager.default.fileExists(atPath: plistPath) else {
+            throw CLIError.runtime("install-agent self-test: install did not write the plist")
+        }
+        guard recorded.arguments.count == 2,
+              recorded.arguments[0] == ["bootout", "gui/501/\(label)"],
+              recorded.arguments[1] == ["bootstrap", "gui/501", plistPath] else {
+            throw CLIError.runtime("install-agent self-test: install did not run the expected bootout+bootstrap launchctl calls")
+        }
+        recorded.arguments.removeAll()
+
+        // 5. Re-run with identical arguments: reported as .restarted, plist
+        // unchanged, but still reloaded (bootout+bootstrap again).
+        let sameContentsBefore = try String(contentsOfFile: plistPath, encoding: .utf8)
+        let restartResult = try AgentInstaller.run(
+            label: label, binaryPath: "/tmp/c100-status", locationID: 0x110000,
+            dryRun: false, uninstall: false, homeDirectory: root.path, uid: 501, launchctl: stubLaunchctl
+        )
+        let sameContentsAfter = try String(contentsOfFile: plistPath, encoding: .utf8)
+        guard restartResult.status == .restarted, sameContentsBefore == sameContentsAfter, recorded.arguments.count == 2 else {
+            throw CLIError.runtime("install-agent self-test: an unchanged re-run was not reported as .restarted")
+        }
+        recorded.arguments.removeAll()
+
+        // 6. Change --location: reported as .updated, plist content changes.
+        let updateResult = try AgentInstaller.run(
+            label: label, binaryPath: "/tmp/c100-status", locationID: 0x120000,
+            dryRun: false, uninstall: false, homeDirectory: root.path, uid: 501, launchctl: stubLaunchctl
+        )
+        let updatedContents = try String(contentsOfFile: plistPath, encoding: .utf8)
+        guard updateResult.status == .updated, updatedContents != sameContentsAfter, updatedContents.contains("0x120000") else {
+            throw CLIError.runtime("install-agent self-test: a --location change was not reported as .updated")
+        }
+        recorded.arguments.removeAll()
+
+        // 7. --uninstall boots the job out and removes the plist.
+        let uninstallResult = try AgentInstaller.run(
+            label: label, binaryPath: "/tmp/c100-status", locationID: 0x120000,
+            dryRun: false, uninstall: true, homeDirectory: root.path, uid: 501, launchctl: stubLaunchctl
+        )
+        guard uninstallResult.status == .uninstalled,
+              !FileManager.default.fileExists(atPath: plistPath),
+              recorded.arguments == [["bootout", "gui/501/\(label)"]] else {
+            throw CLIError.runtime("install-agent self-test: --uninstall did not bootout and remove the plist")
+        }
+    }
+
     private static func writeDiagnostic(_ message: String) {
         FileHandle.standardError.write(Data("c100-status: \(message)\n".utf8))
     }
@@ -1824,9 +1976,11 @@ enum C100StatusCLI {
           c100-status watch-matrix [SECONDS] [--location 0x110000]
           c100-status apply <status> [--location 0x110000] [--dry-run]
           c100-status install-claude-hooks [--config-dir PATH]... [--binary PATH] [--dry-run] [--uninstall]
+          c100-status install-agent [--location 0x110000] [--binary PATH] [--label LABEL] [--dry-run] [--uninstall]
           c100-status self-test
 
         `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (default config dirs: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise, plus any other ~/.claude-config/* subdirectory), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
+        `install-agent` installs `c100-status run` as a per-user LaunchAgent (~/Library/LaunchAgents/<label>.plist, default label com.kotainaba.c100-status.run), loaded via `launchctl bootstrap gui/<uid>` and kept alive by launchd (RunAtLoad+KeepAlive, ProcessType Interactive). `--location` is forwarded to `run` if given. `--binary` overrides the auto-detected absolute path to this executable; `--label` overrides the plist label (must match an existing manual `run` invocation's expectations if you rely on the default). `--dry-run` prints the plist and the launchctl commands that would run without touching disk or launchd. Re-running is idempotent: an unchanged plist is just restarted (bootout+bootstrap); a changed one is rewritten and reloaded. `--uninstall` runs `launchctl bootout` and deletes the plist. Refuses to run as root -- it manages your per-user (gui/<uid>) launchd domain, not the root helper. If a manually started `c100-status run` (e.g. via `nohup ... &`) is already holding the grabber lease/socket when the LaunchAgent starts, the two will race for the same resources; stop the manual process (or use a different --socket/--location for one of them) before installing.
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
         `--claude-config-dirs` adds extra Claude profile directories (scanned for sessions/<pid>.json) on top of the defaults: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise.
