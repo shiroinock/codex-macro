@@ -168,6 +168,20 @@ final class StatusDaemon {
     /// herdr, so a key-press on a herdr session the daemon hasn't received
     /// any Claude hook for yet still navigates correctly.
     private var herdrNavigationBySession: [String: NavigationTarget] = [:]
+    /// Bug fix (M5.1): resolved `NavigationTarget` for *every* session
+    /// currently placed on any layer's grid, regardless of source --
+    /// rebuilt each `syncCatalog` from that sync's `UnifiedLayout.compute`
+    /// placements (`AgentSession.navigation`, which every provider already
+    /// resolves correctly: `ClaudeSessionsCatalog` -> `.ghosttyTab`,
+    /// `ClaudeDesktopCatalog` -> `.claudeDesktop`, herdr -> `.herdrPane`,
+    /// Codex -> `.codexThread`). `handleKeyPress` falls back to this map
+    /// when neither the hook-derived `claudeSessions` record nor
+    /// `herdrNavigationBySession` has an entry, so a claude-terminal or
+    /// claude-desktop session the daemon only ever learned about via a file
+    /// scan (never received a hook for) still navigates to the *right* app
+    /// instead of falling through to `.codexThread` and opening Codex
+    /// Desktop by mistake.
+    private var sessionNavigationBySession: [String: NavigationTarget] = [:]
     /// Consecutive-sync streak of a herdr-reported idle/done status per
     /// session, used for hook-miss recovery (see `applyHerdrStatusHeuristics`).
     private var herdrStatusStreaks: [String: (status: AgentStatus, count: Int, since: Date)] = [:]
@@ -217,7 +231,14 @@ final class StatusDaemon {
         activeLayer = layerStore.load()
         logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
-        syncCatalog()
+        // Bug fix (M5.1): force a fresh repack of every layer on this first
+        // sync -- there is no placement history yet for any of them (a
+        // fresh daemon start), so nothing is lost by ignoring
+        // `previousUnifiedPlacements`, and this is what pulls a layer with a
+        // single stray session (e.g. one left parked on row 4 by the old
+        // pre-M5 unified-grid state) up to row 0 instead of restoring it
+        // wherever `StateStore`'s on-disk state happened to remember it.
+        syncCatalog(forceRepackSources: Set(SessionSourceKind.allCases))
         // Guarantee the layer bar (and whatever the first `syncCatalog` sync
         // placed) is on the keyboard even if that sync's `GridReconciliation`
         // happened to report no change (e.g. no sessions yet at all).
@@ -809,6 +830,16 @@ final class StatusDaemon {
         activeLayer = newLayer
         layerStore.save(newLayer)
         logger.log(.info, "layer switch active=\(newLayer.rawValue) action=switched")
+        // Bug fix (M5.1): repack the layer being switched to from scratch
+        // (ignoring its sticky `previousUnifiedPlacements`) before
+        // repainting, so a session left parked on a stale row -- inherited
+        // from the pre-M5 unified grid, or simply never repacked to the top
+        // since a since-departed session left that row occupied -- gets
+        // pulled back up instead of staying stuck there indefinitely.
+        // Routine 2s syncs never do this (see `syncCatalog`'s doc comment),
+        // so this is the only other place besides the daemon's first sync
+        // that can move an unranked session's row.
+        syncCatalog(forceRepackSources: [newLayer])
         do {
             try reconcileLEDs()
         } catch {
@@ -915,14 +946,31 @@ final class StatusDaemon {
                 .info,
                 "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) session=\(shortSession(assignment.sessionID))"
             )
-            // Claude sessions carry their own resolved NavigationTarget
-            // (herdr pane / Ghostty tab / Claude Desktop) recorded from their
-            // hooks; anything else (Codex, or a Claude session the daemon
-            // hasn't seen a hook for yet) falls back to Codex-thread
-            // navigation, matching pre-M1 behavior.
-            let target = claudeSessions[assignment.sessionID]?.navigation
-                ?? herdrNavigationBySession[assignment.sessionID]
-                ?? .codexThread(sessionID: assignment.sessionID)
+            // Bug fix (M5.1): hook-derived navigation (herdr pane id etc.) is
+            // preferred when available since it is the most precise; next,
+            // the herdr catalog's own resolved target; then the unified
+            // catalog's resolved target for *any* source (covers a
+            // claude-terminal/claude-desktop session `syncCatalog` has
+            // placed via its file-scan providers but that has never sent a
+            // hook). Only when none of those resolve -- and only on the
+            // Codex layer itself -- does this fall back to `.codexThread`;
+            // any other layer with nothing resolvable does nothing rather
+            // than risk launching the wrong app (see
+            // `resolveNavigationTarget`'s doc comment for the pre-fix bug).
+            let target = StatusDaemon.resolveNavigationTarget(
+                sessionID: assignment.sessionID,
+                layer: activeLayer,
+                hookNavigation: claudeSessions[assignment.sessionID]?.navigation,
+                herdrNavigation: herdrNavigationBySession[assignment.sessionID],
+                catalogNavigation: sessionNavigationBySession[assignment.sessionID]
+            )
+            guard let target else {
+                logger.log(
+                    .warning,
+                    "input key=\(keyIndex) session=\(shortSession(assignment.sessionID)) layer=\(activeLayer.rawValue) action=navigation_unresolved reason=no_target_for_non_codex_session"
+                )
+                return
+            }
             let navigated = navigationRouter.handleTap(
                 keyIndex: keyIndex,
                 sessionID: assignment.sessionID,
@@ -948,7 +996,53 @@ final class StatusDaemon {
         }
     }
 
-    private func syncCatalog() {
+    /// Pure navigation-resolution rule for a key press. This is the fix for
+    /// the "pressing a CLI/Desktop-layer key opens Codex Desktop" bug: the
+    /// old `handleKeyPress` fell back to `.codexThread` for *any* session
+    /// unresolved by `claudeSessions`/`herdrNavigationBySession` (an M1-era
+    /// stopgap, back when Codex was the only source), so a claude-terminal
+    /// or claude-desktop session `syncCatalog` had only ever placed via a
+    /// file scan (no hook received yet) opened Codex Desktop instead of
+    /// Ghostty/Claude Desktop. Precedence, most to least precise: hook data,
+    /// herdr's own catalog resolution, the unified catalog's resolution for
+    /// any source, and -- only on the Codex layer itself -- a
+    /// `.codexThread` fallback built from the bare session id. Every other
+    /// layer with nothing resolvable returns `nil` (do nothing) rather than
+    /// guess and risk launching the wrong app.
+    static func resolveNavigationTarget(
+        sessionID: String,
+        layer: SessionSourceKind,
+        hookNavigation: NavigationTarget?,
+        herdrNavigation: NavigationTarget?,
+        catalogNavigation: NavigationTarget?
+    ) -> NavigationTarget? {
+        if let hookNavigation { return hookNavigation }
+        if let herdrNavigation { return herdrNavigation }
+        if let catalogNavigation { return catalogNavigation }
+        guard layer == .codex else { return nil }
+        return .codexThread(sessionID: sessionID)
+    }
+
+    /// `forceRepackSources` (M5.1 bug fix): sources in this set have their
+    /// sticky `previousUnifiedPlacements` feedback ignored for this one
+    /// sync, so every session in that layer without an explicit `rowRank`/
+    /// `columnRank` (herdr workspace number, Codex absolute row -- those
+    /// keep their claimed slot regardless) gets packed fresh from row 0 in
+    /// recency-then-stable-key order (see `UnifiedLayout.compute`). Ranked
+    /// rows/columns are unaffected either way since an explicit slot claim
+    /// never depends on `previousPlacements`.
+    ///
+    /// This is intentionally *not* the default: repacking on every routine
+    /// 2s sync would undo `UnifiedLayout`'s whole sticky-placement mechanism
+    /// and reintroduce the flicker it was built to fix (see
+    /// `UnifiedLayout.compute`'s doc comment and the M0.1 regression tests).
+    /// It's only ever passed non-empty from `run()`'s first sync (a layer's
+    /// grid has no placement history yet, so there is nothing to preserve)
+    /// and from `switchLayer` (clears out any row a session inherited from
+    /// the pre-M5 unified grid, or simply never got repacked to the top of,
+    /// so a layer with e.g. one session doesn't keep showing it stuck on row
+    /// 4 just because that's the row a since-departed session left behind).
+    private func syncCatalog(forceRepackSources: Set<SessionSourceKind> = []) {
         nextCatalogSync = Date().addingTimeInterval(2)
         pruneEndedClaudeSessions()
         pruneActiveSubagents()
@@ -1152,13 +1246,24 @@ final class StatusDaemon {
             var reconciliationBySource: [SessionSourceKind: GridReconciliation] = [:]
             var anyReconciliationChanged = false
             var currentCatalogWarnings: Set<String> = []
+            // Bug fix (M5.1): rebuilt fresh every sync from this sync's
+            // placements across *every* layer, so `handleKeyPress` can
+            // resolve a key press on any session regardless of source --
+            // see `sessionNavigationBySession`'s doc comment.
+            var nextSessionNavigationBySession: [String: NavigationTarget] = [:]
             for source in SessionSourceKind.allCases {
                 let sourceSessions = agentSessions.filter { $0.sourceKind == source }
+                let sourcePreviousPlacements = forceRepackSources.contains(source)
+                    ? [:]
+                    : (previousUnifiedPlacements[source] ?? [:])
                 let unified = UnifiedLayout.compute(
                     sessions: sourceSessions,
-                    previousPlacements: previousUnifiedPlacements[source] ?? [:],
+                    previousPlacements: sourcePreviousPlacements,
                     maxRows: GridState.rowCapacity
                 )
+                for placement in unified.placements {
+                    nextSessionNavigationBySession[placement.session.sessionID] = placement.session.navigation
+                }
                 currentCatalogWarnings.formUnion(unified.warnings.map { "\(source.rawValue): \($0)" })
                 previousUnifiedPlacements[source] = Dictionary(uniqueKeysWithValues: unified.placements.map {
                     ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
@@ -1179,6 +1284,7 @@ final class StatusDaemon {
                 reconciliationBySource[source] = reconciliation
                 if reconciliation.changed { anyReconciliationChanged = true }
             }
+            sessionNavigationBySession = nextSessionNavigationBySession
             for warning in currentCatalogWarnings.subtracting(previousCatalogWarnings) {
                 logger.log(.warning, "catalog layout warning=\(warning)")
             }

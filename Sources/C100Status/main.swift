@@ -1492,6 +1492,139 @@ enum C100StatusCLI {
             throw CLIError.runtime("Codex fork ancestry/project inheritance self-test failed")
         }
 
+        // Bug fix regression: a key press on a CLI/Desktop-layer session
+        // that has no hook-derived record and no herdr catalog entry must
+        // resolve to that session's own unified-catalog `NavigationTarget`
+        // (e.g. `.claudeDesktop`), never the Codex fallback -- the old
+        // behavior opened Codex Desktop for a claude-terminal/claude-desktop
+        // session the daemon had only ever seen via a file scan.
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "hook-wins",
+            layer: .claudeTerminal,
+            hookNavigation: .ghosttyTab(sessionID: "hook-wins", cwd: "/tmp/hook", pid: nil),
+            herdrNavigation: .herdrPane(paneID: "should-not-win"),
+            catalogNavigation: .claudeDesktop
+        ) == .ghosttyTab(sessionID: "hook-wins", cwd: "/tmp/hook", pid: nil) else {
+            throw CLIError.runtime("resolveNavigationTarget hook-precedence self-test failed")
+        }
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "herdr-wins",
+            layer: .claudeHerdr,
+            hookNavigation: nil,
+            herdrNavigation: .herdrPane(paneID: "w1:p1"),
+            catalogNavigation: .claudeDesktop
+        ) == .herdrPane(paneID: "w1:p1") else {
+            throw CLIError.runtime("resolveNavigationTarget herdr-precedence self-test failed")
+        }
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "catalog-only-desktop",
+            layer: .claudeDesktop,
+            hookNavigation: nil,
+            herdrNavigation: nil,
+            catalogNavigation: .claudeDesktop
+        ) == .claudeDesktop else {
+            throw CLIError.runtime(
+                "resolveNavigationTarget catalog-fallback (unhooked claude-desktop session) self-test failed"
+            )
+        }
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "codex-fallback",
+            layer: .codex,
+            hookNavigation: nil,
+            herdrNavigation: nil,
+            catalogNavigation: nil
+        ) == .codexThread(sessionID: "codex-fallback") else {
+            throw CLIError.runtime("resolveNavigationTarget codex-only-fallback self-test failed")
+        }
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "unresolvable-claude-terminal",
+            layer: .claudeTerminal,
+            hookNavigation: nil,
+            herdrNavigation: nil,
+            catalogNavigation: nil
+        ) == nil else {
+            throw CLIError.runtime(
+                "resolveNavigationTarget non-codex-unresolvable-does-nothing self-test failed (must not fall back to codexThread)"
+            )
+        }
+        guard StatusDaemon.resolveNavigationTarget(
+            sessionID: "unresolvable-claude-desktop",
+            layer: .claudeDesktop,
+            hookNavigation: nil,
+            herdrNavigation: nil,
+            catalogNavigation: nil
+        ) == nil else {
+            throw CLIError.runtime(
+                "resolveNavigationTarget non-codex-unresolvable-does-nothing (claude-desktop layer) self-test failed"
+            )
+        }
+
+        // Bug fix regression: a lone unranked session left sticky on a
+        // stale row (e.g. inherited from the pre-M5 unified grid, or from a
+        // since-departed session that used to occupy that row) stays there
+        // under the normal sticky `previousPlacements` path...
+        let strandedSession = AgentSession(
+            sourceKind: .claudeTerminal,
+            sessionID: "stranded",
+            cwd: "/repo/stranded",
+            rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: nil),
+            recency: 1,
+            rowRank: nil,
+            columnRank: nil,
+            seedStatus: nil,
+            navigation: .ghosttyTab(sessionID: "stranded", cwd: "/repo/stranded", pid: nil)
+        )
+        let strandedPreviousPlacements = ["stranded": UnifiedLayout.PreviousSlot(row: 4, column: 0)]
+        let stickyStranded = UnifiedLayout.compute(
+            sessions: [strandedSession],
+            previousPlacements: strandedPreviousPlacements,
+            maxRows: 9
+        )
+        guard stickyStranded.placements.first?.row == 4 else {
+            throw CLIError.runtime("UnifiedLayout stranded-session-stays-sticky baseline self-test failed")
+        }
+        // ...but a repack (empty `previousPlacements`, as `Daemon.syncCatalog`
+        // passes for sources in `forceRepackSources` -- daemon startup and
+        // layer switches) packs it back to row 0 instead.
+        let repackedStranded = UnifiedLayout.compute(
+            sessions: [strandedSession],
+            previousPlacements: [:],
+            maxRows: 9
+        )
+        guard repackedStranded.placements.first?.row == 0 else {
+            throw CLIError.runtime("UnifiedLayout repack-packs-stranded-session-to-top self-test failed")
+        }
+        // A session with a real, in-range explicit row claim (Codex's
+        // absolute row, resolved by `CodexCatalog.layout()` and handed to
+        // `UnifiedLayout` as a literal slot -- unlike herdr's row "rank",
+        // which is a deliberately out-of-range *ordering hint* and is
+        // therefore free to move under a repack same as any unranked row)
+        // must keep that exact row even under a repack.
+        let rankedSession = AgentSession(
+            sourceKind: .codex,
+            sessionID: "ranked",
+            cwd: "/repo/ranked",
+            rowHints: RowGroupingHints(codexProjectID: "ranked-proj", herdrWorkspaceID: nil),
+            recency: 1,
+            rowRank: 5,
+            columnRank: 0,
+            seedStatus: nil,
+            navigation: .codexThread(sessionID: "ranked")
+        )
+        let rankedRowBeforeRepack = UnifiedLayout.compute(
+            sessions: [rankedSession],
+            previousPlacements: ["ranked": UnifiedLayout.PreviousSlot(row: 3, column: 0)],
+            maxRows: 9
+        ).placements.first?.row
+        let rankedRowAfterRepack = UnifiedLayout.compute(
+            sessions: [rankedSession],
+            previousPlacements: [:],
+            maxRows: 9
+        ).placements.first?.row
+        guard rankedRowBeforeRepack == 5, rankedRowAfterRepack == 5 else {
+            throw CLIError.runtime("UnifiedLayout repack-preserves-explicit-rank self-test failed")
+        }
+
         let interruptedLines = [
             #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
             #"{"type":"response_item","payload":{"type":"message","text":"turn_aborted"}}"#,
