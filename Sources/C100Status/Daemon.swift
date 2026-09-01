@@ -23,6 +23,17 @@ final class StatusDaemon {
     private var catalogProjectBySession: [String: String] = [:]
     private var catalogProjectByCWD: [String: String] = [:]
     private var catalogSessionIDs: Set<String> = []
+    /// Sticky feedback for `UnifiedLayout.compute`: the previous sync's
+    /// placements, so a repeating rank conflict resolves the same way (and a
+    /// session that lost one keeps its fallback slot) every time instead of
+    /// churning when a source's `recency` value moves or the session set
+    /// briefly flickers -- see `UnifiedLayout.compute`'s doc comment.
+    private var previousUnifiedPlacements: [String: UnifiedLayout.PreviousSlot] = [:]
+    /// Last sync's `UnifiedLayout` warning strings, so `syncCatalog` only
+    /// logs a `catalog layout warning=` line when the set of active
+    /// conflicts actually changes, not every 2s sync a still-unresolved one
+    /// persists.
+    private var previousCatalogWarnings: Set<String> = []
     private var deferredHooks = DeferredHookBuffer()
     private let deferredHookMaxAge: TimeInterval = 6
     private var pendingApprovals = PendingApprovalBuffer()
@@ -822,10 +833,15 @@ final class StatusDaemon {
                     navigation: record.navigation
                 )
             })
-            let unified = UnifiedLayout.compute(sessions: agentSessions)
-            for warning in unified.warnings {
+            let unified = UnifiedLayout.compute(sessions: agentSessions, previousPlacements: previousUnifiedPlacements)
+            let currentCatalogWarnings = Set(unified.warnings)
+            for warning in currentCatalogWarnings.subtracting(previousCatalogWarnings) {
                 logger.log(.warning, "catalog layout warning=\(warning)")
             }
+            previousCatalogWarnings = currentCatalogWarnings
+            previousUnifiedPlacements = Dictionary(uniqueKeysWithValues: unified.placements.map {
+                ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
+            })
             let sessions = catalogSessions
 
             let reconciliation = try stateStore.reconcile(

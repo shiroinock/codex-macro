@@ -1113,6 +1113,133 @@ enum C100StatusCLI {
             throw CLIError.runtime("UnifiedLayout column-overflow truncation self-test failed")
         }
 
+        // Determinism: calling compute() twice with the exact same input
+        // (recency included) must produce byte-for-byte the same result.
+        guard UnifiedLayout.compute(sessions: mergeSessions) == UnifiedLayout.compute(sessions: mergeSessions) else {
+            throw CLIError.runtime("UnifiedLayout determinism (same input twice) self-test failed")
+        }
+
+        // Anti-flicker regression #1: reproduces the shiro-task-vault
+        // incident's column conflict -- a Codex thread and a herdr-tracked
+        // Claude pane share one cwd (merged onto the same row) and both
+        // claim absolute column 0. herdr's recency is always "now" (always
+        // climbing every 2s poll), so if the conflict's winner were decided
+        // by recency, it would keep "winning harder" each sync without ever
+        // actually changing outcome by itself -- but the real bug was more
+        // subtle: whichever side wins must stay the *same* side every sync
+        // regardless of how recency moves, not just happen to stay the same
+        // in this one case. Two calls with wildly different (and reversed)
+        // recency values, with no previous-placement info at all, must
+        // still agree byte-for-byte on who gets column 0.
+        func flickerColumnSessions(codexRecency: Double, herdrRecency: Double) -> [AgentSession] {
+            [
+                AgentSession(
+                    sourceKind: .codex,
+                    sessionID: "codex-thread",
+                    cwd: "/repo/shared",
+                    rowHints: RowGroupingHints(codexProjectID: "shared-proj", herdrWorkspaceID: nil),
+                    recency: codexRecency,
+                    rowRank: 2,
+                    columnRank: 0,
+                    seedStatus: nil,
+                    navigation: .codexThread(sessionID: "codex-thread")
+                ),
+                AgentSession(
+                    sourceKind: .claudeHerdr,
+                    sessionID: "herdr-pane",
+                    cwd: "/repo/shared",
+                    rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wX"),
+                    recency: herdrRecency,
+                    rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 5),
+                    columnRank: 0,
+                    seedStatus: .idle,
+                    navigation: .herdrPane(paneID: "wX:p1")
+                ),
+            ]
+        }
+        let flickerLow = UnifiedLayout.compute(sessions: flickerColumnSessions(codexRecency: 1_000, herdrRecency: 2_000))
+        let flickerHigh = UnifiedLayout.compute(sessions: flickerColumnSessions(codexRecency: 5, herdrRecency: 999_999))
+        func columnsBySessionID(_ result: UnifiedLayoutResult) -> [String: Int] {
+            Dictionary(uniqueKeysWithValues: result.placements.map { ($0.session.sessionID, $0.column) })
+        }
+        guard !flickerLow.warnings.isEmpty,
+              flickerLow.projectRows["shared-proj"] == 2,
+              columnsBySessionID(flickerLow) == columnsBySessionID(flickerHigh) else {
+            throw CLIError.runtime("UnifiedLayout column-conflict recency-invariance self-test failed")
+        }
+
+        // Anti-flicker regression #2: sticky reclaim. Once a session has
+        // lost a column conflict and settled into a fallback slot, a *new*,
+        // unrelated session joining the same row (e.g. a Claude Desktop/
+        // terminal session freshly seen at the same cwd, which happens
+        // continuously as those sources rescan) must not bump it to a
+        // different column just because the newcomer sorts earlier in the
+        // no-explicit-rank fill order -- it should keep the slot it already
+        // held, and the newcomer takes what's left.
+        let stickyBase = flickerColumnSessions(codexRecency: 1_000, herdrRecency: 2_000)
+        let stickyFirst = UnifiedLayout.compute(sessions: stickyBase)
+        guard let herdrColumn = stickyFirst.placements.first(where: { $0.session.sessionID == "herdr-pane" })?.column,
+              herdrColumn != 0 else {
+            throw CLIError.runtime("UnifiedLayout sticky-reclaim baseline self-test failed")
+        }
+        let stickyPrevious = Dictionary(uniqueKeysWithValues: stickyFirst.placements.map {
+            ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
+        })
+        let newcomer = AgentSession(
+            sourceKind: .claudeTerminal,
+            sessionID: "newcomer",
+            cwd: "/repo/shared",
+            rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: nil),
+            recency: 999_999, // sorts ahead of everyone in no-rank fill order
+            rowRank: nil,
+            columnRank: nil,
+            seedStatus: nil,
+            navigation: .claudeDesktop
+        )
+        let stickyNext = UnifiedLayout.compute(
+            sessions: stickyBase + [newcomer],
+            previousPlacements: stickyPrevious
+        )
+        guard stickyNext.placements.first(where: { $0.session.sessionID == "herdr-pane" })?.column == herdrColumn,
+              stickyNext.placements.first(where: { $0.session.sessionID == "newcomer" })?.column != herdrColumn else {
+            throw CLIError.runtime("UnifiedLayout sticky-reclaim-under-churn self-test failed")
+        }
+
+        // Root-cause regression: a merged row group must not lose its real,
+        // in-range row claim just because another session sharing its cwd
+        // contributes an out-of-range "ordering hint" rank (herdr's
+        // negative-encoded rowRank). Taking a plain min() across the whole
+        // group used to let the hint clobber the real claim, demoting the
+        // row to "unranked" and making it bounce around the pending pack.
+        let rowMergeSessions = [
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "codex-in-shared-row",
+                cwd: "/repo/shared-row",
+                rowHints: RowGroupingHints(codexProjectID: "shared-row-proj", herdrWorkspaceID: nil),
+                recency: 1,
+                rowRank: 2,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "codex-in-shared-row")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "herdr-in-shared-row",
+                cwd: "/repo/shared-row",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wY"),
+                recency: 1,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 9),
+                columnRank: 0,
+                seedStatus: .idle,
+                navigation: .herdrPane(paneID: "wY:p1")
+            ),
+        ]
+        let rowMergeLayout = UnifiedLayout.compute(sessions: rowMergeSessions)
+        guard rowMergeLayout.projectRows["shared-row-proj"] == 2 else {
+            throw CLIError.runtime("UnifiedLayout row-rank-merge (real claim over out-of-range hint) self-test failed")
+        }
+
         let forkSessionMeta = Data(#"{"type":"session_meta","payload":{"id":"fork","forked_from_id":"subagent"}}"#.utf8)
         let forkProject = CodexCatalog.resolvedForkProjectID(
             explicitProjectID: nil,
