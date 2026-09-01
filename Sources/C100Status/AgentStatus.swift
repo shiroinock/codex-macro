@@ -378,6 +378,21 @@ struct ActiveSubagentTracker {
         }
     }
 
+    /// Snapshot of tracked subagents (agent key -> `SubagentStart` time)
+    /// for `sessionID`, for the per-agent staleness sweep.
+    func entries(sessionID: String) -> [String: Date] {
+        startedAtByAgentID[sessionID] ?? [:]
+    }
+
+    /// Removes a single tracked subagent entry (per-agent staleness sweep).
+    mutating func remove(sessionID: String, agentKey: String) {
+        startedAtByAgentID[sessionID]?.removeValue(forKey: agentKey)
+        fallbackStackBySession[sessionID]?.removeAll { $0 == agentKey }
+        if startedAtByAgentID[sessionID]?.isEmpty ?? false {
+            clear(sessionID: sessionID)
+        }
+    }
+
     /// Drops every tracked subagent for `sessionID` outright -- used when
     /// the session itself is torn down (`SessionEnd`, any cross-source GC)
     /// so a leftover entry can't resurrect an override once the session id

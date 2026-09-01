@@ -251,4 +251,26 @@ final class ClaudeSessionsCatalog: SessionSourceProvider {
         }
         return true
     }
+
+    /// Freshness of one specific subagent's transcript
+    /// (`agent-<agentID>.jsonl`). `nil` when the file doesn't exist -- which
+    /// includes tracker fallback keys that never correspond to a file, and
+    /// a just-started subagent that hasn't written its transcript yet, so
+    /// callers must pair this with a start-time grace window rather than
+    /// treating `nil` as proof of death.
+    static func isSubagentTranscriptFresh(
+        configDir: String,
+        cwd: String,
+        sessionID: String,
+        agentID: String,
+        now: Date = Date(),
+        staleAfter: TimeInterval,
+        fileManager: FileManager = .default
+    ) -> Bool? {
+        let path = subagentsDirectoryPath(configDir: configDir, cwd: cwd, sessionID: sessionID)
+            + "/agent-\(agentID).jsonl"
+        guard let attributes = try? fileManager.attributesOfItem(atPath: path),
+              let modifiedAt = attributes[.modificationDate] as? Date else { return nil }
+        return now.timeIntervalSince(modifiedAt) <= staleAfter
+    }
 }

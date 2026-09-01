@@ -606,19 +606,35 @@ final class StatusDaemon {
     private func applyActiveSubagentStaleSweep(now: Date = Date()) {
         for sessionID in activeSubagents.activeSessionIDs {
             guard let record = claudeSessions[sessionID] else { continue }
-            guard ClaudeSessionsCatalog.isSubagentActivityStale(
-                configDir: record.configDir,
-                cwd: record.cwd,
-                sessionID: sessionID,
-                now: now,
-                staleAfter: activeSubagentStaleAfter
-            ) == true else { continue }
-            activeSubagents.clear(sessionID: sessionID)
-            logger.log(
-                .info,
-                "claude session=\(shortSession(sessionID)) action=active_subagents_cleared reason=subagent_transcripts_stale threshold_s=\(Int(activeSubagentStaleAfter))"
-            )
-            _ = try? refreshSubagentOverride(sessionID: sessionID)
+            var sweptAny = false
+            for (agentKey, startedAt) in activeSubagents.entries(sessionID: sessionID) {
+                // Grace window: `SubagentStart` fires before the subagent's
+                // transcript file exists, so a young entry must never be
+                // swept just because its (or any sibling's) file is missing
+                // or stale -- that false positive cleared a fresh subagent
+                // 75ms after its start and let the next `Stop` show done.
+                guard now.timeIntervalSince(startedAt) > activeSubagentStaleAfter else { continue }
+                // Past the grace window the agent's own transcript must
+                // prove liveness; a missing file (fallback keys included)
+                // or a stale one means its SubagentStop was likely lost.
+                if ClaudeSessionsCatalog.isSubagentTranscriptFresh(
+                    configDir: record.configDir,
+                    cwd: record.cwd,
+                    sessionID: sessionID,
+                    agentID: agentKey,
+                    now: now,
+                    staleAfter: activeSubagentStaleAfter
+                ) == true { continue }
+                activeSubagents.remove(sessionID: sessionID, agentKey: agentKey)
+                sweptAny = true
+                logger.log(
+                    .info,
+                    "claude session=\(shortSession(sessionID)) agent=\(agentKey.prefix(8)) action=active_subagent_swept reason=transcript_stale threshold_s=\(Int(activeSubagentStaleAfter))"
+                )
+            }
+            if sweptAny {
+                _ = try? refreshSubagentOverride(sessionID: sessionID)
+            }
         }
     }
 
