@@ -441,6 +441,13 @@ enum C100StatusCLI {
         return Int(value)
     }
 
+    /// Counts this process's own open file descriptors via `/dev/fd`, used
+    /// by the fd-leak regression tests below to catch `Process`/`Pipe`
+    /// handles that survive past a runner call instead of being closed.
+    private static func openFileDescriptorCount() throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+    }
+
     private static func selfTest() throws {
         let decoder = JSONDecoder()
         let samples: [(String, AgentStatus)] = [
@@ -2193,10 +2200,63 @@ enum C100StatusCLI {
             throw CLIError.runtime("OsascriptRunner timeout self-test failed")
         }
 
+        // Regression test for the daemon fd-exhaustion bug: `herdr agent
+        // list` / `herdr workspace list` are shelled out to every 2s by the
+        // background sync loop via `HerdrProcessRunner.run`, and each call
+        // used to leak the stdout/stderr pipes' read-end fds (never closed
+        // by Foundation), which is exactly what filled `lsof`'s PIPE count
+        // to 2,553 after ~20 minutes and wedged catalog sync with EBADF.
+        // Exercise the real runner (not a mock) against a harmless binary
+        // and assert our own process's open-fd count stays flat.
+        let fdCountBeforeHerdrSuccess = try openFileDescriptorCount()
+        for _ in 0..<200 {
+            _ = try HerdrProcessRunner.run(binary: "/bin/echo", arguments: ["fd-leak-check"], timeout: 2)
+        }
+        let fdCountAfterHerdrSuccess = try openFileDescriptorCount()
+        guard fdCountAfterHerdrSuccess - fdCountBeforeHerdrSuccess <= 2 else {
+            throw CLIError.runtime(
+                "HerdrProcessRunner fd-leak self-test failed (success path): "
+                    + "fd count \(fdCountBeforeHerdrSuccess) -> \(fdCountAfterHerdrSuccess) after 200 calls"
+            )
+        }
+
+        // Same check along the timeout-then-terminate() path, since that's
+        // a separate early-return that must close the pipes too.
+        let fdCountBeforeHerdrTimeout = try openFileDescriptorCount()
+        for _ in 0..<50 {
+            do {
+                _ = try HerdrProcessRunner.run(binary: "/bin/sleep", arguments: ["1"], timeout: 0.05)
+                throw CLIError.runtime("HerdrProcessRunner fd-leak self-test setup failed: expected a timeout")
+            } catch let error as HerdrProcessRunner.RunError {
+                guard case .timedOut = error else { throw error }
+            }
+        }
+        let fdCountAfterHerdrTimeout = try openFileDescriptorCount()
+        guard fdCountAfterHerdrTimeout - fdCountBeforeHerdrTimeout <= 2 else {
+            throw CLIError.runtime(
+                "HerdrProcessRunner fd-leak self-test failed (timeout path): "
+                    + "fd count \(fdCountBeforeHerdrTimeout) -> \(fdCountAfterHerdrTimeout) after 50 calls"
+            )
+        }
+
+        // NavigationRouter's Ghostty focus path shares the exact same
+        // pipe-handling shape via OsascriptRunner -- cover it too.
+        let fdCountBeforeOsascript = try openFileDescriptorCount()
+        for _ in 0..<40 {
+            _ = try OsascriptRunner.run(arguments: ["-e", "return 1"], timeout: 5)
+        }
+        let fdCountAfterOsascript = try openFileDescriptorCount()
+        guard fdCountAfterOsascript - fdCountBeforeOsascript <= 2 else {
+            throw CLIError.runtime(
+                "OsascriptRunner fd-leak self-test failed: "
+                    + "fd count \(fdCountBeforeOsascript) -> \(fdCountAfterOsascript) after 40 calls"
+            )
+        }
+
         try selfTestClaudeHooksInstaller()
         try selfTestAgentInstaller()
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, and install-agent")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, install-agent, and fd-leak regressions for HerdrProcessRunner/OsascriptRunner")
     }
 
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end

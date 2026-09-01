@@ -65,6 +65,19 @@ enum HerdrProcessRunner {
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
+        defer {
+            // `Process` closes its own copies of the pipes' write ends once
+            // the child has been spawned, but the read ends belong to us and
+            // are never closed by Foundation. Left open, every call here
+            // (fired every 2s by the background sync loop) leaked two PIPE
+            // fds -- this is what exhausted the daemon's fd table after
+            // ~20 minutes. `close()` is safe to call even along the timeout
+            // path where the handles were never read from.
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+        }
         try process.run()
 
         let deadline = Date().addingTimeInterval(timeout)

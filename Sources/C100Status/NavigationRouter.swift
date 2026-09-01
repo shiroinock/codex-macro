@@ -219,6 +219,16 @@ enum OsascriptRunner {
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
+        defer {
+            // See HerdrProcessRunner.run: the pipes' read ends are ours and
+            // are never closed by Foundation, so they must be closed
+            // explicitly on every path (success, non-zero exit, timeout) or
+            // they leak a PIPE fd per call.
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+        }
         try process.run()
 
         let deadline = Date().addingTimeInterval(timeout)

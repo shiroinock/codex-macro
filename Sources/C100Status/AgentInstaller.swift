@@ -127,6 +127,13 @@ enum AgentInstaller {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
+        defer {
+            // The read end is ours and Foundation never closes it; leaving
+            // it open leaks a PIPE fd per invocation (see HerdrProcessRunner
+            // for the same fix applied to the daemon's hot path).
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+        }
         try process.run()
         process.waitUntilExit()
         let data = output.fileHandleForReading.readDataToEndOfFile()
