@@ -20,6 +20,8 @@ struct Options {
     var grabberSocketPath = RuntimePaths.grabberSocket()
     var ownerUID: uid_t?
     var ownerGID: gid_t?
+    var hookSource = "codex"
+    var notificationMatcher: String?
 }
 
 enum C100StatusCLI {
@@ -177,7 +179,12 @@ enum C100StatusCLI {
 
     private static func runHook(options: Options) throws {
         let data = FileHandle.standardInput.readDataToEndOfFile()
-        let input = try JSONDecoder().decode(HookInput.self, from: data)
+        var input = try JSONDecoder().decode(HookInput.self, from: data)
+        if options.hookSource == "claude" {
+            input = applyClaudeEnvironment(to: input, notificationMatcher: options.notificationMatcher)
+        } else if let notificationMatcher = options.notificationMatcher {
+            input = input.applyingNotificationMatcher(notificationMatcher)
+        }
         if options.dryRun {
             if input.endsSession {
                 writeDiagnostic("event=SessionEnd session=\(input.sessionID) daemon-send=skipped")
@@ -198,6 +205,38 @@ enum C100StatusCLI {
             writeDiagnostic("daemon unavailable; hook ignored: \(error)")
         }
         print("{}")
+    }
+
+    /// Resolves which of the three Claude Code launch paths produced this
+    /// hook invocation, using only the environment variables set for each
+    /// path (stdin JSON cannot distinguish them -- see the implementation
+    /// plan's "調査で確定した環境事実").
+    static func resolveClaudeSource(
+        environment: [String: String]
+    ) -> (kind: SessionSourceKind, herdrPaneID: String?, herdrWorkspaceID: String?) {
+        if environment["CLAUDE_CODE_ENTRYPOINT"] == "claude-desktop" {
+            return (.claudeDesktop, nil, nil)
+        }
+        if environment["HERDR_ENV"] == "1" {
+            return (.claudeHerdr, environment["HERDR_PANE_ID"], environment["HERDR_WORKSPACE_ID"])
+        }
+        return (.claudeTerminal, nil, nil)
+    }
+
+    static func applyClaudeEnvironment(
+        to input: HookInput,
+        notificationMatcher: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> HookInput {
+        let (kind, herdrPaneID, herdrWorkspaceID) = resolveClaudeSource(environment: environment)
+        let configDir = environment["CLAUDE_CONFIG_DIR"] ?? (NSHomeDirectory() + "/.claude")
+        return input.applyingSource(
+            kind,
+            herdrPaneID: herdrPaneID,
+            herdrWorkspaceID: herdrWorkspaceID,
+            configDir: configDir,
+            notificationMatcher: notificationMatcher
+        )
     }
 
     private static func send(_ request: DaemonRequest, options: Options) throws -> DaemonResponse {
@@ -256,6 +295,21 @@ enum C100StatusCLI {
                     throw CLIError.usage("--owner-gid requires a numeric gid")
                 }
                 options.ownerGID = gid_t(value)
+            case "--source":
+                index += 1
+                guard index < arguments.count, ["codex", "claude"].contains(arguments[index]) else {
+                    throw CLIError.usage("--source requires one of: codex, claude")
+                }
+                options.hookSource = arguments[index]
+            case "--notification-matcher":
+                index += 1
+                guard index < arguments.count,
+                      ["permission_prompt", "idle_prompt", "agent_needs_input", "agent_completed"].contains(arguments[index]) else {
+                    throw CLIError.usage(
+                        "--notification-matcher requires one of: permission_prompt, idle_prompt, agent_needs_input, agent_completed"
+                    )
+                }
+                options.notificationMatcher = arguments[index]
             default:
                 positionals.append(arguments[index])
             }
@@ -296,6 +350,144 @@ enum C100StatusCLI {
             guard roundTrip.hook?.hookEventName == event else {
                 throw CLIError.runtime("Daemon request self-test failed for \(event)")
             }
+        }
+
+        // Backward-compat decode: a source-less JSON payload (every hook
+        // emitted before M1) must decode with `source == nil` and resolve
+        // to `.codex` via `effectiveSource`, so the Codex path is completely
+        // unaffected by the M1 field additions.
+        let backCompatInput = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"legacy","cwd":"/tmp","hook_event_name":"SessionStart"}"#.utf8)
+        )
+        guard backCompatInput.source == nil,
+              backCompatInput.effectiveSource == .codex,
+              backCompatInput.herdrPaneID == nil,
+              backCompatInput.herdrWorkspaceID == nil,
+              backCompatInput.configDir == nil,
+              backCompatInput.notificationMatcher == nil else {
+            throw CLIError.runtime("Legacy source-less hook decode self-test failed")
+        }
+
+        // Claude Code event -> LED status mapping table (M1).
+        let claudeMappingSamples: [(event: String, matcher: String?, expected: AgentStatus?)] = [
+            ("SessionStart", nil, .idle),
+            ("UserPromptSubmit", nil, .working),
+            ("PreToolUse", nil, .working),
+            ("PostToolUse", nil, .working),
+            ("PermissionRequest", nil, .approval),
+            ("Notification", "permission_prompt", .approval),
+            ("Notification", "agent_needs_input", .approval),
+            ("Notification", "idle_prompt", .idle),
+            ("Notification", "agent_completed", .done),
+            ("Stop", nil, .done),
+            ("StopFailure", nil, .error),
+            ("SessionEnd", nil, nil),
+        ]
+        for sample in claudeMappingSamples {
+            let json = #"{"session_id":"claude-self-test","cwd":"/tmp/claude-project","hook_event_name":"EVENT","source":"claude-terminal"}"#
+                .replacingOccurrences(of: "EVENT", with: sample.event)
+            var claudeInput = try decoder.decode(HookInput.self, from: Data(json.utf8))
+            if let matcher = sample.matcher {
+                claudeInput = claudeInput.applyingNotificationMatcher(matcher)
+            }
+            guard claudeInput.effectiveSource == .claudeTerminal,
+                  claudeInput.status == sample.expected else {
+                throw CLIError.runtime(
+                    "Claude hook mapping self-test failed for \(sample.event)/\(sample.matcher ?? "-")"
+                )
+            }
+        }
+        guard try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"c","cwd":"/tmp","hook_event_name":"SessionEnd","source":"claude-terminal"}"#.utf8)
+        ).endsSession else {
+            throw CLIError.runtime("Claude SessionEnd endsSession self-test failed")
+        }
+
+        // Subagent exclusion: an `agent_id` field or a `/subagents/`
+        // transcript path marks a hook as belonging to a subagent, which
+        // Daemon.handleClaudeHook ignores outright.
+        let subagentByID = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"s1","cwd":"/tmp","hook_event_name":"PostToolUse","agent_id":"sub-1","source":"claude-terminal"}"#.utf8)
+        )
+        let subagentByTranscriptPath = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"s2","cwd":"/tmp","hook_event_name":"PostToolUse","transcript_path":"/tmp/.claude/subagents/foo.jsonl","source":"claude-terminal"}"#.utf8)
+        )
+        let nonSubagent = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"s3","cwd":"/tmp","hook_event_name":"PostToolUse","source":"claude-terminal"}"#.utf8)
+        )
+        guard subagentByID.isSubagent, subagentByTranscriptPath.isSubagent, !nonSubagent.isSubagent else {
+            throw CLIError.runtime("Claude subagent exclusion self-test failed")
+        }
+
+        // Environment-variable source discrimination (stdin JSON cannot tell
+        // the three Claude launch paths apart -- see the implementation
+        // plan's confirmed environment facts).
+        let desktopEnvironment = ["CLAUDE_CODE_ENTRYPOINT": "claude-desktop"]
+        let herdrEnvironment = [
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p2",
+            "HERDR_WORKSPACE_ID": "ws1",
+        ]
+        let terminalEnvironment: [String: String] = [:]
+        let desktopResolved = resolveClaudeSource(environment: desktopEnvironment)
+        let herdrResolved = resolveClaudeSource(environment: herdrEnvironment)
+        let terminalResolved = resolveClaudeSource(environment: terminalEnvironment)
+        guard desktopResolved.kind == .claudeDesktop,
+              desktopResolved.herdrPaneID == nil,
+              herdrResolved.kind == .claudeHerdr,
+              herdrResolved.herdrPaneID == "w1:p2",
+              herdrResolved.herdrWorkspaceID == "ws1",
+              terminalResolved.kind == .claudeTerminal,
+              terminalResolved.herdrPaneID == nil else {
+            throw CLIError.runtime("Claude source environment discrimination self-test failed")
+        }
+
+        let envAttachmentBaseInput = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"env-test","cwd":"/tmp","hook_event_name":"Notification"}"#.utf8)
+        )
+        let desktopAttached = applyClaudeEnvironment(
+            to: envAttachmentBaseInput,
+            notificationMatcher: nil,
+            environment: desktopEnvironment
+        )
+        guard desktopAttached.source == .claudeDesktop,
+              desktopAttached.configDir == NSHomeDirectory() + "/.claude" else {
+            throw CLIError.runtime("Claude Desktop environment attachment self-test failed")
+        }
+        var herdrEnvironmentWithConfigDir = herdrEnvironment
+        herdrEnvironmentWithConfigDir["CLAUDE_CONFIG_DIR"] = "/tmp/custom-claude-config"
+        let herdrAttached = applyClaudeEnvironment(
+            to: envAttachmentBaseInput,
+            notificationMatcher: "agent_needs_input",
+            environment: herdrEnvironmentWithConfigDir
+        )
+        guard herdrAttached.source == .claudeHerdr,
+              herdrAttached.herdrPaneID == "w1:p2",
+              herdrAttached.herdrWorkspaceID == "ws1",
+              herdrAttached.configDir == "/tmp/custom-claude-config",
+              herdrAttached.notificationMatcher == "agent_needs_input",
+              herdrAttached.status == .approval else {
+            throw CLIError.runtime("Claude herdr environment attachment self-test failed")
+        }
+
+        // SessionEnd tombstone: a session that has ended stays tombstoned
+        // (re-delivered/late hooks must be ignorable) until the TTL elapses.
+        var tombstones = ClaudeSessionEndTombstoneBuffer()
+        tombstones.record(sessionID: "ended-session", at: Date(timeIntervalSince1970: 1_000))
+        guard tombstones.isTombstoned(sessionID: "ended-session", now: Date(timeIntervalSince1970: 1_030), ttl: 60),
+              !tombstones.isTombstoned(sessionID: "ended-session", now: Date(timeIntervalSince1970: 1_061), ttl: 60),
+              !tombstones.isTombstoned(sessionID: "never-ended", now: Date(timeIntervalSince1970: 1_000), ttl: 60) else {
+            throw CLIError.runtime("Claude SessionEnd tombstone self-test failed")
+        }
+        tombstones.prune(now: Date(timeIntervalSince1970: 1_061), ttl: 60)
+        guard tombstones.count == 0 else {
+            throw CLIError.runtime("Claude SessionEnd tombstone pruning self-test failed")
         }
 
         let diagnosticJSON = #"{"session_id":"deferred","cwd":"/tmp/project","hook_event_name":"PostToolUse","turn_id":"turn-1","agent_id":"agent-1","agent_type":"executor","transcript_path":"/tmp/transcript.jsonl","permission_mode":"default","tool_name":"exec_command"}"#
@@ -810,7 +1002,8 @@ enum C100StatusCLI {
           c100-status grabber-status [--grabber-socket PATH]
           c100-status status <idle|working|approval|done|error> [--socket PATH]
           c100-status key <0...99> <off|white|red|green|blue|amber> [--socket PATH]
-          c100-status hook [--socket PATH] [--dry-run]   # reads Codex hook JSON on stdin
+          c100-status hook [--socket PATH] [--dry-run] [--source <codex|claude>] [--notification-matcher <permission_prompt|idle_prompt|agent_needs_input|agent_completed>]
+                                                          # reads hook JSON on stdin; --source defaults to codex
           c100-status clear [--socket PATH]
           c100-status ping [--socket PATH]
           c100-status logs [--log-file PATH]

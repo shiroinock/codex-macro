@@ -38,6 +38,16 @@ struct HookInput: Codable {
     let transcriptPath: String?
     let permissionMode: String?
     let toolName: String?
+    /// Which product produced this hook. `nil` on the wire means a
+    /// pre-M1 Codex hook payload (back-compat) -- see `effectiveSource`.
+    let source: SessionSourceKind?
+    let herdrPaneID: String?
+    let herdrWorkspaceID: String?
+    let configDir: String?
+    /// Only populated for `Notification` events; distinguishes the four
+    /// Claude Code notification matchers (`permission_prompt`,
+    /// `idle_prompt`, `agent_needs_input`, `agent_completed`).
+    let notificationMatcher: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -49,6 +59,24 @@ struct HookInput: Codable {
         case transcriptPath = "transcript_path"
         case permissionMode = "permission_mode"
         case toolName = "tool_name"
+        case source
+        case herdrPaneID = "herdr_pane_id"
+        case herdrWorkspaceID = "herdr_workspace_id"
+        case configDir = "config_dir"
+        case notificationMatcher = "notification_matcher"
+    }
+
+    /// Resolves the wire-optional `source` back to a concrete kind: missing
+    /// `source` (every hook emitted before M1) is a Codex hook.
+    var effectiveSource: SessionSourceKind { source ?? .codex }
+
+    /// Claude subagent hooks (`agent_id` present, or a `/subagents/`
+    /// transcript path) are excluded from the grid entirely -- only the
+    /// top-level session is tracked. Codex's own `agent_id` semantics
+    /// (executor turns) are untouched since this is only consulted on the
+    /// Claude path.
+    var isSubagent: Bool {
+        agentID != nil || (transcriptPath?.contains("/subagents/") ?? false)
     }
 
     var projectKey: String {
@@ -59,12 +87,36 @@ struct HookInput: Codable {
     }
 
     var status: AgentStatus? {
+        guard effectiveSource == .codex else { return claudeStatus }
         switch hookEventName {
-        case "SessionStart", "SessionEnd": .idle
-        case "UserPromptSubmit", "PreToolUse", "PostToolUse": .working
-        case "PermissionRequest": .approval
-        case "Stop": .done
-        default: nil
+        case "SessionStart", "SessionEnd": return .idle
+        case "UserPromptSubmit", "PreToolUse", "PostToolUse": return .working
+        case "PermissionRequest": return .approval
+        case "Stop": return .done
+        default: return nil
+        }
+    }
+
+    /// Claude Code event -> LED status mapping (M1). `SessionEnd` is
+    /// intentionally excluded here (returns `nil`): unlike Codex, Claude is
+    /// hook-authoritative, so `SessionEnd` removes the session outright
+    /// rather than setting a status -- `Daemon` handles that via
+    /// `endsSession` before ever consulting `status`.
+    private var claudeStatus: AgentStatus? {
+        switch hookEventName {
+        case "SessionStart": return .idle
+        case "UserPromptSubmit", "PreToolUse", "PostToolUse": return .working
+        case "PermissionRequest": return .approval
+        case "Notification":
+            switch notificationMatcher {
+            case "permission_prompt", "agent_needs_input": return .approval
+            case "idle_prompt": return .idle
+            case "agent_completed": return .done
+            default: return nil
+            }
+        case "Stop": return .done
+        case "StopFailure": return .error
+        default: return nil
         }
     }
 
@@ -73,6 +125,57 @@ struct HookInput: Codable {
     var beginsToolUse: Bool { hookEventName == "PreToolUse" }
     var directlyRequestsUserPermission: Bool {
         requestsPermission && toolName == "request_permissions"
+    }
+
+    /// Returns a copy of this hook with the Claude source-identification
+    /// fields attached. Used by `c100-status hook --source claude` after it
+    /// resolves the source kind from the process environment; leaves every
+    /// other field untouched.
+    func applyingSource(
+        _ source: SessionSourceKind,
+        herdrPaneID: String?,
+        herdrWorkspaceID: String?,
+        configDir: String?,
+        notificationMatcher: String?
+    ) -> HookInput {
+        HookInput(
+            sessionID: sessionID,
+            hookEventName: hookEventName,
+            cwd: cwd,
+            turnID: turnID,
+            agentID: agentID,
+            agentType: agentType,
+            transcriptPath: transcriptPath,
+            permissionMode: permissionMode,
+            toolName: toolName,
+            source: source,
+            herdrPaneID: herdrPaneID,
+            herdrWorkspaceID: herdrWorkspaceID,
+            configDir: configDir,
+            notificationMatcher: notificationMatcher
+        )
+    }
+
+    /// Returns a copy with only `notificationMatcher` changed. Used when
+    /// `--notification-matcher` is passed without `--source claude` (e.g.
+    /// tests, or a future non-Claude source that also has notifications).
+    func applyingNotificationMatcher(_ notificationMatcher: String?) -> HookInput {
+        HookInput(
+            sessionID: sessionID,
+            hookEventName: hookEventName,
+            cwd: cwd,
+            turnID: turnID,
+            agentID: agentID,
+            agentType: agentType,
+            transcriptPath: transcriptPath,
+            permissionMode: permissionMode,
+            toolName: toolName,
+            source: source,
+            herdrPaneID: herdrPaneID,
+            herdrWorkspaceID: herdrWorkspaceID,
+            configDir: configDir,
+            notificationMatcher: notificationMatcher
+        )
     }
 }
 
@@ -161,6 +264,31 @@ struct DeferredHookBuffer {
             }
         }
         return DeferredHookDrain(promoted: promoted, expired: expired)
+    }
+}
+
+/// Tracks recently-ended Claude sessions so a reordered/late hook (e.g. an
+/// async `PostToolUse` that lands after `SessionEnd`) doesn't resurrect a
+/// session the daemon has already torn down. Entries age out after `ttl`
+/// seconds -- there is no unbounded growth since every lookup path also
+/// prunes.
+struct ClaudeSessionEndTombstoneBuffer {
+    private(set) var endedAtBySessionID: [String: Date] = [:]
+
+    var count: Int { endedAtBySessionID.count }
+
+    mutating func record(sessionID: String, at date: Date = Date()) {
+        endedAtBySessionID[sessionID] = date
+    }
+
+    func isTombstoned(sessionID: String, now: Date = Date(), ttl: TimeInterval) -> Bool {
+        guard let endedAt = endedAtBySessionID[sessionID] else { return false }
+        return now.timeIntervalSince(endedAt) < ttl
+    }
+
+    mutating func prune(now: Date = Date(), ttl: TimeInterval) {
+        guard !endedAtBySessionID.isEmpty else { return }
+        endedAtBySessionID = endedAtBySessionID.filter { now.timeIntervalSince($0.value) < ttl }
     }
 }
 

@@ -31,8 +31,29 @@ final class StatusDaemon {
     private lazy var navigator = CodexNavigator { [weak self] level, message in
         self?.logger.log(level, message)
     }
-    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator)
+    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator) { [weak self] level, message in
+        self?.logger.log(level, message)
+    }
     private let providers: [SessionSourceProvider] = [CodexSourceProvider()]
+    /// Claude is hook-authoritative (M1): there is no on-disk catalog to
+    /// scan yet (that's `ClaudeSessionsCatalog` in M3), so the daemon itself
+    /// remembers every session a Claude hook has told it about -- cwd/source
+    /// for `UnifiedLayout` grouping, and where a key-press on it should
+    /// navigate. Entries are added on any non-`SessionEnd` Claude hook and
+    /// removed on `SessionEnd` (see `handleClaudeHook`).
+    private struct ClaudeSessionRecord {
+        let sourceKind: SessionSourceKind
+        let cwd: String
+        let herdrWorkspaceID: String?
+        let navigation: NavigationTarget
+        var lastSeen: Date
+    }
+    private var claudeSessions: [String: ClaudeSessionRecord] = [:]
+    /// `SessionEnd` tombstones, so a Claude hook re-delivery or reordering
+    /// (e.g. an async PostToolUse hook that lands after SessionEnd) doesn't
+    /// resurrect an already-ended session. Pruned after `claudeSessionEndTombstoneTTL`.
+    private var endedClaudeSessions = ClaudeSessionEndTombstoneBuffer()
+    private let claudeSessionEndTombstoneTTL: TimeInterval = 60
 
     init(socketPath: String, logURL: URL, locationID: Int?, grabberSocketPath: String, dryRun: Bool) throws {
         guard geteuid() != 0 else {
@@ -151,6 +172,9 @@ final class StatusDaemon {
     }
 
     private func handleHook(_ hook: HookInput) throws -> DaemonResponse {
+        guard hook.effectiveSource == .codex else {
+            return try handleClaudeHook(hook)
+        }
         let projectKey = resolvedProjectKey(for: hook)
         if hook.endsSession {
             pendingApprovals.cancel(sessionID: hook.sessionID)
@@ -217,12 +241,125 @@ final class StatusDaemon {
         return DaemonResponse(ok: true, message: "hook accepted on key \(slot.keyIndex)", status: slot.status)
     }
 
+    /// Claude hook path (M1): hook-authoritative, so a session is registered
+    /// on its first non-`SessionEnd` hook rather than waiting on a catalog
+    /// scan (there is no catalog yet for Claude sources). Codex's approval
+    /// rollout routing (`CodexApprovalRouting`) is intentionally never
+    /// consulted here -- every Claude approval routes straight to the user
+    /// with the same 0.5s debounce Codex uses.
+    private func handleClaudeHook(_ hook: HookInput) throws -> DaemonResponse {
+        pruneEndedClaudeSessions()
+
+        if hook.isSubagent {
+            logger.log(
+                .debug,
+                "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) action=ignored_subagent\(hookDiagnosticContext(hook))"
+            )
+            return DaemonResponse(ok: true, message: "subagent hook ignored", status: nil)
+        }
+
+        if hook.endsSession {
+            pendingApprovals.cancel(sessionID: hook.sessionID)
+            claudeSessions.removeValue(forKey: hook.sessionID)
+            endedClaudeSessions.record(sessionID: hook.sessionID)
+            let mutation = try stateStore.update(
+                sessionID: hook.sessionID,
+                projectKey: hook.projectKey,
+                status: nil,
+                remove: true
+            )
+            logger.log(
+                .info,
+                "hook event=SessionEnd session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) action=session_removed\(hookDiagnosticContext(hook))"
+            )
+            if mutation.changed {
+                try reconcileLEDs()
+            }
+            return DaemonResponse(ok: true, message: "session ended", status: nil)
+        }
+
+        if endedClaudeSessions.isTombstoned(sessionID: hook.sessionID, ttl: claudeSessionEndTombstoneTTL) {
+            logger.log(
+                .debug,
+                "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) action=ignored_tombstoned\(hookDiagnosticContext(hook))"
+            )
+            return DaemonResponse(ok: true, message: "tombstoned session ignored", status: nil)
+        }
+
+        claudeSessions[hook.sessionID] = ClaudeSessionRecord(
+            sourceKind: hook.effectiveSource,
+            cwd: hook.projectKey,
+            herdrWorkspaceID: hook.herdrWorkspaceID,
+            navigation: claudeNavigationTarget(for: hook),
+            lastSeen: Date()
+        )
+
+        guard let status = hook.status else {
+            logger.log(
+                .debug,
+                "hook ignored event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue)"
+            )
+            return DaemonResponse(ok: true, message: "hook ignored", status: nil)
+        }
+
+        let projectKey = hook.projectKey
+        if status == .approval {
+            // Ensure the session already has a key before its approval
+            // color is (debounced-)displayed, in case this is the very
+            // first hook seen for it.
+            _ = try stateStore.assignIfNeeded(sessionID: hook.sessionID, projectKey: projectKey)
+            pendingApprovals.record(hook)
+            logger.log(
+                .info,
+                "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) status=approval action=debounced route=user source=\(hook.effectiveSource.rawValue) delay_ms=\(Int(approvalDisplayDelay * 1_000))\(hookDiagnosticContext(hook))"
+            )
+            return DaemonResponse(ok: true, message: "user approval display deferred", status: nil)
+        }
+
+        let cancelledApproval = pendingApprovals.cancel(sessionID: hook.sessionID) != nil
+        let mutation = try stateStore.update(sessionID: hook.sessionID, projectKey: projectKey, status: status)
+        guard let slot = mutation.slot else {
+            throw CLIError.runtime("Hook session was not assigned a C100 key")
+        }
+        logger.log(
+            .info,
+            "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) changed=\(mutation.changed)\(cancelledApproval ? " approval=resolved_before_display" : "")"
+        )
+        if mutation.changed {
+            if mutation.previousSlot == nil {
+                try reconcileLEDs()
+            } else {
+                try apply(color: slot.status.color, at: slot.keyIndex)
+            }
+        }
+        return DaemonResponse(ok: true, message: "hook accepted on key \(slot.keyIndex)", status: slot.status)
+    }
+
+    private func claudeNavigationTarget(for hook: HookInput) -> NavigationTarget {
+        switch hook.effectiveSource {
+        case .claudeHerdr:
+            if let paneID = hook.herdrPaneID {
+                return .herdrPane(paneID: paneID)
+            }
+            return .ghosttyTab(sessionID: hook.sessionID)
+        case .claudeDesktop:
+            return .claudeDesktop
+        case .claudeTerminal, .codex:
+            return .ghosttyTab(sessionID: hook.sessionID)
+        }
+    }
+
+    private func pruneEndedClaudeSessions(now: Date = Date()) {
+        endedClaudeSessions.prune(now: now, ttl: claudeSessionEndTombstoneTTL)
+    }
+
     private func servicePendingApprovals() {
         let due = pendingApprovals.due(delay: approvalDisplayDelay)
         guard !due.isEmpty else { return }
         for entry in due {
             do {
-                guard catalogSessionIDs.contains(entry.hook.sessionID) else {
+                guard catalogSessionIDs.contains(entry.hook.sessionID)
+                    || claudeSessions[entry.hook.sessionID] != nil else {
                     logger.log(
                         .debug,
                         "hook event=PermissionRequest session=\(shortSession(entry.hook.sessionID)) action=dropped_not_in_catalog\(hookDiagnosticContext(entry.hook))"
@@ -395,13 +532,17 @@ final class StatusDaemon {
                 .info,
                 "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) session=\(shortSession(assignment.sessionID))"
             )
-            // Only Codex is wired up as a session source in M0, so every stored
-            // slot navigates as a Codex thread. Once StateStore/SessionSlot carry
-            // a per-session NavigationTarget (M1+), this will be read from there.
+            // Claude sessions carry their own resolved NavigationTarget
+            // (herdr pane / Ghostty tab / Claude Desktop) recorded from their
+            // hooks; anything else (Codex, or a Claude session the daemon
+            // hasn't seen a hook for yet) falls back to Codex-thread
+            // navigation, matching pre-M1 behavior.
+            let target = claudeSessions[assignment.sessionID]?.navigation
+                ?? .codexThread(sessionID: assignment.sessionID)
             let navigated = navigationRouter.handleTap(
                 keyIndex: keyIndex,
                 sessionID: assignment.sessionID,
-                target: .codexThread(sessionID: assignment.sessionID)
+                target: target
             )
             guard navigated, assignment.slot.status == .done else { return }
 
@@ -423,6 +564,7 @@ final class StatusDaemon {
 
     private func syncCatalog() {
         nextCatalogSync = Date().addingTimeInterval(2)
+        pruneEndedClaudeSessions()
         do {
             // Codex-authoritative view: approval routing, deferred-hook
             // promotion, and turn-abort monitoring below remain gated to Codex
@@ -445,6 +587,25 @@ final class StatusDaemon {
             for provider in providers {
                 agentSessions.append(contentsOf: try provider.snapshot())
             }
+            // Claude has no on-disk catalog to snapshot yet (M3), so the
+            // sessions the daemon has learned about directly from hooks
+            // stand in here. This is what lets a hook-registered Claude
+            // session "move" from its provisional row (assigned by
+            // handleClaudeHook's stateStore.update) onto the UnifiedLayout
+            // row its herdrWorkspaceID/cwd grouping actually resolves to.
+            agentSessions.append(contentsOf: claudeSessions.map { sessionID, record in
+                AgentSession(
+                    sourceKind: record.sourceKind,
+                    sessionID: sessionID,
+                    cwd: record.cwd,
+                    rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: record.herdrWorkspaceID),
+                    recency: record.lastSeen.timeIntervalSince1970,
+                    rowRank: nil,
+                    columnRank: nil,
+                    seedStatus: nil,
+                    navigation: record.navigation
+                )
+            })
             let unified = UnifiedLayout.compute(sessions: agentSessions)
             for warning in unified.warnings {
                 logger.log(.warning, "catalog layout warning=\(warning)")
@@ -561,7 +722,8 @@ final class StatusDaemon {
     }
 
     private func resolvedProjectKey(for hook: HookInput) -> String {
-        catalogProjectBySession[hook.sessionID]
+        guard hook.effectiveSource == .codex else { return hook.projectKey }
+        return catalogProjectBySession[hook.sessionID]
             ?? catalogProjectByCWD[hook.projectKey]
             ?? CodexCatalog.projectKey(sessionID: hook.sessionID)
     }
