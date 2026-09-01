@@ -228,6 +228,25 @@ A session counts as alive if it isn't archived (`isArchived: false`) and at leas
 
 **SDK-mode notification caveat**: Claude Desktop's Claude Code runs in SDK mode rather than as the interactive TUI, and this project has not exhaustively verified that `Notification` hook events (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`) fire identically to the TUI in every case. `PermissionRequest` (fired on every tool permission check, independent of SDK vs. TUI mode) is the primary, more reliably-observed signal this daemon relies on for detecting a Desktop session waiting on approval; if your Desktop sessions don't light up amber when you'd expect, check `/tmp/keychron-c100-status-<uid>.log` for which hook events are actually arriving.
 
+## Layers (per-source grids)
+
+The keyboard multiplexes four independent grids ("layers"), one per session source: Codex Desktop, herdr, plain-terminal Claude Code, and Claude Desktop. Only one layer's sessions are shown on the main 0-89 key grid at a time; switching layers is instant and every layer keeps its own row/project bookkeeping, so a herdr session and a Codex session that happen to share a cwd never merge into (or fight over) the same row.
+
+**Row 9 (keys 90-99) is the layer switch bar.** Keys 94-99 are reserved for future use and always stay off.
+
+| Key | Layer | Base color | Why |
+| --- | --- | --- | --- |
+| 90 | Codex | Blue-violet / indigo (~#5B5BF5-#6466F1) | OpenAI Codex's own brand color |
+| 91 | herdr | Azure / dodger blue (`#4a9eff`) | herdr.dev's own `--accent` CSS variable (its default `terminal`/`herdr`/`taat` theme) |
+| 92 | Claude CLI (terminal) | Anthropic "Claude orange" (~#D97757) | Claude Code's own brand coral/terracotta |
+| 93 | Claude Desktop | Same Claude family, rotated toward red/burgundy and dimmed | Keeps the two Claude-sourced layers visually distinct from each other at a glance |
+
+Pressing a layer key switches the active layer immediately and persists the choice to `/tmp/keychron-c100-status-<uid>-layer.json`, so a daemon restart resumes on the same layer. The default (first run, or if that file is missing/corrupt) is herdr.
+
+**Non-active layers still light up their key** so you know something needs attention without switching over: whenever a background layer has a session in `approval`, `error`, or `done` (checked in that priority order), its key blinks -- toggling roughly every 600ms between its normal base color and that status's real color -- instead of staying static. The active layer's own key is always shown at full brightness with no blink. Because a layer's brand hue can sit close to a status color (Codex's blue-violet is near `.working`'s blue; Claude's orange is near `.approval`'s amber and `.error`'s red), the blink -- not the static color alone -- is what makes "this layer needs attention" reliably distinguishable from "this is just the layer's resting color".
+
+Hooks and catalog syncs for non-active layers keep updating that layer's internal state (and therefore its key's blink) in the background; they just don't repaint the main grid until you switch to that layer. Navigating a key (0-89) and the "press a done session to mark it read" acknowledgement only ever apply to the currently active layer's sessions.
+
 ## Runtime paths and options
 
 - Socket: `/tmp/keychron-c100-status-<uid>.sock`; override with `--socket PATH` on both daemon and clients.

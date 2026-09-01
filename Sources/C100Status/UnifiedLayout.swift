@@ -61,9 +61,14 @@ enum UnifiedLayout {
     /// slot shifts because a competing session's presence flickers) makes the
     /// LEDs for the loser repaint every sync even though nothing meaningful
     /// changed -- see the M0.1 flicker fix.
+    /// `maxRows` defaults to the historical single-grid cap (10) so every
+    /// pre-M5 call site (and self-test) is unaffected. M5's per-layer
+    /// daemon sync passes 9: row 9 (keys 90-99) is reserved for the layer
+    /// switch bar, so each layer's own grid only gets rows 0-8.
     static func compute(
         sessions: [AgentSession],
-        previousPlacements: [String: PreviousSlot] = [:]
+        previousPlacements: [String: PreviousSlot] = [:],
+        maxRows: Int = UnifiedLayout.maxRows
     ) -> UnifiedLayoutResult {
         guard !sessions.isEmpty else {
             return UnifiedLayoutResult(projectRows: [:], placements: [], warnings: [])

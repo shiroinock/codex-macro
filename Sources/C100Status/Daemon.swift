@@ -23,12 +23,34 @@ final class StatusDaemon {
     private var catalogProjectBySession: [String: String] = [:]
     private var catalogProjectByCWD: [String: String] = [:]
     private var catalogSessionIDs: Set<String> = []
-    /// Sticky feedback for `UnifiedLayout.compute`: the previous sync's
-    /// placements, so a repeating rank conflict resolves the same way (and a
-    /// session that lost one keeps its fallback slot) every time instead of
-    /// churning when a source's `recency` value moves or the session set
-    /// briefly flickers -- see `UnifiedLayout.compute`'s doc comment.
-    private var previousUnifiedPlacements: [String: UnifiedLayout.PreviousSlot] = [:]
+    /// Sticky feedback for `UnifiedLayout.compute`, kept *per layer* (M5):
+    /// each `SessionSourceKind` gets its own independent `compute()` call
+    /// (9-row cap, no cross-layer row merging), so its sticky-placement
+    /// feedback must also be kept independent -- otherwise switching layers
+    /// would mix one layer's previous-slot history into another's and
+    /// placements would churn on every switch. Within a layer this is the
+    /// same mechanism as pre-M5: the previous sync's placements, so a
+    /// repeating rank conflict resolves the same way (and a session that
+    /// lost one keeps its fallback slot) every time instead of churning when
+    /// a source's `recency` value moves or the session set briefly flickers
+    /// -- see `UnifiedLayout.compute`'s doc comment.
+    private var previousUnifiedPlacements: [SessionSourceKind: [String: UnifiedLayout.PreviousSlot]] = [:]
+    /// M5: which of the 4 `SessionSourceKind` layers is currently displayed
+    /// on keys 0-89. Loaded from `layerStore` at startup (defaults to
+    /// `.claudeHerdr`) and persisted every time it changes so a daemon
+    /// restart resumes on the same layer.
+    private var activeLayer: SessionSourceKind = LayerSelectionStore.defaultLayer
+    private let layerStore = LayerSelectionStore()
+    /// Colors last written to the 4 layer keys (90-93), so the ~600ms blink
+    /// timer only issues a single-key HID write when a key's color actually
+    /// changed instead of re-sending all 4 every tick.
+    private var lastPaintedLayerColors: [Int: HSVColor] = [:]
+    /// Toggled every ~600ms by the main loop; flips which of (attention
+    /// status color / layer base color) a blinking layer key currently
+    /// shows -- see `LayerKeyColorLogic.color`.
+    private var layerBlinkPhaseOn = false
+    private var nextLayerBlinkToggle = Date.distantPast
+    private let layerBlinkInterval: TimeInterval = 0.6
     /// Last sync's `UnifiedLayout` warning strings, so `syncCatalog` only
     /// logs a `catalog layout warning=` line when the set of active
     /// conflicts actually changes, not every 2s sync a still-unresolved one
@@ -161,8 +183,15 @@ final class StatusDaemon {
         _ = instanceLock
         try stateStore.clear()
         try stateStore.discardLegacyEndedSessions()
+        activeLayer = layerStore.load()
+        logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
         syncCatalog()
+        // Guarantee the layer bar (and whatever the first `syncCatalog` sync
+        // placed) is on the keyboard even if that sync's `GridReconciliation`
+        // happened to report no change (e.g. no sessions yet at all).
+        try reconcileLEDs()
+        nextLayerBlinkToggle = Date().addingTimeInterval(layerBlinkInterval)
         let server = try UnixSocketServer(path: socketPath)
         logger.log(
             .info,
@@ -190,6 +219,10 @@ final class StatusDaemon {
             servicePendingApprovals()
             if Date() >= nextCatalogSync {
                 syncCatalog()
+            }
+            if Date() >= nextLayerBlinkToggle {
+                nextLayerBlinkToggle = Date().addingTimeInterval(layerBlinkInterval)
+                updateLayerBlink()
             }
             guard let client = try server.accept(timeoutMilliseconds: 10) else { continue }
             autoreleasepool {
@@ -219,6 +252,7 @@ final class StatusDaemon {
                 deferredHooks.removeAll()
                 pendingApprovals.removeAll()
                 try applyAll(color: LEDColorName.off.color)
+                try reconcileLEDs()
                 logger.log(.info, "state cleared keys=off")
                 return DaemonResponse(ok: true, message: "state cleared", status: .idle)
             case .manual:
@@ -298,6 +332,7 @@ final class StatusDaemon {
         let mutation = try stateStore.update(
             sessionID: hook.sessionID,
             projectKey: projectKey,
+            source: .codex,
             status: status
         )
         guard let slot = mutation.slot else {
@@ -308,11 +343,7 @@ final class StatusDaemon {
             "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) changed=\(mutation.changed)\(cancelledApproval ? " approval=resolved_before_display" : "")"
         )
         if mutation.changed {
-            if mutation.previousSlot == nil {
-                try reconcileLEDs()
-            } else {
-                try apply(color: slot.status.color, at: slot.keyIndex)
-            }
+            try applyLayerAwareUpdate(source: .codex, mutation: mutation, slot: slot)
         }
         return DaemonResponse(ok: true, message: "hook accepted on key \(slot.keyIndex)", status: slot.status)
     }
@@ -341,6 +372,7 @@ final class StatusDaemon {
             let mutation = try stateStore.update(
                 sessionID: hook.sessionID,
                 projectKey: hook.projectKey,
+                source: hook.effectiveSource,
                 status: nil,
                 remove: true
             )
@@ -348,7 +380,7 @@ final class StatusDaemon {
                 .info,
                 "hook event=SessionEnd session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) action=session_removed\(hookDiagnosticContext(hook))"
             )
-            if mutation.changed {
+            if mutation.changed, hook.effectiveSource == activeLayer {
                 try reconcileLEDs()
             }
             return DaemonResponse(ok: true, message: "session ended", status: nil)
@@ -384,7 +416,7 @@ final class StatusDaemon {
             // Ensure the session already has a key before its approval
             // color is (debounced-)displayed, in case this is the very
             // first hook seen for it.
-            _ = try stateStore.assignIfNeeded(sessionID: hook.sessionID, projectKey: projectKey)
+            _ = try stateStore.assignIfNeeded(sessionID: hook.sessionID, projectKey: projectKey, source: hook.effectiveSource)
             pendingApprovals.record(hook)
             logger.log(
                 .info,
@@ -394,7 +426,12 @@ final class StatusDaemon {
         }
 
         let cancelledApproval = pendingApprovals.cancel(sessionID: hook.sessionID) != nil
-        let mutation = try stateStore.update(sessionID: hook.sessionID, projectKey: projectKey, status: status)
+        let mutation = try stateStore.update(
+            sessionID: hook.sessionID,
+            projectKey: projectKey,
+            source: hook.effectiveSource,
+            status: status
+        )
         guard let slot = mutation.slot else {
             throw CLIError.runtime("Hook session was not assigned a C100 key")
         }
@@ -403,11 +440,7 @@ final class StatusDaemon {
             "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) changed=\(mutation.changed)\(cancelledApproval ? " approval=resolved_before_display" : "")"
         )
         if mutation.changed {
-            if mutation.previousSlot == nil {
-                try reconcileLEDs()
-            } else {
-                try apply(color: slot.status.color, at: slot.keyIndex)
-            }
+            try applyLayerAwareUpdate(source: hook.effectiveSource, mutation: mutation, slot: slot)
         }
         return DaemonResponse(ok: true, message: "hook accepted on key \(slot.keyIndex)", status: slot.status)
     }
@@ -454,6 +487,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: entry.hook.sessionID,
                     projectKey: resolvedProjectKey(for: entry.hook),
+                    source: entry.hook.effectiveSource,
                     status: .approval
                 )
                 guard let slot = mutation.slot else { continue }
@@ -462,11 +496,7 @@ final class StatusDaemon {
                     "hook event=PermissionRequest session=\(shortSession(entry.hook.sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=approval action=waiting_for_user\(hookDiagnosticContext(entry.hook))"
                 )
                 guard mutation.changed else { continue }
-                if mutation.previousSlot == nil {
-                    try reconcileLEDs()
-                } else {
-                    try apply(color: slot.status.color, at: slot.keyIndex)
-                }
+                try applyLayerAwareUpdate(source: entry.hook.effectiveSource, mutation: mutation, slot: slot)
             } catch {
                 logger.log(
                     .warning,
@@ -496,36 +526,128 @@ final class StatusDaemon {
         }
     }
 
+    /// Only meaningful for the currently-displayed layer -- painting every
+    /// layer's sessions the same manual color onto keys 0-89 would overlay
+    /// up to 4 layers' worth of placements onto the same physical keys at
+    /// once, which makes no sense since only one layer's grid is ever
+    /// visible.
     private func applyAssigned(status: AgentStatus) throws {
-        let assignments = try stateStore.assignments()
+        let assignments = try stateStore.assignments(source: activeLayer)
         if dryRun {
-            logger.log(.info, "HID skipped assigned_keys status=\(status.rawValue) assigned=\(assignments.count)")
+            logger.log(.info, "HID skipped assigned_keys status=\(status.rawValue) assigned=\(assignments.count) layer=\(activeLayer.rawValue)")
             return
         }
         guard let connection else {
             throw CLIError.runtime("C100 vendor HID connection is unavailable")
         }
-        let colors = Dictionary(
+        var colors = Dictionary(
             uniqueKeysWithValues: assignments.map { ($0.slot.keyIndex, status.color) }
         )
+        for (key, color) in layerKeyColors() { colors[key] = color }
         try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
-        logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) persistence=volatile")
+        logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
     }
 
+    /// Full-frame repaint: keys 0-89 show `activeLayer`'s sessions only
+    /// (every other layer's sessions stay tracked in `StateStore` but never
+    /// reach the LEDs while inactive -- see the M5 doc comment on
+    /// `GridState`), keys 90-93 show the layer bar (base color, or
+    /// blinking between base/attention color -- see `LayerKeyColorLogic`),
+    /// and keys 94-99 are always off (unused, per the M5 spec).
     private func reconcileLEDs() throws {
-        let assignments = try stateStore.assignments()
+        let assignments = try stateStore.assignments(source: activeLayer)
+        let layerColors = layerKeyColors()
+        lastPaintedLayerColors = layerColors
         if dryRun {
-            logger.log(.info, "HID skipped frame assigned=\(assignments.count) unassigned=\(100 - assignments.count)")
+            logger.log(.info, "HID skipped frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue)")
             return
         }
         guard let connection else {
             throw CLIError.runtime("C100 vendor HID connection is unavailable")
         }
-        let colors = Dictionary(
+        var colors = Dictionary(
             uniqueKeysWithValues: assignments.map { ($0.slot.keyIndex, $0.slot.status.color) }
         )
+        for (key, color) in layerColors { colors[key] = color }
         try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
-        logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) persistence=volatile")
+        logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
+    }
+
+    /// Colors for the 4 layer keys (90-93) right now, given the current
+    /// active layer and blink phase. Pulled out of `reconcileLEDs` so the
+    /// ~600ms blink timer (`updateLayerBlink`) can compute the same colors
+    /// without doing a full grid repaint.
+    private func layerKeyColors() -> [Int: HSVColor] {
+        var colors: [Int: HSVColor] = [:]
+        for source in LayerKeyColorLogic.order {
+            guard let keyIndex = LayerKeyColorLogic.keyIndexes[source] else { continue }
+            let statuses = (try? stateStore.assignments(source: source))?.map(\.slot.status) ?? []
+            colors[keyIndex] = LayerKeyColorLogic.color(
+                for: source,
+                isActive: source == activeLayer,
+                sessionStatuses: statuses,
+                blinkPhaseOn: layerBlinkPhaseOn
+            )
+        }
+        return colors
+    }
+
+    /// Called every `layerBlinkInterval` (~600ms) from the main loop. Only
+    /// issues a single-key HID write (the same path a status-change hook
+    /// already uses) for a layer key whose color actually changed since the
+    /// last paint, so steady-state (nothing blinking) costs nothing beyond
+    /// recomputing 4 colors and comparing them.
+    private func updateLayerBlink() {
+        layerBlinkPhaseOn.toggle()
+        let colors = layerKeyColors()
+        for (key, color) in colors where lastPaintedLayerColors[key] != color {
+            do {
+                try apply(color: color, at: key)
+            } catch {
+                logger.log(.warning, "layer key blink update failed key=\(key) error=\(error)")
+            }
+        }
+        lastPaintedLayerColors = colors
+    }
+
+    /// A status mutation only ever needs to touch the LEDs when it belongs
+    /// to the layer currently on screen -- a hook for a background layer's
+    /// session still updates `StateStore` (see every `stateStore.update`
+    /// call site), but must never repaint keys 0-89, which only ever show
+    /// `activeLayer`. `mutation.previousSlot == nil` (a session's very first
+    /// placement) still forces a full `reconcileLEDs()` rather than a
+    /// single-key write, matching the pre-M5 behavior: a brand-new key can
+    /// only be trusted alongside a full-frame repaint of its neighbors.
+    private func applyLayerAwareUpdate(source: SessionSourceKind, mutation: SessionMutation, slot: SessionSlot) throws {
+        guard source == activeLayer else { return }
+        if mutation.previousSlot == nil {
+            try reconcileLEDs()
+        } else {
+            try apply(color: slot.status.color, at: slot.keyIndex)
+        }
+    }
+
+    /// Handles a press on one of the 4 layer-switch keys (90=Codex,
+    /// 91=herdr, 92=Claude CLI, 93=Claude Desktop): switches the displayed
+    /// layer, persists the choice (so a daemon restart resumes on it), and
+    /// does a full repaint -- both because the grid content itself changes
+    /// entirely and because pressing a blinking layer key is this app's
+    /// only "acknowledge" gesture for that layer's attention state (there is
+    /// no separate read receipt; switching to it and seeing its sessions is
+    /// the acknowledgment).
+    private func switchLayer(to newLayer: SessionSourceKind) {
+        guard newLayer != activeLayer else {
+            logger.log(.debug, "layer press layer=\(newLayer.rawValue) action=already_active")
+            return
+        }
+        activeLayer = newLayer
+        layerStore.save(newLayer)
+        logger.log(.info, "layer switch active=\(newLayer.rawValue) action=switched")
+        do {
+            try reconcileLEDs()
+        } catch {
+            logger.log(.error, "layer switch repaint failed layer=\(newLayer.rawValue) error=\(error)")
+        }
     }
 
     private func apply(color: HSVColor, at index: Int) throws {
@@ -608,9 +730,19 @@ final class StatusDaemon {
     }
 
     private func handleKeyPress(keyIndex: Int) {
+        // Row 9 (keys 90-99): 90-93 are the layer switch bar, 94-99 are
+        // unused (per the M5 spec) and never reach grid navigation below.
+        if keyIndex >= 90 {
+            if let source = LayerKeyColorLogic.keyIndexes.first(where: { $0.value == keyIndex })?.key {
+                switchLayer(to: source)
+            } else {
+                logger.log(.debug, "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) action=ignored_unused_layer_key")
+            }
+            return
+        }
         do {
-            guard let assignment = try stateStore.assignment(at: keyIndex) else {
-                logger.log(.debug, "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) action=ignored_unassigned")
+            guard let assignment = try stateStore.assignment(at: keyIndex, source: activeLayer) else {
+                logger.log(.debug, "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) layer=\(activeLayer.rawValue) action=ignored_unassigned")
                 return
             }
             logger.log(
@@ -636,6 +768,7 @@ final class StatusDaemon {
             let mutation = try stateStore.update(
                 sessionID: assignment.sessionID,
                 projectKey: assignment.slot.projectKey,
+                source: activeLayer,
                 status: .idle
             )
             guard let slot = mutation.slot else { return }
@@ -705,6 +838,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
                     projectKey: "(herdr-pane-closed)",
+                    source: .claudeHerdr,
                     status: nil,
                     remove: true
                 )
@@ -740,6 +874,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
                     projectKey: "(claude-terminal-ended)",
+                    source: .claudeTerminal,
                     status: nil,
                     remove: true
                 )
@@ -770,6 +905,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
                     projectKey: "(claude-desktop-ended)",
+                    source: .claudeDesktop,
                     status: nil,
                     remove: true
                 )
@@ -833,31 +969,54 @@ final class StatusDaemon {
                     navigation: record.navigation
                 )
             })
-            let unified = UnifiedLayout.compute(sessions: agentSessions, previousPlacements: previousUnifiedPlacements)
-            let currentCatalogWarnings = Set(unified.warnings)
+            // M5: each layer (SessionSourceKind) gets its own independent
+            // `UnifiedLayout.compute` -- 9-row cap (row 9 is the layer bar),
+            // no cross-layer row merging -- and its own `StateStore.reconcile`
+            // call, which only ever touches that layer's slice of the grid
+            // (see `GridState`'s doc comment). This is what makes a herdr
+            // session and a Codex session that happen to share a cwd land on
+            // independent rows in their own layers instead of merging into
+            // one shared row the way pre-M5's single grid did.
+            var unifiedBySource: [SessionSourceKind: UnifiedLayoutResult] = [:]
+            var reconciliationBySource: [SessionSourceKind: GridReconciliation] = [:]
+            var anyReconciliationChanged = false
+            var currentCatalogWarnings: Set<String> = []
+            for source in SessionSourceKind.allCases {
+                let sourceSessions = agentSessions.filter { $0.sourceKind == source }
+                let unified = UnifiedLayout.compute(
+                    sessions: sourceSessions,
+                    previousPlacements: previousUnifiedPlacements[source] ?? [:],
+                    maxRows: GridState.rowCapacity
+                )
+                currentCatalogWarnings.formUnion(unified.warnings.map { "\(source.rawValue): \($0)" })
+                previousUnifiedPlacements[source] = Dictionary(uniqueKeysWithValues: unified.placements.map {
+                    ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
+                })
+                let reconciliation = try stateStore.reconcile(
+                    source: source,
+                    projectRows: unified.projectRows,
+                    placements: unified.placements.map {
+                        (
+                            sessionID: $0.session.sessionID,
+                            projectKey: $0.projectKey,
+                            row: $0.row,
+                            column: $0.column
+                        )
+                    }
+                )
+                unifiedBySource[source] = unified
+                reconciliationBySource[source] = reconciliation
+                if reconciliation.changed { anyReconciliationChanged = true }
+            }
             for warning in currentCatalogWarnings.subtracting(previousCatalogWarnings) {
                 logger.log(.warning, "catalog layout warning=\(warning)")
             }
             previousCatalogWarnings = currentCatalogWarnings
-            previousUnifiedPlacements = Dictionary(uniqueKeysWithValues: unified.placements.map {
-                ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
-            })
             let sessions = catalogSessions
 
-            let reconciliation = try stateStore.reconcile(
-                projectRows: unified.projectRows,
-                placements: unified.placements.map {
-                    (
-                        sessionID: $0.session.sessionID,
-                        projectKey: $0.projectKey,
-                        row: $0.row,
-                        column: $0.column
-                    )
-                }
-            )
             let herdrStatusChanged = try applyHerdrStatusHeuristics(
                 herdrAgentSessions: herdrAgentSessions,
-                reconciliation: reconciliation
+                reconciliation: reconciliationBySource[.claudeHerdr] ?? GridReconciliation(previous: GridState(), current: GridState())
             )
 
             catalogSessionIDs = nextCatalogSessionIDs
@@ -894,6 +1053,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: entry.hook.sessionID,
                     projectKey: resolvedProjectKey(for: entry.hook),
+                    source: .codex,
                     status: promotedStatus
                 )
                 guard let slot = mutation.slot else { continue }
@@ -915,6 +1075,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
                     projectKey: slot.projectKey,
+                    source: .codex,
                     status: .idle
                 )
                 guard let updated = mutation.slot, mutation.changed else { continue }
@@ -925,14 +1086,15 @@ final class StatusDaemon {
                 )
             }
 
-            if reconciliation.changed {
+            for source in SessionSourceKind.allCases {
+                guard let reconciliation = reconciliationBySource[source], reconciliation.changed else { continue }
                 let previousIDs = Set(reconciliation.previous.sessions.keys)
                 let currentIDs = Set(reconciliation.current.sessions.keys)
                 for sessionID in previousIDs.subtracting(currentIDs) {
                     guard let slot = reconciliation.previous.sessions[sessionID] else { continue }
                     logger.log(
                         .info,
-                        "catalog session=\(shortSession(sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) action=released"
+                        "catalog session=\(shortSession(sessionID)) layer=\(source.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) action=released"
                     )
                 }
                 for sessionID in currentIDs {
@@ -942,15 +1104,16 @@ final class StatusDaemon {
                     let action = previous == nil ? "assigned" : "moved"
                     logger.log(
                         .info,
-                        "catalog session=\(shortSession(sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) action=\(action)"
+                        "catalog session=\(shortSession(sessionID)) layer=\(source.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) action=\(action)"
                     )
                 }
+                let unified = unifiedBySource[source]
                 logger.log(
                     .info,
-                    "catalog sync projects=\(unified.projectRows.count) sessions=\(unified.placements.count) layout=updated"
+                    "catalog sync layer=\(source.rawValue) projects=\(unified?.projectRows.count ?? 0) sessions=\(unified?.placements.count ?? 0) layout=updated"
                 )
             }
-            if reconciliation.changed || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged
+            if anyReconciliationChanged || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged
                 || claudeTerminalRemovalChanged || claudeDesktopRemovalChanged || staleGCChanged {
                 try reconcileLEDs()
             }
@@ -981,6 +1144,7 @@ final class StatusDaemon {
             let mutation = try stateStore.update(
                 sessionID: sessionID,
                 projectKey: "(claude-transcript-stale)",
+                source: record.sourceKind,
                 status: nil,
                 remove: true
             )
@@ -1019,6 +1183,7 @@ final class StatusDaemon {
                 let mutation = try stateStore.update(
                     sessionID: session.sessionID,
                     projectKey: reconciliation.current.sessions[session.sessionID]?.projectKey ?? "(herdr)",
+                    source: .claudeHerdr,
                     status: seedStatus
                 )
                 if mutation.changed {
@@ -1051,6 +1216,7 @@ final class StatusDaemon {
             let mutation = try stateStore.update(
                 sessionID: sessionID,
                 projectKey: currentSlot.projectKey,
+                source: .claudeHerdr,
                 status: streak.status
             )
             if mutation.changed {

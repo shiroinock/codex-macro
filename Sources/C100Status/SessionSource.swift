@@ -5,7 +5,7 @@ import Foundation
 /// Only `.codex` is populated in M0. The remaining cases exist so the
 /// abstraction (grid layout, navigation dispatch, hook wiring) can be built
 /// out now and filled in by later milestones without another refactor.
-enum SessionSourceKind: String, Codable, Equatable {
+enum SessionSourceKind: String, Codable, Equatable, CaseIterable {
     case codex
     case claudeHerdr = "claude-herdr"
     case claudeTerminal = "claude-terminal"

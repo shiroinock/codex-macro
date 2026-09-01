@@ -923,13 +923,13 @@ enum C100StatusCLI {
         }
 
         var grid = GridState()
-        let a0 = try grid.update(sessionID: "a0", projectKey: "/project/a", status: .idle)
-        let a1 = try grid.update(sessionID: "a1", projectKey: "/project/a", status: .working)
-        let b0 = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .approval)
-        let b0Done = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .done)
-        let b0Acknowledged = try grid.update(sessionID: "b0", projectKey: "/project/b", status: .idle)
-        _ = try grid.update(sessionID: "a0", projectKey: "/project/a", status: nil, remove: true)
-        let a2 = try grid.update(sessionID: "a2", projectKey: "/project/a", status: .idle)
+        let a0 = try grid.update(sessionID: "a0", projectKey: "/project/a", source: .codex, status: .idle)
+        let a1 = try grid.update(sessionID: "a1", projectKey: "/project/a", source: .codex, status: .working)
+        let b0 = try grid.update(sessionID: "b0", projectKey: "/project/b", source: .codex, status: .approval)
+        let b0Done = try grid.update(sessionID: "b0", projectKey: "/project/b", source: .codex, status: .done)
+        let b0Acknowledged = try grid.update(sessionID: "b0", projectKey: "/project/b", source: .codex, status: .idle)
+        _ = try grid.update(sessionID: "a0", projectKey: "/project/a", source: .codex, status: nil, remove: true)
+        let a2 = try grid.update(sessionID: "a2", projectKey: "/project/a", source: .codex, status: .idle)
         guard a0.slot?.keyIndex == 0,
               a1.slot?.keyIndex == 1,
               b0.slot?.keyIndex == 10,
@@ -937,9 +937,159 @@ enum C100StatusCLI {
               b0Acknowledged.slot?.status == .idle,
               b0Acknowledged.changed,
               a2.slot?.keyIndex == 0,
-              grid.projectRows["/project/a"] == 0,
-              grid.projectRows["/project/b"] == 1 else {
+              grid.projectRows[SessionSourceKind.codex.rawValue]?["/project/a"] == 0,
+              grid.projectRows[SessionSourceKind.codex.rawValue]?["/project/b"] == 1 else {
             throw CLIError.runtime("Project-row/session-column allocation self-test failed")
+        }
+
+        // M5: two different layers (SessionSourceKind) get fully independent
+        // row/column namespaces even for the same project key and even at
+        // the same physical row/column -- the whole point of per-layer grids
+        // is that a herdr session and a Codex session sharing a cwd never
+        // have to merge or contend for the same slot.
+        var layeredGrid = GridState()
+        let codexSlot = try layeredGrid.update(sessionID: "codex-1", projectKey: "/shared", source: .codex, status: .working)
+        let herdrSlot = try layeredGrid.update(sessionID: "herdr-1", projectKey: "/shared", source: .claudeHerdr, status: .approval)
+        guard codexSlot.slot?.keyIndex == 0, herdrSlot.slot?.keyIndex == 0,
+              layeredGrid.sessions["codex-1"]?.source == .codex,
+              layeredGrid.sessions["herdr-1"]?.source == .claudeHerdr,
+              layeredGrid.projectRows[SessionSourceKind.codex.rawValue]?["/shared"] == 0,
+              layeredGrid.projectRows[SessionSourceKind.claudeHerdr.rawValue]?["/shared"] == 0 else {
+            throw CLIError.runtime("Per-layer GridState independence self-test failed")
+        }
+        let layeredStore = try {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("c100-status-layered-grid-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return (StateStore(uid: 4321, runtimeDirectory: directory), directory)
+        }()
+        defer { try? FileManager.default.removeItem(at: layeredStore.1) }
+        _ = try layeredStore.0.update(sessionID: "codex-2", projectKey: "/p", source: .codex, status: .working)
+        let herdrReconciliation = try layeredStore.0.reconcile(
+            source: .claudeHerdr,
+            projectRows: ["/p": 0],
+            placements: [(sessionID: "herdr-2", projectKey: "/p", row: 0, column: 0)]
+        )
+        let codexOnlyAfterHerdrReconcile = try layeredStore.0.assignments(source: .codex)
+        let herdrOnlyAfterReconcile = try layeredStore.0.assignments(source: .claudeHerdr)
+        guard herdrReconciliation.changed,
+              codexOnlyAfterHerdrReconcile.map(\.sessionID) == ["codex-2"],
+              herdrOnlyAfterReconcile.map(\.sessionID) == ["herdr-2"],
+              try layeredStore.0.assignment(at: 0, source: .codex)?.sessionID == "codex-2",
+              try layeredStore.0.assignment(at: 0, source: .claudeHerdr)?.sessionID == "herdr-2" else {
+            throw CLIError.runtime(
+                "StateStore.reconcile(source:) layer-isolation self-test failed: a non-active layer's hook-derived session leaked into another layer's display"
+            )
+        }
+
+        // M5: UnifiedLayout.compute(maxRows: 9) -- the per-layer cap the
+        // daemon actually uses (row 9 stays reserved for the layer switch
+        // bar) -- must never place a session on row 9, unlike the default
+        // 10-row single-grid cap every other UnifiedLayout self-test below
+        // exercises.
+        let nineRowSessions = (0..<10).map { index in
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "row-cap-\(index)",
+                cwd: "/project/\(index)",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: nil),
+                recency: Double(index),
+                rowRank: nil,
+                columnRank: nil,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "row-cap-\(index)")
+            )
+        }
+        let nineRowResult = UnifiedLayout.compute(sessions: nineRowSessions, maxRows: 9)
+        guard nineRowResult.placements.allSatisfy({ $0.row < 9 }),
+              nineRowResult.placements.count == 9,
+              !nineRowResult.warnings.isEmpty else {
+            throw CLIError.runtime("UnifiedLayout per-layer 9-row cap (layer bar reservation) self-test failed")
+        }
+
+        // M5: LayerKeyColorLogic pure functions -- base color brightness,
+        // attention-status priority (approval > error > done, working/idle
+        // never trigger), and the active-vs-blink color decision itself.
+        guard LayerKeyColorLogic.keyIndexes == [
+            .codex: 90, .claudeHerdr: 91, .claudeTerminal: 92, .claudeDesktop: 93,
+        ] else {
+            throw CLIError.runtime("LayerKeyColorLogic.keyIndexes self-test failed")
+        }
+        for source in LayerKeyColorLogic.order {
+            let active = LayerKeyColorLogic.baseColor(for: source, isActive: true)
+            let inactive = LayerKeyColorLogic.baseColor(for: source, isActive: false)
+            guard active.hue == inactive.hue, active.value > inactive.value else {
+                throw CLIError.runtime("LayerKeyColorLogic.baseColor active/inactive brightness self-test failed for \(source.rawValue)")
+            }
+        }
+        guard LayerKeyColorLogic.attentionStatus(among: [.working, .idle]) == nil,
+              LayerKeyColorLogic.attentionStatus(among: [.done, .error, .approval]) == .approval,
+              LayerKeyColorLogic.attentionStatus(among: [.done, .error]) == .error,
+              LayerKeyColorLogic.attentionStatus(among: [.done]) == .done,
+              LayerKeyColorLogic.attentionStatus(among: []) == nil else {
+            throw CLIError.runtime("LayerKeyColorLogic.attentionStatus priority self-test failed")
+        }
+        let activeLayerColor = LayerKeyColorLogic.color(
+            for: .claudeHerdr, isActive: true, sessionStatuses: [.approval], blinkPhaseOn: false
+        )
+        let inactiveNoAttention = LayerKeyColorLogic.color(
+            for: .claudeHerdr, isActive: false, sessionStatuses: [.working], blinkPhaseOn: true
+        )
+        let inactiveBlinkOff = LayerKeyColorLogic.color(
+            for: .claudeHerdr, isActive: false, sessionStatuses: [.approval], blinkPhaseOn: false
+        )
+        let inactiveBlinkOn = LayerKeyColorLogic.color(
+            for: .claudeHerdr, isActive: false, sessionStatuses: [.approval], blinkPhaseOn: true
+        )
+        guard activeLayerColor == LayerKeyColorLogic.baseColor(for: .claudeHerdr, isActive: true),
+              inactiveNoAttention == LayerKeyColorLogic.baseColor(for: .claudeHerdr, isActive: false),
+              inactiveBlinkOff == LayerKeyColorLogic.baseColor(for: .claudeHerdr, isActive: false),
+              inactiveBlinkOn == AgentStatus.approval.color,
+              inactiveBlinkOff != inactiveBlinkOn else {
+            throw CLIError.runtime("LayerKeyColorLogic.color active/blink self-test failed")
+        }
+
+        // M5: LayerSelectionStore persists the active layer across a
+        // simulated restart (a fresh instance pointed at the same file), and
+        // falls back to the documented default when the file is missing or
+        // corrupt rather than failing.
+        let layerStoreDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-layer-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: layerStoreDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: layerStoreDirectory) }
+        let freshLayerStore = LayerSelectionStore(uid: 9999, runtimeDirectory: layerStoreDirectory)
+        guard freshLayerStore.load() == LayerSelectionStore.defaultLayer else {
+            throw CLIError.runtime("LayerSelectionStore default-when-missing self-test failed")
+        }
+        freshLayerStore.save(.claudeDesktop)
+        let reloadedLayerStore = LayerSelectionStore(uid: 9999, runtimeDirectory: layerStoreDirectory)
+        guard reloadedLayerStore.load() == .claudeDesktop else {
+            throw CLIError.runtime("LayerSelectionStore save/reload roundtrip self-test failed")
+        }
+        let corruptLayerFile = layerStoreDirectory.appendingPathComponent("keychron-c100-status-9999-layer.json")
+        try Data("not json".utf8).write(to: corruptLayerFile, options: .atomic)
+        guard LayerSelectionStore(uid: 9999, runtimeDirectory: layerStoreDirectory).load() == LayerSelectionStore.defaultLayer else {
+            throw CLIError.runtime("LayerSelectionStore corrupt-file fallback self-test failed")
+        }
+
+        // M5: `StateStore.assignments(source:)` is the display filter the
+        // daemon paints keys 0-89 from -- it must return exactly one layer's
+        // sessions even when multiple layers have sessions assigned to the
+        // very same key index.
+        let displayFilterStore = try {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("c100-status-display-filter-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return (StateStore(uid: 8888, runtimeDirectory: directory), directory)
+        }()
+        defer { try? FileManager.default.removeItem(at: displayFilterStore.1) }
+        _ = try displayFilterStore.0.update(sessionID: "codex-3", projectKey: "/x", source: .codex, status: .working)
+        _ = try displayFilterStore.0.update(sessionID: "cli-3", projectKey: "/x", source: .claudeTerminal, status: .approval)
+        _ = try displayFilterStore.0.update(sessionID: "desktop-3", projectKey: "/x", source: .claudeDesktop, status: .idle)
+        let codexOnly = try displayFilterStore.0.assignments(source: .codex)
+        guard codexOnly.map(\.sessionID) == ["codex-3"],
+              try displayFilterStore.0.assignments(source: .claudeHerdr).isEmpty else {
+            throw CLIError.runtime("StateStore.assignments(source:) display-filter self-test failed")
         }
 
         let catalogLayout = CodexCatalog.orderedLayout([
@@ -1785,7 +1935,7 @@ enum C100StatusCLI {
         try selfTestClaudeHooksInstaller()
         try selfTestAgentInstaller()
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, and install-agent")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, and install-agent")
     }
 
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end
