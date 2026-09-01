@@ -136,7 +136,7 @@ Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Cod
 
 ## Claude Code (herdr / terminal / Claude Desktop)
 
-The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). As of M2, the herdr integration is implemented; plain-terminal and Claude Desktop navigation (M3/M4) still fall back to logging the intent instead of navigating.
+The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). As of M3, herdr and plain-terminal (Ghostty) Claude Code sessions are both fully implemented; Claude Desktop navigation (M4) still falls back to logging the intent instead of navigating.
 
 ### Installing the Claude Code hooks
 
@@ -166,12 +166,30 @@ Pressing an assigned herdr session's key runs `herdr agent focus <pane_id>` (200
 
 The daemon resolves `herdr` in this order: `--herdr-bin PATH` (on `run`) > `HERDR_BIN` environment variable > `/opt/homebrew/bin/herdr` > `/usr/local/bin/herdr` > `~/.cargo/bin/herdr`. If none resolve to an executable, herdr support is silently disabled (a single INFO log line at startup) and the daemon otherwise behaves exactly as it did before M2.
 
+### How plain-terminal (Ghostty) Claude Code sessions work
+
+A `claude` process launched directly in a terminal -- no herdr, no Claude Desktop -- is tracked two ways at once:
+
+- **Hooks are authoritative for status.** The same `c100-status hook --source claude` entries used for herdr (see "Installing the Claude Code hooks" above) register/update the session and drive its idle/working/approval/done state.
+- **`sessions/<pid>.json` is authoritative for placement.** Claude Code writes one small JSON file per running process under `<configDir>/sessions/<pid>.json` (fields used: `pid`, `sessionId`, `cwd`; other fields such as `version`, `peerFeatures`, `messagingSocketPath` are ignored). Every sync (2s cadence), the daemon scans this file across all three config directories (`~/.claude`, `~/.claude-config/max`, `~/.claude-config/enterprise`, plus anything passed via `--claude-config-dirs`), confirms the `pid` in the filename is still alive (`kill(pid, 0)`), and uses the file's `cwd` for row/column grouping. This lets a session already running when the daemon starts get seeded onto the grid immediately, without waiting for its next hook event.
+
+Each `sessions/<pid>.json` file is opened with `O_NOFOLLOW` (refusing symlinks) and capped at 64 KiB before being parsed; oversized or non-regular files are skipped rather than read.
+
+If a session herdr is also tracking is the same Claude Code process (i.e. the same session id shows up in both the herdr poll and the terminal scan), herdr's placement wins and the terminal-scan copy is dropped -- avoiding a session flapping between two different row/column placements every sync.
+
+Two independent garbage-collection paths cover a terminal session ending without ever going through Claude Code's normal shutdown: if a hook-registered session's `sessions/<pid>.json` disappears or its pid dies without a `SessionEnd` hook ever arriving (crash, `kill -9`), it's removed on the next sync; separately, any hook-registered Claude session (herdr, terminal, or desktop alike) whose transcript `.jsonl` file hasn't been modified in 30 minutes is presumed abandoned and removed as a safety net.
+
+Pressing an assigned terminal session's key runs an AppleScript against Ghostty (`com.mitchellh.ghostty`) that walks every open window/tab/terminal looking for one whose `working directory` matches the session's `cwd` exactly, then activates its window, selects its tab, and focuses the terminal (Ghostty's AppleScript dictionary does not expose a terminal's underlying pid, so `cwd` is the only usable identifying property; if more than one open tab shares the same cwd, the first match wins). The `cwd` value is passed as an `osascript` `argv` argument, never interpolated into the script text, so it cannot be used to inject additional AppleScript. The script runs with a 1 second hard timeout; if it times out, macOS Automation permission for the daemon hasn't been granted (or was revoked), or no tab matches, the daemon logs why and falls back to just activating Ghostty via `NSWorkspace`, the same fallback herdr navigation uses. The first time this fires, macOS will prompt to allow the daemon to control Ghostty via Apple Events (System Settings > Privacy & Security > Automation) -- until that's approved, every key press falls back to just activating Ghostty without a specific tab.
+
+Note: Ghostty's AppleScript dictionary only exposes `environment variables` as a write-only property used when *creating* a new terminal; it cannot be read back from an already-running terminal to identify a session more precisely, which is why matching is cwd-based rather than session-id-based.
+
 ## Runtime paths and options
 
 - Socket: `/tmp/keychron-c100-status-<uid>.sock`; override with `--socket PATH` on both daemon and clients.
 - Grabber socket: `/var/run/keychron-c100-grabber-<uid>.sock`; override with `--grabber-socket PATH` for diagnostics.
 - Log: `/tmp/keychron-c100-status-<uid>.log`; override with `--log-file PATH` on `run`, `logs`, and `log-path`.
 - Device: pass `--location 0x110000` to `run` when selecting among multiple C100 devices.
+- Claude Code config directories: `~/.claude`, `~/.claude-config/max`, and `~/.claude-config/enterprise` are always scanned for `sessions/<pid>.json`; pass `--claude-config-dirs PATH1,PATH2` to scan additional directories on top of those three.
 - Input ownership: startup fails rather than leaving normal C100 typing enabled when exclusive capture cannot be obtained.
 
 `apply <status>` bypasses the daemon and writes directly to HID. Use it only for troubleshooting while the daemon and Keychron Launcher are stopped.

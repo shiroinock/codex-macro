@@ -32,7 +32,7 @@ struct RowGroupingHints: Equatable {
 enum NavigationTarget: Equatable {
     case codexThread(sessionID: String)
     case herdrPane(paneID: String)
-    case ghosttyTab(sessionID: String)
+    case ghosttyTab(sessionID: String, cwd: String, pid: Int32?)
     case claudeDesktop
 }
 
@@ -81,6 +81,46 @@ protocol SessionSourceProvider {
 
 extension SessionSourceProvider {
     func acceptHook(_ hook: HookInput) -> HookVerdict { .ignore }
+}
+
+/// Resolves the same `sessionID` reported by more than one source down to a
+/// single `AgentSession`, per the implementation plan's dedup priority:
+/// `claudeHerdr > claudeDesktop > claudeTerminal` (first-wins; Codex session
+/// ids never collide with Claude ones by construction, so its relative
+/// priority is irrelevant). Pure/order-stable so it's cheap to unit test in
+/// isolation from `Daemon`.
+///
+/// `Daemon.syncCatalog` currently applies the herdr-over-terminal half of
+/// this same policy inline (via `Set` exclusion against each provider's
+/// current-sync sessionIDs, alongside its own per-source GC bookkeeping);
+/// this standalone version exists so the policy has a single pure, tested
+/// definition and is ready to be reused once `claudeDesktop` gains its own
+/// `SessionSourceProvider` in M4.
+enum SessionSourceDedup {
+    static func priority(_ kind: SessionSourceKind) -> Int {
+        switch kind {
+        case .claudeHerdr: 0
+        case .claudeDesktop: 1
+        case .claudeTerminal: 2
+        case .codex: 3
+        }
+    }
+
+    static func resolve(_ sessions: [AgentSession]) -> [AgentSession] {
+        var bestByID: [String: AgentSession] = [:]
+        var order: [String] = []
+        for session in sessions {
+            if let existing = bestByID[session.sessionID] {
+                if priority(session.sourceKind) < priority(existing.sourceKind) {
+                    bestByID[session.sessionID] = session
+                }
+            } else {
+                bestByID[session.sessionID] = session
+                order.append(session.sessionID)
+            }
+        }
+        return order.compactMap { bestByID[$0] }
+    }
 }
 
 /// Thin adapter exposing the existing, unmodified `CodexCatalog` as a

@@ -23,6 +23,7 @@ struct Options {
     var hookSource = "codex"
     var notificationMatcher: String?
     var herdrBinaryPath: String?
+    var claudeConfigDirs: [String] = []
 }
 
 enum C100StatusCLI {
@@ -40,7 +41,8 @@ enum C100StatusCLI {
                 locationID: options.locationID,
                 grabberSocketPath: options.grabberSocketPath,
                 dryRun: options.dryRun,
-                herdrBinaryPath: options.herdrBinaryPath
+                herdrBinaryPath: options.herdrBinaryPath,
+                claudeConfigDirs: ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs)
             )
             try daemon.run()
         case "grabber-service":
@@ -115,6 +117,15 @@ enum C100StatusCLI {
                 }
             } else {
                 print("herdr sessions: herdr binary not found (--herdr-bin / HERDR_BIN / PATH)")
+            }
+            let claudeConfigDirs = ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs)
+            let claudeTerminalSessions = try ClaudeSessionsCatalog(configDirs: claudeConfigDirs).snapshot()
+            print("claude-terminal sessions (config_dirs=\(claudeConfigDirs.joined(separator: ","))):")
+            for session in claudeTerminalSessions.sorted(by: { $0.sessionID < $1.sessionID }) {
+                print("  session=\(session.sessionID) cwd=\(session.cwd)")
+            }
+            if claudeTerminalSessions.isEmpty {
+                print("  (no live claude sessions/<pid>.json found)")
             }
         case "request-input-access":
             let before = C100InputCapture.accessDescription
@@ -336,6 +347,15 @@ enum C100StatusCLI {
                     throw CLIError.usage("--herdr-bin requires a path")
                 }
                 options.herdrBinaryPath = arguments[index]
+            case "--claude-config-dirs":
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else {
+                    throw CLIError.usage("--claude-config-dirs requires a comma-separated list of paths")
+                }
+                options.claudeConfigDirs = arguments[index]
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
             default:
                 positionals.append(arguments[index])
             }
@@ -1187,7 +1207,230 @@ enum C100StatusCLI {
               physicalMap.resolve(usage: 99) == .unmapped else {
             throw CLIError.runtime("Keychron report self-test failed")
         }
-        print("self-test passed: hooks, Codex catalog, herdr catalog, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
+
+        // M3: `sessions/<pid>.json` decode against the real schema confirmed
+        // from a live Claude Code process (fields beyond pid/sessionId/cwd
+        // are present on the real file but irrelevant here and must be
+        // ignored, not rejected).
+        let claudeSessionFileJSON = #"""
+        {"pid":32317,"sessionId":"a4085832-886f-4195-86cd-3c8bbfef72c0","cwd":"/Users/dev/repo","startedAt":1788247808700,"version":"2.1.252","kind":"interactive","entrypoint":"cli","status":"idle"}
+        """#
+        let claudeSessionFileEntry = try decoder.decode(
+            ClaudeSessionFileEntry.self,
+            from: Data(claudeSessionFileJSON.utf8)
+        )
+        guard claudeSessionFileEntry.pid == 32317,
+              claudeSessionFileEntry.sessionID == "a4085832-886f-4195-86cd-3c8bbfef72c0",
+              claudeSessionFileEntry.cwd == "/Users/dev/repo" else {
+            throw CLIError.runtime("Claude sessions/<pid>.json schema decode self-test failed")
+        }
+        guard ClaudeSessionsCatalog.parsePID(fromFilename: "32317.json") == 32317,
+              ClaudeSessionsCatalog.parsePID(fromFilename: "32317.4a51adf0722fc5.key") == nil,
+              ClaudeSessionsCatalog.parsePID(fromFilename: "not-a-pid.json") == nil,
+              ClaudeSessionsCatalog.parsePID(fromFilename: "32317") == nil else {
+            throw CLIError.runtime("Claude sessions filename pid-parsing self-test failed")
+        }
+
+        // M3: full ClaudeSessionsCatalog.snapshot() scan -- pid liveness
+        // branching (dead pid's file is ignored), pid/filename mismatch
+        // rejection, and multi-config-dir aggregation, all via a real
+        // temp-directory scan (only `isProcessAlive` is faked).
+        let claudeCatalogFixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-claude-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: claudeCatalogFixtureRoot) }
+        let claudeConfigDirA = claudeCatalogFixtureRoot.appendingPathComponent("configA")
+        let claudeConfigDirB = claudeCatalogFixtureRoot.appendingPathComponent("configB")
+        for dir in [claudeConfigDirA, claudeConfigDirB] {
+            try FileManager.default.createDirectory(
+                at: dir.appendingPathComponent("sessions"),
+                withIntermediateDirectories: true
+            )
+        }
+        // Alive, well-formed session in config dir A.
+        try Data(#"{"pid":111,"sessionId":"alive-session","cwd":"/repo/a"}"#.utf8)
+            .write(to: claudeConfigDirA.appendingPathComponent("sessions/111.json"))
+        // Dead pid (isProcessAlive will report false) -- must be excluded.
+        try Data(#"{"pid":222,"sessionId":"dead-session","cwd":"/repo/a"}"#.utf8)
+            .write(to: claudeConfigDirA.appendingPathComponent("sessions/222.json"))
+        // A `.key` sibling file must never be parsed as a session file.
+        try Data("not-json-and-should-never-be-read".utf8)
+            .write(to: claudeConfigDirA.appendingPathComponent("sessions/111.somehash.key"))
+        // pid/filename mismatch -- suspicious, must be skipped even though
+        // its own pid (333) is alive.
+        try Data(#"{"pid":999,"sessionId":"mismatched-session","cwd":"/repo/a"}"#.utf8)
+            .write(to: claudeConfigDirA.appendingPathComponent("sessions/333.json"))
+        // Second config dir, alive session, proving multi-dir aggregation.
+        try Data(#"{"pid":444,"sessionId":"alive-session-b","cwd":"/repo/b"}"#.utf8)
+            .write(to: claudeConfigDirB.appendingPathComponent("sessions/444.json"))
+        let claudeCatalogFixture = ClaudeSessionsCatalog(
+            configDirs: [claudeConfigDirA.path, claudeConfigDirB.path],
+            isProcessAlive: { pid in pid != 222 }
+        )
+        let claudeCatalogSnapshot = try claudeCatalogFixture.snapshot()
+        guard Set(claudeCatalogSnapshot.map(\.sessionID)) == ["alive-session", "alive-session-b"],
+              claudeCatalogSnapshot.allSatisfy({ $0.sourceKind == .claudeTerminal }),
+              claudeCatalogSnapshot.first(where: { $0.sessionID == "alive-session" })?.cwd == "/repo/a" else {
+            throw CLIError.runtime("ClaudeSessionsCatalog.snapshot self-test failed")
+        }
+
+        // M3: config-dir resolution merges the 3 defaults with
+        // `--claude-config-dirs` additions, de-duplicating.
+        let claudeConfigDirDefaults = ClaudeConfigDirs.defaults(homeDirectory: "/Users/example")
+        guard claudeConfigDirDefaults == [
+            "/Users/example/.claude",
+            "/Users/example/.claude-config/max",
+            "/Users/example/.claude-config/enterprise",
+        ] else {
+            throw CLIError.runtime("ClaudeConfigDirs.defaults self-test failed")
+        }
+        let claudeConfigDirResolved = ClaudeConfigDirs.resolved(
+            additional: ["/extra/claude-config", "/Users/example/.claude"],
+            homeDirectory: "/Users/example"
+        )
+        guard claudeConfigDirResolved == [
+            "/Users/example/.claude",
+            "/Users/example/.claude-config/max",
+            "/Users/example/.claude-config/enterprise",
+            "/extra/claude-config",
+        ] else {
+            throw CLIError.runtime("ClaudeConfigDirs.resolved self-test failed")
+        }
+
+        // M3: transcript-mtime stale GC judgment -- fresh transcript is not
+        // stale, a transcript older than the threshold is, and a missing
+        // transcript is never treated as stale (avoids false-positive GC of
+        // a brand-new session or a wrong configDir/cwd pairing).
+        let transcriptFixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-claude-transcript-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: transcriptFixtureRoot) }
+        let transcriptCWD = "/Users/dev/some-repo"
+        let transcriptProjectDir = transcriptFixtureRoot
+            .appendingPathComponent("projects")
+            .appendingPathComponent(ClaudeSessionsCatalog.flattenedProjectDirectoryName(cwd: transcriptCWD))
+        try FileManager.default.createDirectory(at: transcriptProjectDir, withIntermediateDirectories: true)
+        guard ClaudeSessionsCatalog.flattenedProjectDirectoryName(cwd: transcriptCWD) == "-Users-dev-some-repo" else {
+            throw CLIError.runtime("Claude transcript path flattening self-test failed")
+        }
+        let transcriptURL = transcriptProjectDir.appendingPathComponent("stale-transcript-session.jsonl")
+        try Data("{}".utf8).write(to: transcriptURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -3_600)],
+            ofItemAtPath: transcriptURL.path
+        )
+        guard ClaudeSessionsCatalog.isTranscriptStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: "stale-transcript-session",
+            staleAfter: 1_800
+        ) else {
+            throw CLIError.runtime("Claude transcript stale-GC (stale case) self-test failed")
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date()],
+            ofItemAtPath: transcriptURL.path
+        )
+        guard !ClaudeSessionsCatalog.isTranscriptStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: "stale-transcript-session",
+            staleAfter: 1_800
+        ) else {
+            throw CLIError.runtime("Claude transcript stale-GC (fresh case) self-test failed")
+        }
+        guard !ClaudeSessionsCatalog.isTranscriptStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: "never-written-session",
+            staleAfter: 1_800
+        ) else {
+            throw CLIError.runtime("Claude transcript stale-GC (missing-file case) self-test failed")
+        }
+
+        // M3: dedup priority (claudeHerdr > claudeDesktop > claudeTerminal,
+        // first-wins) -- a herdr-reported and a terminal-reported session
+        // sharing the same session id must resolve to the herdr entry, and
+        // an unrelated third session must pass through untouched.
+        let dedupHerdrEntry = AgentSession(
+            sourceKind: .claudeHerdr,
+            sessionID: "shared-session",
+            cwd: "/repo/from-herdr",
+            rowHints: .none,
+            recency: 1,
+            rowRank: nil,
+            columnRank: nil,
+            seedStatus: nil,
+            navigation: .herdrPane(paneID: "w1:p1")
+        )
+        let dedupTerminalEntry = AgentSession(
+            sourceKind: .claudeTerminal,
+            sessionID: "shared-session",
+            cwd: "/repo/from-terminal",
+            rowHints: .none,
+            recency: 1,
+            rowRank: nil,
+            columnRank: nil,
+            seedStatus: nil,
+            navigation: .ghosttyTab(sessionID: "shared-session", cwd: "/repo/from-terminal", pid: 555)
+        )
+        let dedupUnrelatedEntry = AgentSession(
+            sourceKind: .claudeTerminal,
+            sessionID: "solo-session",
+            cwd: "/repo/solo",
+            rowHints: .none,
+            recency: 1,
+            rowRank: nil,
+            columnRank: nil,
+            seedStatus: nil,
+            navigation: .ghosttyTab(sessionID: "solo-session", cwd: "/repo/solo", pid: 666)
+        )
+        let dedupResolved = SessionSourceDedup.resolve([dedupTerminalEntry, dedupHerdrEntry, dedupUnrelatedEntry])
+        guard dedupResolved.count == 2,
+              dedupResolved.first(where: { $0.sessionID == "shared-session" })?.sourceKind == .claudeHerdr,
+              dedupResolved.first(where: { $0.sessionID == "shared-session" })?.cwd == "/repo/from-herdr",
+              dedupResolved.first(where: { $0.sessionID == "solo-session" })?.sourceKind == .claudeTerminal else {
+            throw CLIError.runtime("Claude session-source dedup priority self-test failed")
+        }
+
+        // M3: `NavigationTarget.ghosttyTab` now carries cwd/pid (used by
+        // `ClaudeSessionsCatalog.snapshot()`'s pid-bearing entries above and
+        // `Daemon.claudeNavigationTarget`'s hook-derived, pid-less ones).
+        let ghosttyTargetFromScan = NavigationTarget.ghosttyTab(sessionID: "gt", cwd: "/tmp/gt-project", pid: 777)
+        guard case let .ghosttyTab(sessionID, cwd, pid) = ghosttyTargetFromScan,
+              sessionID == "gt", cwd == "/tmp/gt-project", pid == 777 else {
+            throw CLIError.runtime("Ghostty navigation target self-test failed")
+        }
+
+        // M3: AppleScript argv passthrough is injection-safe -- a cwd
+        // containing quotes, ampersands, and AppleScript-looking text comes
+        // back byte-for-byte unmodified rather than being interpreted, since
+        // it's bound via `on run argv` rather than interpolated into the
+        // script text. This deliberately never touches Ghostty (or any
+        // other app) -- the probe script only echoes its argument back.
+        let argvEchoScript = """
+        on run argv
+            return item 1 of argv
+        end run
+        """
+        let injectionAttemptCWD = #"/tmp/weird "quote" & tell application "Finder" to activate -- end"#
+        let argvEchoOutput = try OsascriptRunner.run(
+            arguments: ["-e", argvEchoScript, injectionAttemptCWD],
+            timeout: 2
+        )
+        guard String(decoding: argvEchoOutput, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            == injectionAttemptCWD else {
+            throw CLIError.runtime("AppleScript argv injection-safety self-test failed")
+        }
+        var osascriptTimedOut = false
+        do {
+            _ = try OsascriptRunner.run(arguments: ["-e", "delay 2"], timeout: 0.1)
+        } catch let error as OsascriptRunner.RunError {
+            if case .timedOut = error { osascriptTimedOut = true }
+        }
+        guard osascriptTimedOut else {
+            throw CLIError.runtime("OsascriptRunner timeout self-test failed")
+        }
+
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
     }
 
     private static func writeDiagnostic(_ message: String) {
@@ -1201,7 +1444,7 @@ enum C100StatusCLI {
     private static func printHelp() {
         print("""
         Usage:
-          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH]
+          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...]
           sudo c100-status install-helper --location 0x110000
           sudo c100-status uninstall-helper
           c100-status grabber-status [--grabber-socket PATH]
@@ -1223,6 +1466,7 @@ enum C100StatusCLI {
 
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
+        `--claude-config-dirs` adds extra Claude profile directories (scanned for sessions/<pid>.json) on top of the defaults: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise.
         `install-helper` performs the one-time root-owned LaunchDaemon installation.
         `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.
         While `run` is active, normal C100 keystrokes are suppressed and assigned keys navigate Codex tasks.

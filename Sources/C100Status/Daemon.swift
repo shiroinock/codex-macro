@@ -38,18 +38,28 @@ final class StatusDaemon {
     private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath) { [weak self] level, message in
         self?.logger.log(level, message)
     }
-    private lazy var providers: [SessionSourceProvider] = [CodexSourceProvider(), herdrCatalog]
-    /// Claude is hook-authoritative (M1): there is no on-disk catalog to
-    /// scan yet (that's `ClaudeSessionsCatalog` in M3), so the daemon itself
-    /// remembers every session a Claude hook has told it about -- cwd/source
-    /// for `UnifiedLayout` grouping, and where a key-press on it should
+    private let claudeConfigDirs: [String]
+    private lazy var claudeSessionsCatalog = ClaudeSessionsCatalog(
+        configDirs: claudeConfigDirs,
+        log: { [weak self] level, message in self?.logger.log(level, message) }
+    )
+    private lazy var providers: [SessionSourceProvider] = [CodexSourceProvider(), herdrCatalog, claudeSessionsCatalog]
+    /// Claude is hook-authoritative (M1): the daemon itself remembers every
+    /// session a Claude hook has told it about -- cwd/source for
+    /// `UnifiedLayout` grouping, and where a key-press on it should
     /// navigate. Entries are added on any non-`SessionEnd` Claude hook and
-    /// removed on `SessionEnd` (see `handleClaudeHook`).
+    /// removed on `SessionEnd` (see `handleClaudeHook`). `ClaudeSessionsCatalog`
+    /// (M3) supplements this with an on-disk scan used purely for startup
+    /// seeding and crash GC -- see `syncCatalog`'s claude-terminal GC step
+    /// and `applyClaudeTranscriptStaleGC` below.
     private struct ClaudeSessionRecord {
         let sourceKind: SessionSourceKind
         let cwd: String
         let herdrWorkspaceID: String?
         let navigation: NavigationTarget
+        /// `hook.configDir`, defaulted to `~/.claude` -- needed to locate
+        /// this session's transcript jsonl for the cross-source stale GC.
+        let configDir: String
         var lastSeen: Date
     }
     private var claudeSessions: [String: ClaudeSessionRecord] = [:]
@@ -58,11 +68,22 @@ final class StatusDaemon {
     /// resurrect an already-ended session. Pruned after `claudeSessionEndTombstoneTTL`.
     private var endedClaudeSessions = ClaudeSessionEndTombstoneBuffer()
     private let claudeSessionEndTombstoneTTL: TimeInterval = 60
+    /// A hook-registered Claude session (any source) whose transcript jsonl
+    /// hasn't been touched in this long is presumed abandoned (crashed
+    /// process, killed terminal that never delivered `SessionEnd`, ...) and
+    /// is GC'd -- see `applyClaudeTranscriptStaleGC`.
+    private let claudeTranscriptStaleAfter: TimeInterval = 1_800
     /// herdr session IDs present in the *previous* sync's herdr snapshot, so
     /// a session that vanishes (pane closed/killed) can be told apart from
     /// one that was never there -- and torn down explicitly (M2) rather than
     /// silently falling back to a stale hook-registered placement.
     private var previousHerdrSessionIDs: Set<String> = []
+    /// claude-terminal session IDs present in the *previous* sync's
+    /// `ClaudeSessionsCatalog` scan (M3), mirroring `previousHerdrSessionIDs`:
+    /// a hook-registered claude-terminal session whose `sessions/<pid>.json`
+    /// disappears (process died/was killed without ever sending
+    /// `SessionEnd`) is torn down the same way a closed herdr pane is.
+    private var previousClaudeTerminalSessionIDs: Set<String> = []
     /// Resolved navigation target for every session currently reported by
     /// herdr, so a key-press on a herdr session the daemon hasn't received
     /// any Claude hook for yet still navigates correctly.
@@ -77,7 +98,8 @@ final class StatusDaemon {
         locationID: Int?,
         grabberSocketPath: String,
         dryRun: Bool,
-        herdrBinaryPath: String? = nil
+        herdrBinaryPath: String? = nil,
+        claudeConfigDirs: [String]? = nil
     ) throws {
         guard geteuid() != 0 else {
             throw CLIError.runtime(
@@ -89,6 +111,7 @@ final class StatusDaemon {
         self.grabberSocketPath = grabberSocketPath
         self.dryRun = dryRun
         self.herdrBinaryPath = herdrBinaryPath
+        self.claudeConfigDirs = claudeConfigDirs ?? ClaudeConfigDirs.resolved(additional: [])
         logger = try StatusLogger(fileURL: logURL)
     }
 
@@ -315,6 +338,7 @@ final class StatusDaemon {
             cwd: hook.projectKey,
             herdrWorkspaceID: hook.herdrWorkspaceID,
             navigation: claudeNavigationTarget(for: hook),
+            configDir: hook.configDir ?? (NSHomeDirectory() + "/.claude"),
             lastSeen: Date()
         )
 
@@ -365,11 +389,19 @@ final class StatusDaemon {
             if let paneID = hook.herdrPaneID {
                 return .herdrPane(paneID: paneID)
             }
-            return .ghosttyTab(sessionID: hook.sessionID)
+            return .ghosttyTab(sessionID: hook.sessionID, cwd: hook.projectKey, pid: nil)
         case .claudeDesktop:
             return .claudeDesktop
         case .claudeTerminal, .codex:
-            return .ghosttyTab(sessionID: hook.sessionID)
+            // `pid` is left `nil` here: a hook doesn't reliably know its own
+            // parent Claude process's pid (async hooks in particular can be
+            // reparented), and Ghostty's AppleScript surface doesn't expose
+            // terminal pids to match against anyway (see
+            // `GhosttyNavigator` -- matching is cwd-only). The real pid,
+            // when known, comes from `ClaudeSessionsCatalog`'s own
+            // `sessions/<pid>.json` scan and is only used there for
+            // liveness GC, not navigation.
+            return .ghosttyTab(sessionID: hook.sessionID, cwd: hook.projectKey, pid: nil)
         }
     }
 
@@ -653,16 +685,75 @@ final class StatusDaemon {
             }
             previousHerdrSessionIDs = currentHerdrSessionIDs
 
+            // ClaudeSessionsCatalog (M3) is placement-authoritative for any
+            // claude-terminal session it currently reports, the same way
+            // herdr is above: a session appearing in both the on-disk scan
+            // and the hook-derived `claudeSessions` map is placed using the
+            // scanned entry (whose cwd/navigation come straight from
+            // `sessions/<pid>.json`, no staleness risk), and the
+            // hook-derived duplicate is dropped below.
+            let claudeTerminalAgentSessions = agentSessions.filter { $0.sourceKind == .claudeTerminal }
+            let currentClaudeTerminalSessionIDs = Set(claudeTerminalAgentSessions.map(\.sessionID))
+
+            // A claude-terminal session the daemon has a hook-derived record
+            // for, but that no longer shows up in the on-disk scan (process
+            // died / `sessions/<pid>.json` disappeared) without ever sending
+            // `SessionEnd`: GC it outright, mirroring the herdr pane-closed
+            // GC above. This closes the M1 gap where a crashed terminal
+            // session lingered until the daemon itself restarted.
+            var claudeTerminalRemovalChanged = false
+            for sessionID in previousClaudeTerminalSessionIDs.subtracting(currentClaudeTerminalSessionIDs) {
+                guard claudeSessions[sessionID]?.sourceKind == .claudeTerminal else { continue }
+                pendingApprovals.cancel(sessionID: sessionID)
+                claudeSessions.removeValue(forKey: sessionID)
+                endedClaudeSessions.record(sessionID: sessionID)
+                let mutation = try stateStore.update(
+                    sessionID: sessionID,
+                    projectKey: "(claude-terminal-ended)",
+                    status: nil,
+                    remove: true
+                )
+                if mutation.changed {
+                    claudeTerminalRemovalChanged = true
+                    logger.log(.info, "claude session=\(shortSession(sessionID)) source=claude-terminal action=removed reason=process_or_session_file_gone")
+                }
+            }
+            previousClaudeTerminalSessionIDs = currentClaudeTerminalSessionIDs
+
+            // Dedup (M3): the same Claude session id can legitimately be
+            // reported by more than one provider at once -- most commonly a
+            // herdr pane whose `sessions/<pid>.json` this scan also sees
+            // directly. Per the dedup priority (claudeHerdr > claudeDesktop
+            // > claudeTerminal), drop the claude-terminal copy here, before
+            // `UnifiedLayout.compute` ever sees it: leaving both in would
+            // hand the same session id two candidate placements, and which
+            // one "wins" would depend on non-deterministic dictionary/array
+            // ordering, showing up as spurious `action=moved` churn between
+            // syncs instead of a single stable placement.
+            agentSessions.removeAll { $0.sourceKind == .claudeTerminal && currentHerdrSessionIDs.contains($0.sessionID) }
+
+            // Cross-source stale GC (M3): any hook-registered Claude session
+            // (herdr/terminal/desktop alike) whose transcript jsonl hasn't
+            // been touched in `claudeTranscriptStaleAfter` is presumed
+            // abandoned. This is a safety net on top of the source-specific
+            // GCs above/herdr's, covering crash scenarios those don't (e.g.
+            // Claude Desktop, or a source-specific GC itself lagging).
+            let (staleGCChanged, staleGCRemovedIDs) = try applyClaudeTranscriptStaleGC()
+            for sessionID in staleGCRemovedIDs {
+                logger.log(.info, "claude session=\(shortSession(sessionID)) action=removed reason=transcript_stale threshold_s=\(Int(claudeTranscriptStaleAfter))")
+            }
+
             // Claude has no on-disk catalog to snapshot yet for the
             // terminal-direct path (M3), so the sessions the daemon has
             // learned about directly from hooks stand in here -- except any
-            // session herdr already placed above. This is what lets a
-            // hook-registered Claude session "move" from its provisional row
-            // (assigned by handleClaudeHook's stateStore.update) onto the
-            // UnifiedLayout row its herdrWorkspaceID/cwd grouping actually
-            // resolves to.
+            // session herdr or ClaudeSessionsCatalog already placed above.
+            // This is what lets a hook-registered Claude session "move" from
+            // its provisional row (assigned by handleClaudeHook's
+            // stateStore.update) onto the UnifiedLayout row its
+            // herdrWorkspaceID/cwd grouping actually resolves to.
             agentSessions.append(contentsOf: claudeSessions.compactMap { sessionID, record -> AgentSession? in
-                guard !currentHerdrSessionIDs.contains(sessionID) else { return nil }
+                guard !currentHerdrSessionIDs.contains(sessionID),
+                      !currentClaudeTerminalSessionIDs.contains(sessionID) else { return nil }
                 return AgentSession(
                     sourceKind: record.sourceKind,
                     sessionID: sessionID,
@@ -787,12 +878,46 @@ final class StatusDaemon {
                     "catalog sync projects=\(unified.projectRows.count) sessions=\(unified.placements.count) layout=updated"
                 )
             }
-            if reconciliation.changed || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged {
+            if reconciliation.changed || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged
+                || claudeTerminalRemovalChanged || staleGCChanged {
                 try reconcileLEDs()
             }
         } catch {
             logger.log(.warning, "catalog sync failed error=\(error)")
         }
+    }
+
+    /// Removes any hook-registered Claude session (herdr/terminal/desktop
+    /// alike) whose transcript jsonl mtime is older than
+    /// `claudeTranscriptStaleAfter`. A missing transcript is never treated
+    /// as stale (see `ClaudeSessionsCatalog.isTranscriptStale`), so a
+    /// brand-new session or one whose `configDir` this daemon doesn't have
+    /// right is left alone rather than GC'd on a false signal.
+    private func applyClaudeTranscriptStaleGC() throws -> (changed: Bool, removedSessionIDs: [String]) {
+        var changed = false
+        var removed: [String] = []
+        for (sessionID, record) in claudeSessions {
+            guard ClaudeSessionsCatalog.isTranscriptStale(
+                configDir: record.configDir,
+                cwd: record.cwd,
+                sessionID: sessionID,
+                staleAfter: claudeTranscriptStaleAfter
+            ) else { continue }
+            pendingApprovals.cancel(sessionID: sessionID)
+            claudeSessions.removeValue(forKey: sessionID)
+            endedClaudeSessions.record(sessionID: sessionID)
+            let mutation = try stateStore.update(
+                sessionID: sessionID,
+                projectKey: "(claude-transcript-stale)",
+                status: nil,
+                remove: true
+            )
+            if mutation.changed {
+                changed = true
+                removed.append(sessionID)
+            }
+        }
+        return (changed, removed)
     }
 
     /// herdr `agent_status` is only ever used (a) to seed a brand-new
