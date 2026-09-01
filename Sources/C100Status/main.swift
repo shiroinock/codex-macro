@@ -24,6 +24,7 @@ struct Options {
     var notificationMatcher: String?
     var herdrBinaryPath: String?
     var claudeConfigDirs: [String] = []
+    var claudeDesktopDir: String?
 }
 
 enum C100StatusCLI {
@@ -42,7 +43,8 @@ enum C100StatusCLI {
                 grabberSocketPath: options.grabberSocketPath,
                 dryRun: options.dryRun,
                 herdrBinaryPath: options.herdrBinaryPath,
-                claudeConfigDirs: ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs)
+                claudeConfigDirs: ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs),
+                claudeDesktopDir: options.claudeDesktopDir
             )
             try daemon.run()
         case "grabber-service":
@@ -126,6 +128,15 @@ enum C100StatusCLI {
             }
             if claudeTerminalSessions.isEmpty {
                 print("  (no live claude sessions/<pid>.json found)")
+            }
+            let claudeDesktopDir = options.claudeDesktopDir ?? ClaudeDesktopCatalog.defaultSessionsDir()
+            let claudeDesktopSessions = try ClaudeDesktopCatalog(desktopSessionsDir: claudeDesktopDir).snapshot()
+            print("claude-desktop sessions (dir=\(claudeDesktopDir)):")
+            for session in claudeDesktopSessions.sorted(by: { $0.sessionID < $1.sessionID }) {
+                print("  session=\(session.sessionID) cwd=\(session.cwd)")
+            }
+            if claudeDesktopSessions.isEmpty {
+                print("  (no live Claude Desktop sessions found -- either Desktop isn't running, or every local_*.json is archived/stale)")
             }
         case "request-input-access":
             let before = C100InputCapture.accessDescription
@@ -356,6 +367,12 @@ enum C100StatusCLI {
                     .split(separator: ",")
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty }
+            case "--claude-desktop-dir":
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else {
+                    throw CLIError.usage("--claude-desktop-dir requires a path")
+                }
+                options.claudeDesktopDir = arguments[index]
             default:
                 positionals.append(arguments[index])
             }
@@ -1391,6 +1408,161 @@ enum C100StatusCLI {
             throw CLIError.runtime("Claude session-source dedup priority self-test failed")
         }
 
+        // M4: `local_<uuid>.json` schema decode, confirmed against a real
+        // file written by a live Claude Desktop install (see M4
+        // investigation notes -- fields beyond the ones declared here, e.g.
+        // `enabledMcpTools`/`spawnSeed`/`remoteMcpServersConfig`, are present
+        // in the real file and simply ignored).
+        let claudeDesktopSessionFileJSON = """
+        {
+          "sessionId": "local_cd0c64c6-feb1-4568-ae81-db30f88d39fe",
+          "cliSessionId": "5a7a3295-e4c7-4189-90c3-aa3140529c71",
+          "cwd": "/Users/dev/repo",
+          "originCwd": "/Users/dev/repo",
+          "lastFocusedAt": 1788232819595,
+          "createdAt": 1788226254674,
+          "lastActivityAt": 1788232819550,
+          "model": "claude-opus-5[1m]",
+          "isArchived": false,
+          "title": "Example title",
+          "permissionMode": "auto",
+          "enabledMcpTools": {},
+          "remoteMcpServersConfig": []
+        }
+        """
+        let claudeDesktopSessionFileEntry = try JSONDecoder().decode(
+            ClaudeDesktopSessionFileEntry.self,
+            from: Data(claudeDesktopSessionFileJSON.utf8)
+        )
+        guard claudeDesktopSessionFileEntry.sessionID == "local_cd0c64c6-feb1-4568-ae81-db30f88d39fe",
+              claudeDesktopSessionFileEntry.cliSessionID == "5a7a3295-e4c7-4189-90c3-aa3140529c71",
+              claudeDesktopSessionFileEntry.cwd == "/Users/dev/repo",
+              claudeDesktopSessionFileEntry.isArchived == false,
+              claudeDesktopSessionFileEntry.lastActivityAt == 1_788_232_819_550 else {
+            throw CLIError.runtime("Claude Desktop local_*.json schema decode self-test failed")
+        }
+
+        // M4: liveness judgment -- fresh `lastActivityAt` is recent, one well
+        // past the 6-hour default window is not, and archived sessions are
+        // never recent regardless of timestamp (that check lives in
+        // `ClaudeDesktopCatalog.snapshot()` itself, exercised via the full
+        // scan below).
+        let claudeDesktopNow = Date(timeIntervalSince1970: 1_788_240_000)
+        guard ClaudeDesktopCatalog.isRecent(
+            epochMilliseconds: 1_788_232_819_550,
+            now: claudeDesktopNow,
+            within: ClaudeDesktopCatalog.defaultStaleAfter
+        ) else {
+            throw CLIError.runtime("Claude Desktop recency judgment (recent case) self-test failed")
+        }
+        guard !ClaudeDesktopCatalog.isRecent(
+            epochMilliseconds: 1_788_232_819_550 - 7 * 60 * 60 * 1_000,
+            now: claudeDesktopNow,
+            within: ClaudeDesktopCatalog.defaultStaleAfter
+        ) else {
+            throw CLIError.runtime("Claude Desktop recency judgment (stale case) self-test failed")
+        }
+        guard !ClaudeDesktopCatalog.isRecent(epochMilliseconds: nil, now: claudeDesktopNow, within: ClaudeDesktopCatalog.defaultStaleAfter) else {
+            throw CLIError.runtime("Claude Desktop recency judgment (missing timestamp case) self-test failed")
+        }
+
+        // M4: full `ClaudeDesktopCatalog.snapshot()` scan against a real
+        // two-level `<accountId>/<workspaceId>/local_*.json` temp-directory
+        // layout -- covers archived exclusion, stale-timestamp exclusion,
+        // hook-registered lifetime extension past the timestamp window, and
+        // the "Desktop isn't running" short-circuit. Only `isDesktopRunning`/
+        // `isHookRegistered`/`now` are faked.
+        let claudeDesktopFixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-claude-desktop-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: claudeDesktopFixtureRoot) }
+        let claudeDesktopWorkspaceDir = claudeDesktopFixtureRoot
+            .appendingPathComponent("account-1")
+            .appendingPathComponent("workspace-1")
+        try FileManager.default.createDirectory(at: claudeDesktopWorkspaceDir, withIntermediateDirectories: true)
+
+        func writeClaudeDesktopFixture(name: String, cliSessionID: String, cwd: String, isArchived: Bool, lastActivityAt: Double) throws {
+            let json = """
+            {"sessionId":"local_\(UUID().uuidString)","cliSessionId":"\(cliSessionID)","cwd":"\(cwd)","isArchived":\(isArchived),"lastActivityAt":\(lastActivityAt)}
+            """
+            try Data(json.utf8).write(to: claudeDesktopWorkspaceDir.appendingPathComponent(name))
+        }
+        let claudeDesktopNowMillis = claudeDesktopNow.timeIntervalSince1970 * 1_000
+        // Recently active, not archived -- must survive.
+        try writeClaudeDesktopFixture(
+            name: "local_recent.json",
+            cliSessionID: "desktop-recent",
+            cwd: "/repo/desktop-recent",
+            isArchived: false,
+            lastActivityAt: claudeDesktopNowMillis - 60_000
+        )
+        // Not archived, but 7 hours stale and never hook-registered -- must
+        // be excluded.
+        try writeClaudeDesktopFixture(
+            name: "local_stale.json",
+            cliSessionID: "desktop-stale",
+            cwd: "/repo/desktop-stale",
+            isArchived: false,
+            lastActivityAt: claudeDesktopNowMillis - 7 * 60 * 60 * 1_000
+        )
+        // Archived, even though recently active -- must always be excluded.
+        try writeClaudeDesktopFixture(
+            name: "local_archived.json",
+            cliSessionID: "desktop-archived",
+            cwd: "/repo/desktop-archived",
+            isArchived: true,
+            lastActivityAt: claudeDesktopNowMillis - 60_000
+        )
+        // 7 hours stale by timestamp, but hook-registered -- hooks are
+        // authoritative, so this must survive anyway.
+        try writeClaudeDesktopFixture(
+            name: "local_hook_kept_alive.json",
+            cliSessionID: "desktop-hook-kept-alive",
+            cwd: "/repo/desktop-hook-kept-alive",
+            isArchived: false,
+            lastActivityAt: claudeDesktopNowMillis - 7 * 60 * 60 * 1_000
+        )
+        let claudeDesktopCatalogFixture = ClaudeDesktopCatalog(
+            desktopSessionsDir: claudeDesktopFixtureRoot.path,
+            staleAfter: ClaudeDesktopCatalog.defaultStaleAfter,
+            isDesktopRunning: { true },
+            isHookRegistered: { $0 == "desktop-hook-kept-alive" },
+            now: { claudeDesktopNow }
+        )
+        let claudeDesktopCatalogSnapshot = try claudeDesktopCatalogFixture.snapshot()
+        guard Set(claudeDesktopCatalogSnapshot.map(\.sessionID)) == ["desktop-recent", "desktop-hook-kept-alive"],
+              claudeDesktopCatalogSnapshot.allSatisfy({ $0.sourceKind == .claudeDesktop && $0.navigation == .claudeDesktop }),
+              claudeDesktopCatalogSnapshot.first(where: { $0.sessionID == "desktop-recent" })?.cwd == "/repo/desktop-recent" else {
+            throw CLIError.runtime("ClaudeDesktopCatalog.snapshot self-test failed")
+        }
+
+        // M4: when Claude Desktop isn't running, the snapshot is always
+        // empty regardless of what's on disk -- a quit app can never
+        // navigate anywhere and can't fire `SessionEnd` for what it had
+        // open, so holding those sessions alive would light dead keys
+        // forever.
+        let claudeDesktopNotRunningFixture = ClaudeDesktopCatalog(
+            desktopSessionsDir: claudeDesktopFixtureRoot.path,
+            isDesktopRunning: { false },
+            now: { claudeDesktopNow }
+        )
+        guard try claudeDesktopNotRunningFixture.snapshot().isEmpty else {
+            throw CLIError.runtime("ClaudeDesktopCatalog app-not-running self-test failed")
+        }
+
+        // M4: needs-input routing branch -- approval status routes to
+        // Desktop's needs-input list, every other status (including no
+        // status at all) just activates the app. This only exercises the
+        // pure decision function, never `NSWorkspace`/`open`, so no
+        // `claude://` URL is ever actually opened by the self-test.
+        guard NavigationRouter.claudeDesktopAction(forStatus: .approval) == .openNeedsInput else {
+            throw CLIError.runtime("Claude Desktop needs-input routing (approval case) self-test failed")
+        }
+        for otherStatus: AgentStatus? in [.idle, .working, .done, .error, nil] {
+            guard NavigationRouter.claudeDesktopAction(forStatus: otherStatus) == .activateOnly else {
+                throw CLIError.runtime("Claude Desktop needs-input routing (non-approval case) self-test failed status=\(String(describing: otherStatus))")
+            }
+        }
+
         // M3: `NavigationTarget.ghosttyTab` now carries cwd/pid (used by
         // `ClaudeSessionsCatalog.snapshot()`'s pid-bearing entries above and
         // `Daemon.claudeNavigationTarget`'s hook-derived, pid-less ones).
@@ -1430,7 +1602,7 @@ enum C100StatusCLI {
             throw CLIError.runtime("OsascriptRunner timeout self-test failed")
         }
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
     }
 
     private static func writeDiagnostic(_ message: String) {
@@ -1444,7 +1616,7 @@ enum C100StatusCLI {
     private static func printHelp() {
         print("""
         Usage:
-          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...]
+          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
           sudo c100-status install-helper --location 0x110000
           sudo c100-status uninstall-helper
           c100-status grabber-status [--grabber-socket PATH]
@@ -1467,6 +1639,7 @@ enum C100StatusCLI {
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
         `--claude-config-dirs` adds extra Claude profile directories (scanned for sessions/<pid>.json) on top of the defaults: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise.
+        `--claude-desktop-dir` overrides where Claude Desktop's session files are scanned from (default: ~/Library/Application Support/Claude/claude-code-sessions).
         `install-helper` performs the one-time root-owned LaunchDaemon installation.
         `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.
         While `run` is active, normal C100 keystrokes are suppressed and assigned keys navigate Codex tasks.

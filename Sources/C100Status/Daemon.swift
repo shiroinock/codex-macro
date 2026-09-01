@@ -43,7 +43,15 @@ final class StatusDaemon {
         configDirs: claudeConfigDirs,
         log: { [weak self] level, message in self?.logger.log(level, message) }
     )
-    private lazy var providers: [SessionSourceProvider] = [CodexSourceProvider(), herdrCatalog, claudeSessionsCatalog]
+    private let claudeDesktopDir: String
+    private lazy var claudeDesktopCatalog = ClaudeDesktopCatalog(
+        desktopSessionsDir: claudeDesktopDir,
+        isHookRegistered: { [weak self] sessionID in self?.claudeSessions[sessionID]?.sourceKind == .claudeDesktop },
+        log: { [weak self] level, message in self?.logger.log(level, message) }
+    )
+    private lazy var providers: [SessionSourceProvider] = [
+        CodexSourceProvider(), herdrCatalog, claudeSessionsCatalog, claudeDesktopCatalog,
+    ]
     /// Claude is hook-authoritative (M1): the daemon itself remembers every
     /// session a Claude hook has told it about -- cwd/source for
     /// `UnifiedLayout` grouping, and where a key-press on it should
@@ -84,6 +92,14 @@ final class StatusDaemon {
     /// disappears (process died/was killed without ever sending
     /// `SessionEnd`) is torn down the same way a closed herdr pane is.
     private var previousClaudeTerminalSessionIDs: Set<String> = []
+    /// claude-desktop session IDs present in the *previous* sync's
+    /// `ClaudeDesktopCatalog` scan (M4), mirroring
+    /// `previousClaudeTerminalSessionIDs`: a hook-registered claude-desktop
+    /// session that disappears from the scan (archived, aged out past the
+    /// 6-hour liveness window with no hook keeping it alive, or Desktop
+    /// itself quit) without ever sending `SessionEnd` is torn down the same
+    /// way.
+    private var previousClaudeDesktopSessionIDs: Set<String> = []
     /// Resolved navigation target for every session currently reported by
     /// herdr, so a key-press on a herdr session the daemon hasn't received
     /// any Claude hook for yet still navigates correctly.
@@ -99,7 +115,8 @@ final class StatusDaemon {
         grabberSocketPath: String,
         dryRun: Bool,
         herdrBinaryPath: String? = nil,
-        claudeConfigDirs: [String]? = nil
+        claudeConfigDirs: [String]? = nil,
+        claudeDesktopDir: String? = nil
     ) throws {
         guard geteuid() != 0 else {
             throw CLIError.runtime(
@@ -112,6 +129,7 @@ final class StatusDaemon {
         self.dryRun = dryRun
         self.herdrBinaryPath = herdrBinaryPath
         self.claudeConfigDirs = claudeConfigDirs ?? ClaudeConfigDirs.resolved(additional: [])
+        self.claudeDesktopDir = claudeDesktopDir ?? ClaudeDesktopCatalog.defaultSessionsDir()
         logger = try StatusLogger(fileURL: logURL)
     }
 
@@ -599,7 +617,8 @@ final class StatusDaemon {
             let navigated = navigationRouter.handleTap(
                 keyIndex: keyIndex,
                 sessionID: assignment.sessionID,
-                target: target
+                target: target,
+                status: assignment.slot.status
             )
             guard navigated, assignment.slot.status == .done else { return }
 
@@ -720,17 +739,53 @@ final class StatusDaemon {
             }
             previousClaudeTerminalSessionIDs = currentClaudeTerminalSessionIDs
 
-            // Dedup (M3): the same Claude session id can legitimately be
+            // ClaudeDesktopCatalog (M4) is placement-authoritative for any
+            // claude-desktop session it currently reports, the same way
+            // herdr/ClaudeSessionsCatalog are above.
+            let claudeDesktopAgentSessions = agentSessions.filter { $0.sourceKind == .claudeDesktop }
+            let currentClaudeDesktopSessionIDs = Set(claudeDesktopAgentSessions.map(\.sessionID))
+
+            // A claude-desktop session the daemon has a hook-derived record
+            // for, but that no longer shows up in the on-disk scan (archived,
+            // aged out past the 6-hour liveness window, or Desktop itself
+            // quit) without ever sending `SessionEnd`: GC it outright,
+            // mirroring the herdr/claude-terminal GCs above.
+            var claudeDesktopRemovalChanged = false
+            for sessionID in previousClaudeDesktopSessionIDs.subtracting(currentClaudeDesktopSessionIDs) {
+                guard claudeSessions[sessionID]?.sourceKind == .claudeDesktop else { continue }
+                pendingApprovals.cancel(sessionID: sessionID)
+                claudeSessions.removeValue(forKey: sessionID)
+                endedClaudeSessions.record(sessionID: sessionID)
+                let mutation = try stateStore.update(
+                    sessionID: sessionID,
+                    projectKey: "(claude-desktop-ended)",
+                    status: nil,
+                    remove: true
+                )
+                if mutation.changed {
+                    claudeDesktopRemovalChanged = true
+                    logger.log(.info, "claude session=\(shortSession(sessionID)) source=claude-desktop action=removed reason=archived_or_stale_or_app_quit")
+                }
+            }
+            previousClaudeDesktopSessionIDs = currentClaudeDesktopSessionIDs
+
+            // Dedup (M3/M4): the same Claude session id can legitimately be
             // reported by more than one provider at once -- most commonly a
             // herdr pane whose `sessions/<pid>.json` this scan also sees
-            // directly. Per the dedup priority (claudeHerdr > claudeDesktop
-            // > claudeTerminal), drop the claude-terminal copy here, before
-            // `UnifiedLayout.compute` ever sees it: leaving both in would
-            // hand the same session id two candidate placements, and which
-            // one "wins" would depend on non-deterministic dictionary/array
-            // ordering, showing up as spurious `action=moved` churn between
-            // syncs instead of a single stable placement.
-            agentSessions.removeAll { $0.sourceKind == .claudeTerminal && currentHerdrSessionIDs.contains($0.sessionID) }
+            // directly, or a Claude Desktop session that also happens to
+            // match a claude-terminal scan entry. Per the dedup priority
+            // (claudeHerdr > claudeDesktop > claudeTerminal), drop the lower-
+            // priority copy here, before `UnifiedLayout.compute` ever sees
+            // it: leaving both in would hand the same session id two
+            // candidate placements, and which one "wins" would depend on
+            // non-deterministic dictionary/array ordering, showing up as
+            // spurious `action=moved` churn between syncs instead of a
+            // single stable placement.
+            agentSessions.removeAll {
+                $0.sourceKind == .claudeTerminal
+                    && (currentHerdrSessionIDs.contains($0.sessionID) || currentClaudeDesktopSessionIDs.contains($0.sessionID))
+            }
+            agentSessions.removeAll { $0.sourceKind == .claudeDesktop && currentHerdrSessionIDs.contains($0.sessionID) }
 
             // Cross-source stale GC (M3): any hook-registered Claude session
             // (herdr/terminal/desktop alike) whose transcript jsonl hasn't
@@ -753,7 +808,8 @@ final class StatusDaemon {
             // herdrWorkspaceID/cwd grouping actually resolves to.
             agentSessions.append(contentsOf: claudeSessions.compactMap { sessionID, record -> AgentSession? in
                 guard !currentHerdrSessionIDs.contains(sessionID),
-                      !currentClaudeTerminalSessionIDs.contains(sessionID) else { return nil }
+                      !currentClaudeTerminalSessionIDs.contains(sessionID),
+                      !currentClaudeDesktopSessionIDs.contains(sessionID) else { return nil }
                 return AgentSession(
                     sourceKind: record.sourceKind,
                     sessionID: sessionID,
@@ -879,7 +935,7 @@ final class StatusDaemon {
                 )
             }
             if reconciliation.changed || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged
-                || claudeTerminalRemovalChanged || staleGCChanged {
+                || claudeTerminalRemovalChanged || claudeDesktopRemovalChanged || staleGCChanged {
                 try reconcileLEDs()
             }
         } catch {

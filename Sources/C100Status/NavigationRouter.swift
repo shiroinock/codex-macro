@@ -12,7 +12,28 @@ import Foundation
 /// remain reserved for M3/M4.
 final class NavigationRouter {
     static let ghosttyBundleIdentifier = "com.mitchellh.ghostty"
+    static let claudeDesktopBundleIdentifier = "com.anthropic.claudefordesktop"
+    /// The only session-specific Claude Desktop URL scheme action that
+    /// actually works: `claude://` cannot address a particular session, but
+    /// `claude://code/needs-input` opens Desktop's cross-session "needs your
+    /// input" list, which is the one case navigation can do better than a
+    /// bare app activation (see `claudeDesktopAction(forStatus:)`).
+    static let claudeDesktopNeedsInputURL = URL(string: "claude://code/needs-input")!
     private static let herdrFocusTimeout: TimeInterval = 0.2
+
+    /// Which Claude Desktop navigation action a key-press should take, given
+    /// the tapped session's current status. Pulled out as a pure function
+    /// (rather than inlined in `navigateClaudeDesktop`) so it's unit-testable
+    /// without ever touching `NSWorkspace`/`open` -- self-tests must not
+    /// actually open a `claude://` URL or they'd yank focus to Desktop.
+    enum ClaudeDesktopNavigationAction: Equatable {
+        case openNeedsInput
+        case activateOnly
+    }
+
+    static func claudeDesktopAction(forStatus status: AgentStatus?) -> ClaudeDesktopNavigationAction {
+        status == .approval ? .openNeedsInput : .activateOnly
+    }
 
     private let codexNavigator: CodexNavigator
     private let herdrBinaryPath: String?
@@ -29,7 +50,13 @@ final class NavigationRouter {
     }
 
     @discardableResult
-    func handleTap(keyIndex: Int, sessionID: String, target: NavigationTarget, now: Date = Date()) -> Bool {
+    func handleTap(
+        keyIndex: Int,
+        sessionID: String,
+        target: NavigationTarget,
+        status: AgentStatus? = nil,
+        now: Date = Date()
+    ) -> Bool {
         switch target {
         case .codexThread:
             return codexNavigator.handleTap(keyIndex: keyIndex, sessionID: sessionID, now: now)
@@ -38,11 +65,41 @@ final class NavigationRouter {
         case let .ghosttyTab(_, cwd, _):
             return navigateGhostty(cwd: cwd, sessionID: sessionID, keyIndex: keyIndex)
         case .claudeDesktop:
-            // Claude Desktop focus dispatch lands in M4. Until then, log the
-            // intent so a key-press is observable in the daemon log instead
-            // of silently doing nothing.
-            log(.info, "input key=\(keyIndex) session=\(sessionID) action=navigation_not_implemented target=\(target)")
-            return false
+            return navigateClaudeDesktop(status: status, sessionID: sessionID, keyIndex: keyIndex)
+        }
+    }
+
+    /// Claude Desktop navigation (M4): unlike Codex/herdr/Ghostty, Desktop's
+    /// `claude://` URL scheme cannot target a specific session (investigated
+    /// and confirmed at implementation time -- see the plan's environment
+    /// facts). The one thing it *can* do usefully is jump straight to
+    /// Desktop's needs-input list when the tapped session is actually
+    /// awaiting approval; otherwise this just brings Desktop to the front,
+    /// same as the Ghostty/herdr fallback path.
+    private func navigateClaudeDesktop(status: AgentStatus?, sessionID: String, keyIndex: Int) -> Bool {
+        let shortSession = String(sessionID.prefix(8))
+        switch Self.claudeDesktopAction(forStatus: status) {
+        case .openNeedsInput:
+            let opened = NSWorkspace.shared.open(Self.claudeDesktopNeedsInputURL)
+            log(
+                opened ? .info : .warning,
+                "input key=\(keyIndex) session=\(shortSession) action=navigate_claude_desktop result=needs_input status=\(status?.rawValue ?? "nil") opened=\(opened)"
+            )
+            if opened { return true }
+            // Opening the URL scheme itself failed (e.g. Desktop not
+            // installed) -- fall back to a bare activation attempt below
+            // rather than leaving the key press a total no-op.
+            fallthrough
+        case .activateOnly:
+            let activated = activateApp(
+                bundleIdentifier: Self.claudeDesktopBundleIdentifier,
+                notFoundLabel: "claude desktop"
+            )
+            log(
+                activated ? .info : .warning,
+                "input key=\(keyIndex) session=\(shortSession) action=navigate_claude_desktop result=activated status=\(status?.rawValue ?? "nil") activated=\(activated)"
+            )
+            return activated
         }
     }
 
@@ -101,11 +158,22 @@ final class NavigationRouter {
     }
 
     private func activateGhostty() -> Bool {
-        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: Self.ghosttyBundleIdentifier).first {
+        activateApp(bundleIdentifier: Self.ghosttyBundleIdentifier, notFoundLabel: "ghostty")
+    }
+
+    /// Shared best-effort app-foregrounding helper: activates an already-
+    /// running instance directly, or launches+activates it via
+    /// `NSWorkspace.openApplication` (waiting up to 1s for the launch to at
+    /// least get underway) if it isn't running yet. Used for both Ghostty
+    /// (herdr/Ghostty-direct navigation) and Claude Desktop (M4) -- neither
+    /// case can navigate to a specific window/tab through this path, so
+    /// "bring the app forward" is the best available fallback.
+    private func activateApp(bundleIdentifier: String, notFoundLabel: String) -> Bool {
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first {
             return running.activate(options: [.activateAllWindows])
         }
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.ghosttyBundleIdentifier) else {
-            log(.warning, "ghostty not found bundle_id=\(Self.ghosttyBundleIdentifier) action=activate_skipped")
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            log(.warning, "\(notFoundLabel) not found bundle_id=\(bundleIdentifier) action=activate_skipped")
             return false
         }
         let semaphore = DispatchSemaphore(value: 0)
@@ -116,7 +184,7 @@ final class NavigationRouter {
         }
         _ = semaphore.wait(timeout: .now() + 1)
         if let activationError {
-            log(.warning, "ghostty activation failed error=\(activationError)")
+            log(.warning, "\(notFoundLabel) activation failed error=\(activationError)")
         }
         return true
     }

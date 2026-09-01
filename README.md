@@ -136,7 +136,7 @@ Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Cod
 
 ## Claude Code (herdr / terminal / Claude Desktop)
 
-The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). As of M3, herdr and plain-terminal (Ghostty) Claude Code sessions are both fully implemented; Claude Desktop navigation (M4) still falls back to logging the intent instead of navigating.
+The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). herdr, plain-terminal (Ghostty), and Claude Desktop Claude Code sessions are all implemented.
 
 ### Installing the Claude Code hooks
 
@@ -183,6 +183,21 @@ Pressing an assigned terminal session's key runs an AppleScript against Ghostty 
 
 Note: Ghostty's AppleScript dictionary only exposes `environment variables` as a write-only property used when *creating* a new terminal; it cannot be read back from an already-running terminal to identify a session more precisely, which is why matching is cwd-based rather than session-id-based.
 
+### How Claude Desktop sessions work
+
+Claude Desktop's Claude Code runs with `CLAUDE_CODE_ENTRYPOINT=claude-desktop` but no `CLAUDE_CONFIG_DIR` override, so it shares `~/.claude` (and therefore the same hooks) with a plain-terminal `claude`. As with terminal sessions, **hooks are authoritative for status**; the on-disk scan below exists only to seed already-open sessions on daemon startup and to garbage-collect sessions Desktop never sent a `SessionEnd` hook for.
+
+Desktop writes one file per session under `~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<workspaceId>/local_<uuid>.json` (override the scanned root with `--claude-desktop-dir`). The file's own `sessionId` carries the `local_` prefix and is Desktop-internal; the field the daemon actually uses as the session id is `cliSessionId`, which matches the Claude Code hook `session_id` and the `<cliSessionId>.jsonl` transcript filename. `scheduled-tasks.json` in the same directory is unrelated and ignored.
+
+A session counts as alive if it isn't archived (`isArchived: false`) and at least one of the following holds: its `lastActivityAt` is within 6 hours, its transcript `.jsonl` mtime is within 6 hours, or the daemon has already hook-registered it as a `claude-desktop` session (hooks are authoritative once they've fired, so a session the daemon has heard from directly is never dropped just because this scan's timestamps look old). If Claude Desktop (`com.anthropic.claudefordesktop`) isn't currently running, the scan reports no sessions at all -- there would be nothing to navigate to, and a quit app can't send `SessionEnd` for whatever it had open.
+
+**Claude Desktop's `claude://` URL scheme cannot target a specific session** -- this was confirmed while implementing this integration, not merely assumed. Pressing an assigned Desktop session's key therefore does one of two things:
+
+- If that session's current status is `approval`, it opens `claude://code/needs-input`, which shows Desktop's cross-session "needs your input" list (not the specific session, but a real navigational improvement over nothing).
+- For any other status, it just activates Claude Desktop via `NSWorkspace` (bringing the app forward, without selecting a particular conversation), the same "best available fallback" herdr and Ghostty navigation use when they can't pinpoint a window.
+
+**SDK-mode notification caveat**: Claude Desktop's Claude Code runs in SDK mode rather than as the interactive TUI, and this project has not exhaustively verified that `Notification` hook events (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`) fire identically to the TUI in every case. `PermissionRequest` (fired on every tool permission check, independent of SDK vs. TUI mode) is the primary, more reliably-observed signal this daemon relies on for detecting a Desktop session waiting on approval; if your Desktop sessions don't light up amber when you'd expect, check `/tmp/keychron-c100-status-<uid>.log` for which hook events are actually arriving.
+
 ## Runtime paths and options
 
 - Socket: `/tmp/keychron-c100-status-<uid>.sock`; override with `--socket PATH` on both daemon and clients.
@@ -190,6 +205,7 @@ Note: Ghostty's AppleScript dictionary only exposes `environment variables` as a
 - Log: `/tmp/keychron-c100-status-<uid>.log`; override with `--log-file PATH` on `run`, `logs`, and `log-path`.
 - Device: pass `--location 0x110000` to `run` when selecting among multiple C100 devices.
 - Claude Code config directories: `~/.claude`, `~/.claude-config/max`, and `~/.claude-config/enterprise` are always scanned for `sessions/<pid>.json`; pass `--claude-config-dirs PATH1,PATH2` to scan additional directories on top of those three.
+- Claude Desktop sessions directory: `~/Library/Application Support/Claude/claude-code-sessions`; override with `--claude-desktop-dir PATH`.
 - Input ownership: startup fails rather than leaving normal C100 typing enabled when exclusive capture cannot be obtained.
 
 `apply <status>` bypasses the daemon and writes directly to HID. Use it only for troubleshooting while the daemon and Keychron Launcher are stopped.
