@@ -31,7 +31,7 @@ final class StatusDaemon {
     private lazy var navigator = CodexNavigator { [weak self] level, message in
         self?.logger.log(level, message)
     }
-    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator, herdrBinaryPath: herdrBinaryPath) { [weak self] level, message in
+    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator, herdrBinaryPath: HerdrBinaryResolver.resolve(explicitPath: herdrBinaryPath)) { [weak self] level, message in
         self?.logger.log(level, message)
     }
     private let herdrBinaryPath: String?
