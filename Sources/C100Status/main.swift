@@ -473,6 +473,159 @@ enum C100StatusCLI {
             throw CLIError.runtime("Codex sidebar-order/projectless-row self-test failed")
         }
 
+        // M0 golden test: for Codex-only input, UnifiedLayout must reproduce the
+        // exact placements CodexCatalog.orderedLayout (as used by the pre-M0
+        // Daemon.syncCatalog) produces, by construction from the same
+        // row/column ranks CodexSourceProvider would derive.
+        let codexOnlyAgentSessions = catalogLayout.placements.map { placement -> AgentSession in
+            let session = placement.session
+            return AgentSession(
+                sourceKind: .codex,
+                sessionID: session.sessionID,
+                cwd: URL(fileURLWithPath: session.cwd).standardizedFileURL.path,
+                rowHints: RowGroupingHints(codexProjectID: session.projectKey, herdrWorkspaceID: nil),
+                recency: session.recency,
+                rowRank: catalogLayout.projectRows[session.projectKey],
+                columnRank: placement.column,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: session.sessionID)
+            )
+        }
+        let unifiedCodexOnly = UnifiedLayout.compute(sessions: codexOnlyAgentSessions)
+        // Note: catalogLayout.projectRows also reserves row 0 for the
+        // sidebar-listed "project:empty" project, which has zero sessions in
+        // this fixture and therefore no AgentSession to carry it -- so it
+        // cannot appear in unifiedCodexOnly.projectRows. What must match
+        // exactly is the row/column/key each *actual* session lands on,
+        // which is the real correctness bar ("identical placements").
+        guard unifiedCodexOnly.projectRows.allSatisfy({ catalogLayout.projectRows[$0.key] == $0.value }),
+              unifiedCodexOnly.warnings.isEmpty,
+              unifiedCodexOnly.placements.map(\.session.sessionID)
+                  == catalogLayout.placements.map(\.session.sessionID),
+              unifiedCodexOnly.placements.map(\.keyIndex) == catalogLayout.placements.map(\.keyIndex),
+              unifiedCodexOnly.placements.map(\.projectKey)
+                  == catalogLayout.placements.map(\.session.projectKey) else {
+            throw CLIError.runtime("UnifiedLayout Codex-parity golden self-test failed")
+        }
+
+        // Union-find row merging: sessions sharing a codexProjectID (worktree
+        // case) or herdrWorkspaceID (M2 groundwork) merge onto one row even
+        // when their cwds differ; unrelated cwds stay on separate rows.
+        let mergeSessions = [
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "merge-a",
+                cwd: "/repo/main",
+                rowHints: RowGroupingHints(codexProjectID: "proj", herdrWorkspaceID: nil),
+                recency: 10,
+                rowRank: 0,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "merge-a")
+            ),
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "merge-b",
+                cwd: "/repo/worktree",
+                rowHints: RowGroupingHints(codexProjectID: "proj", herdrWorkspaceID: nil),
+                recency: 9,
+                rowRank: 0,
+                columnRank: 1,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "merge-b")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "herdr-a",
+                cwd: "/repo/pane-a",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "ws1"),
+                recency: 8,
+                rowRank: 1,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .herdrPane(paneID: "pane-a")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "herdr-b",
+                cwd: "/repo/pane-b",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "ws1"),
+                recency: 7,
+                rowRank: 1,
+                columnRank: 1,
+                seedStatus: nil,
+                navigation: .herdrPane(paneID: "pane-b")
+            ),
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "unrelated",
+                cwd: "/repo/other",
+                rowHints: RowGroupingHints(codexProjectID: "other-proj", herdrWorkspaceID: nil),
+                recency: 6,
+                rowRank: 2,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "unrelated")
+            ),
+        ]
+        let mergedLayout = UnifiedLayout.compute(sessions: mergeSessions)
+        guard mergedLayout.projectRows["proj"] == 0,
+              mergedLayout.projectRows["ws1"] == 1,
+              mergedLayout.projectRows["other-proj"] == 2,
+              mergedLayout.placements.filter({ $0.row == 0 }).map(\.session.sessionID) == ["merge-a", "merge-b"],
+              mergedLayout.placements.filter({ $0.row == 1 }).map(\.session.sessionID) == ["herdr-a", "herdr-b"],
+              mergedLayout.placements.filter({ $0.row == 2 }).map(\.session.sessionID) == ["unrelated"],
+              mergedLayout.warnings.isEmpty else {
+            throw CLIError.runtime("UnifiedLayout union-find row merging self-test failed")
+        }
+
+        // 10x10 truncation: 12 distinct unranked rows collapse to the first 10
+        // by recency, with a warning; 12 sessions crammed into a single row
+        // collapse to the first 10 columns by rank, with a warning.
+        let overflowRowSessions = (0..<12).map { index in
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "row-\(index)",
+                cwd: "/repo/row-\(index)",
+                rowHints: .none,
+                recency: Double(12 - index),
+                rowRank: nil,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "row-\(index)")
+            )
+        }
+        let overflowRowLayout = UnifiedLayout.compute(sessions: overflowRowSessions)
+        guard overflowRowLayout.placements.count == 10,
+              overflowRowLayout.placements.map(\.session.sessionID)
+                  == (0..<10).map({ "row-\($0)" }),
+              overflowRowLayout.warnings.count == 2,
+              overflowRowLayout.warnings.allSatisfy({ $0.contains("row") }) else {
+            throw CLIError.runtime("UnifiedLayout row-overflow truncation self-test failed")
+        }
+
+        let overflowColumnSessions = (0..<12).map { index in
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "col-\(index)",
+                cwd: "/repo/shared-\(index)",
+                rowHints: RowGroupingHints(codexProjectID: "crowded", herdrWorkspaceID: nil),
+                recency: Double(index),
+                rowRank: 0,
+                columnRank: index,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "col-\(index)")
+            )
+        }
+        let overflowColumnLayout = UnifiedLayout.compute(sessions: overflowColumnSessions)
+        guard overflowColumnLayout.placements.count == 10,
+              overflowColumnLayout.placements.map(\.session.sessionID)
+                  == (0..<10).map({ "col-\($0)" }),
+              overflowColumnLayout.warnings.count == 2,
+              overflowColumnLayout.warnings.allSatisfy({ $0.contains("column") }) else {
+            throw CLIError.runtime("UnifiedLayout column-overflow truncation self-test failed")
+        }
+
         let forkSessionMeta = Data(#"{"type":"session_meta","payload":{"id":"fork","forked_from_id":"subagent"}}"#.utf8)
         let forkProject = CodexCatalog.resolvedForkProjectID(
             explicitProjectID: nil,

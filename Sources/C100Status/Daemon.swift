@@ -31,6 +31,8 @@ final class StatusDaemon {
     private lazy var navigator = CodexNavigator { [weak self] level, message in
         self?.logger.log(level, message)
     }
+    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator)
+    private let providers: [SessionSourceProvider] = [CodexSourceProvider()]
 
     init(socketPath: String, logURL: URL, locationID: Int?, grabberSocketPath: String, dryRun: Bool) throws {
         guard geteuid() != 0 else {
@@ -393,7 +395,14 @@ final class StatusDaemon {
                 .info,
                 "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) session=\(shortSession(assignment.sessionID))"
             )
-            let navigated = navigator.handleTap(keyIndex: keyIndex, sessionID: assignment.sessionID)
+            // Only Codex is wired up as a session source in M0, so every stored
+            // slot navigates as a Codex thread. Once StateStore/SessionSlot carry
+            // a per-session NavigationTarget (M1+), this will be read from there.
+            let navigated = navigationRouter.handleTap(
+                keyIndex: keyIndex,
+                sessionID: assignment.sessionID,
+                target: .codexThread(sessionID: assignment.sessionID)
+            )
             guard navigated, assignment.slot.status == .done else { return }
 
             let mutation = try stateStore.update(
@@ -415,8 +424,14 @@ final class StatusDaemon {
     private func syncCatalog() {
         nextCatalogSync = Date().addingTimeInterval(2)
         do {
-            let layout = try CodexCatalog.layout()
-            let catalogSessions = layout.placements.map(\.session)
+            // Codex-authoritative view: approval routing, deferred-hook
+            // promotion, and turn-abort monitoring below remain gated to Codex
+            // (sourceKind == .codex) and read this directly rather than going
+            // through the generic AgentSession abstraction, since they need
+            // Codex-only fields (rollout paths, createdAt) that the unified
+            // model does not carry.
+            let codexLayout = try CodexCatalog.layout()
+            let catalogSessions = codexLayout.placements.map(\.session)
             let nextCatalogSessionIDs = Set(catalogSessions.map(\.sessionID))
             catalogProjectBySession = Dictionary(
                 uniqueKeysWithValues: catalogSessions.map { ($0.sessionID, $0.projectKey) }
@@ -425,22 +440,23 @@ final class StatusDaemon {
                 catalogSessions.map { (URL(fileURLWithPath: $0.cwd).standardizedFileURL.path, $0.projectKey) },
                 uniquingKeysWith: { first, _ in first }
             )
-            let visible = layout.placements
-            var nextColumnByRow: [Int: Int] = [:]
-            let placements = visible.compactMap { placement -> CatalogPlacement? in
-                let column = nextColumnByRow[placement.row, default: 0]
-                guard column < 10 else { return nil }
-                nextColumnByRow[placement.row] = column + 1
-                return CatalogPlacement(session: placement.session, row: placement.row, column: column)
+
+            var agentSessions: [AgentSession] = []
+            for provider in providers {
+                agentSessions.append(contentsOf: try provider.snapshot())
             }
-            let sessions = placements.map(\.session)
+            let unified = UnifiedLayout.compute(sessions: agentSessions)
+            for warning in unified.warnings {
+                logger.log(.warning, "catalog layout warning=\(warning)")
+            }
+            let sessions = catalogSessions
 
             let reconciliation = try stateStore.reconcile(
-                projectRows: layout.projectRows,
-                placements: placements.map {
+                projectRows: unified.projectRows,
+                placements: unified.placements.map {
                     (
                         sessionID: $0.session.sessionID,
-                        projectKey: $0.session.projectKey,
+                        projectKey: $0.projectKey,
                         row: $0.row,
                         column: $0.column
                     )
@@ -533,7 +549,7 @@ final class StatusDaemon {
                 }
                 logger.log(
                     .info,
-                    "catalog sync projects=\(layout.projectRows.count) sessions=\(sessions.count) layout=updated"
+                    "catalog sync projects=\(unified.projectRows.count) sessions=\(unified.placements.count) layout=updated"
                 )
             }
             if reconciliation.changed || deferredChanged || interruptionChanged {
