@@ -540,6 +540,91 @@ enum C100StatusCLI {
             throw CLIError.runtime("Claude subagent exclusion self-test failed")
         }
 
+        // M6: SubagentStart/SubagentStop fire with the *parent* session's
+        // session_id plus the subagent's own agent_id -- exactly the shape
+        // `isSubagent` would otherwise classify as ignorable, so these two
+        // events must be carved out of that exclusion (see
+        // `HookInput.isSubagentLifecycleEvent`) while every other
+        // agent_id-bearing event remains excluded as before.
+        let subagentStartWithAgentID = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"s4","cwd":"/tmp","hook_event_name":"SubagentStart","agent_id":"sub-1","source":"claude-terminal"}"#.utf8)
+        )
+        let subagentStopWithAgentID = try decoder.decode(
+            HookInput.self,
+            from: Data(#"{"session_id":"s4","cwd":"/tmp","hook_event_name":"SubagentStop","agent_id":"sub-1","source":"claude-terminal"}"#.utf8)
+        )
+        guard !subagentStartWithAgentID.isSubagent,
+              !subagentStopWithAgentID.isSubagent,
+              subagentStartWithAgentID.isSubagentLifecycleEvent,
+              subagentStopWithAgentID.isSubagentLifecycleEvent,
+              subagentStartWithAgentID.status == nil,
+              subagentStopWithAgentID.status == nil else {
+            throw CLIError.runtime("SubagentStart/SubagentStop isSubagent carve-out self-test failed")
+        }
+
+        // M6: ActiveSubagentTracker's increment/decrement/TTL bookkeeping --
+        // the piece of Daemon.refreshSubagentOverride's "working while a
+        // subagent runs" behavior that doesn't require StateStore/HID
+        // plumbing to exercise directly.
+        var tracker = ActiveSubagentTracker()
+        let subagentBase = Date()
+        guard !tracker.isActive(sessionID: "parent-1"), tracker.count(sessionID: "parent-1") == 0 else {
+            throw CLIError.runtime("ActiveSubagentTracker initial-state self-test failed")
+        }
+        tracker.start(sessionID: "parent-1", agentID: "agent-a", at: subagentBase)
+        guard tracker.isActive(sessionID: "parent-1"), tracker.count(sessionID: "parent-1") == 1 else {
+            throw CLIError.runtime("ActiveSubagentTracker single-start self-test failed")
+        }
+        tracker.start(sessionID: "parent-1", agentID: "agent-b", at: subagentBase)
+        guard tracker.count(sessionID: "parent-1") == 2 else {
+            throw CLIError.runtime("ActiveSubagentTracker second-start self-test failed")
+        }
+        tracker.stop(sessionID: "parent-1", agentID: "agent-a")
+        guard tracker.isActive(sessionID: "parent-1"), tracker.count(sessionID: "parent-1") == 1 else {
+            throw CLIError.runtime("ActiveSubagentTracker partial-stop self-test failed")
+        }
+        tracker.stop(sessionID: "parent-1", agentID: "agent-b")
+        guard !tracker.isActive(sessionID: "parent-1"), tracker.count(sessionID: "parent-1") == 0 else {
+            throw CLIError.runtime("ActiveSubagentTracker last-stop self-test failed")
+        }
+
+        // No-agent_id fallback: a Start/Stop pair without agent_id must
+        // still round-trip the count via the LIFO fallback stack instead of
+        // leaking a permanently-inflated entry.
+        tracker.start(sessionID: "parent-2", agentID: nil, at: subagentBase)
+        guard tracker.count(sessionID: "parent-2") == 1 else {
+            throw CLIError.runtime("ActiveSubagentTracker no-agent-id start self-test failed")
+        }
+        tracker.stop(sessionID: "parent-2", agentID: nil)
+        guard !tracker.isActive(sessionID: "parent-2") else {
+            throw CLIError.runtime("ActiveSubagentTracker no-agent-id stop self-test failed")
+        }
+
+        // TTL sweep: an entry older than `ttl` is dropped and reported as a
+        // changed session id; one within `ttl` survives untouched.
+        tracker.start(sessionID: "parent-3", agentID: "agent-old", at: subagentBase.addingTimeInterval(-10_000))
+        tracker.start(sessionID: "parent-4", agentID: "agent-fresh", at: subagentBase)
+        let prunedSessionIDs = tracker.pruneExpired(now: subagentBase, ttl: 7_200)
+        guard prunedSessionIDs == ["parent-3"],
+              !tracker.isActive(sessionID: "parent-3"),
+              tracker.isActive(sessionID: "parent-4") else {
+            throw CLIError.runtime("ActiveSubagentTracker TTL prune self-test failed")
+        }
+
+        // `clear`/`clearAll` (used on SessionEnd and every cross-source GC,
+        // and the `.clear` admin command respectively) drop tracked entries
+        // outright regardless of TTL.
+        tracker.clear(sessionID: "parent-4")
+        guard !tracker.isActive(sessionID: "parent-4") else {
+            throw CLIError.runtime("ActiveSubagentTracker clear(sessionID:) self-test failed")
+        }
+        tracker.start(sessionID: "parent-5", agentID: "agent-e", at: subagentBase)
+        tracker.clearAll()
+        guard tracker.activeSessionIDs.isEmpty else {
+            throw CLIError.runtime("ActiveSubagentTracker clearAll self-test failed")
+        }
+
         // Environment-variable source discrimination (stdin JSON cannot tell
         // the three Claude launch paths apart -- see the implementation
         // plan's confirmed environment facts).
@@ -1693,6 +1778,49 @@ enum C100StatusCLI {
             throw CLIError.runtime("Claude transcript stale-GC (missing-file case) self-test failed")
         }
 
+        // M6: on-disk subagent-activity staleness check -- a session with no
+        // `subagents/` directory at all is `nil` (unknown, not stale, so the
+        // TTL alone decides), one whose `agent-*.jsonl` files are all fresh
+        // is `false`, and one whose files are all past the threshold is
+        // `true`.
+        let subagentSessionID = "stale-transcript-session"
+        guard ClaudeSessionsCatalog.isSubagentActivityStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: subagentSessionID,
+            staleAfter: 1_800
+        ) == nil else {
+            throw CLIError.runtime("Claude subagent-activity stale-GC (missing-directory case) self-test failed")
+        }
+        let subagentsDir = URL(fileURLWithPath: ClaudeSessionsCatalog.subagentsDirectoryPath(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: subagentSessionID
+        ))
+        try FileManager.default.createDirectory(at: subagentsDir, withIntermediateDirectories: true)
+        let subagentFileURL = subagentsDir.appendingPathComponent("agent-1.jsonl")
+        try Data("{}".utf8).write(to: subagentFileURL)
+        guard ClaudeSessionsCatalog.isSubagentActivityStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: subagentSessionID,
+            staleAfter: 1_800
+        ) == false else {
+            throw CLIError.runtime("Claude subagent-activity stale-GC (fresh case) self-test failed")
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -3_600)],
+            ofItemAtPath: subagentFileURL.path
+        )
+        guard ClaudeSessionsCatalog.isSubagentActivityStale(
+            configDir: transcriptFixtureRoot.path,
+            cwd: transcriptCWD,
+            sessionID: subagentSessionID,
+            staleAfter: 1_800
+        ) == true else {
+            throw CLIError.runtime("Claude subagent-activity stale-GC (stale case) self-test failed")
+        }
+
         // M3: dedup priority (claudeHerdr > claudeDesktop > claudeTerminal,
         // first-wins) -- a herdr-reported and a terminal-reported session
         // sharing the same session id must resolve to the herdr entry, and
@@ -1941,7 +2069,7 @@ enum C100StatusCLI {
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end
     /// against synthetic `settings.json` fixtures in a temporary directory
     /// (never against the real `~/.claude*` profiles). Covers: install onto
-    /// a herdr-bearing file (all 9 events added, herdr entries kept),
+    /// a herdr-bearing file (all 11 events added, herdr entries kept),
     /// re-install is a no-op, a binary-path change is picked up as an
     /// update (no duplicate entries), `--dry-run` writes nothing,
     /// `--uninstall` removes only the c100 entries, and a malformed
@@ -1989,7 +2117,7 @@ enum C100StatusCLI {
                 .filter { $0.contains(".c100-backup-") }.count ?? 0
         }
 
-        // 1. Install onto the herdr fixture: all 9 events gain a c100 entry,
+        // 1. Install onto the herdr fixture: all 11 events gain a c100 entry,
         // herdr's untouched, unrelated top-level key preserved, one backup written.
         let binaryA = "/tmp/c100-status-fake-a"
         let installResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryA, dryRun: false, uninstall: false)

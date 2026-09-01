@@ -102,8 +102,39 @@ final class StatusDaemon {
         /// this session's transcript jsonl for the cross-source stale GC.
         let configDir: String
         var lastSeen: Date
+        /// The status the session's own hooks last mapped to (M6), *before*
+        /// any `activeSubagents` override. `StateStore` always holds the
+        /// *displayed* status (raw or overridden), so this is the only place
+        /// the raw value survives while an override is in effect --
+        /// `refreshSubagentOverride` reads it back once the session's last
+        /// subagent stops. Defaults to `.idle`, matching `SessionStart`'s
+        /// mapping, for a session first seen via a hook this field predates
+        /// (shouldn't happen in practice: `SessionStart` is always first).
+        var rawStatus: AgentStatus = .idle
     }
     private var claudeSessions: [String: ClaudeSessionRecord] = [:]
+    /// M6: which Claude sessions currently have a subagent running --
+    /// `ActiveSubagentTracker.isActive(sessionID:)` is the sole signal that
+    /// a session's displayed status should be overridden to `.working`
+    /// regardless of what its own hooks most recently reported -- see
+    /// `refreshSubagentOverride`. Entries are removed on a matching
+    /// `SubagentStop`, TTL sweep (`pruneActiveSubagents`), on-disk
+    /// staleness sweep (`applyActiveSubagentStaleSweep`), or whenever the
+    /// session itself is torn down (`SessionEnd`, any of the cross-source
+    /// GCs, `ActiveSubagentTracker.clear`).
+    private var activeSubagents = ActiveSubagentTracker()
+    /// Take-over-if-lost safety net (M6 spec): even if a `SubagentStop`
+    /// never arrives (crashed subagent process, dropped async hook, ...) an
+    /// entry is force-cleared after this long so a stuck `SubagentStart`
+    /// can't pin a session at `.working` forever.
+    private let activeSubagentTTL: TimeInterval = 7_200
+    /// Second take-over-if-lost check, applied only at `syncCatalog` time
+    /// (too expensive to stat a directory on every hook call): if every
+    /// `agent-*.jsonl` under the session's on-disk `subagents/` directory
+    /// has gone untouched this long, the tracked subagents are presumed
+    /// dead and cleared outright, well before the 2h TTL would catch up --
+    /// see `applyActiveSubagentStaleSweep`.
+    private let activeSubagentStaleAfter: TimeInterval = 1_800
     /// `SessionEnd` tombstones, so a Claude hook re-delivery or reordering
     /// (e.g. an async PostToolUse hook that lands after SessionEnd) doesn't
     /// resurrect an already-ended session. Pruned after `claudeSessionEndTombstoneTTL`.
@@ -251,6 +282,7 @@ final class StatusDaemon {
                 try stateStore.clear()
                 deferredHooks.removeAll()
                 pendingApprovals.removeAll()
+                activeSubagents.clearAll()
                 try applyAll(color: LEDColorName.off.color)
                 try reconcileLEDs()
                 logger.log(.info, "state cleared keys=off")
@@ -356,6 +388,15 @@ final class StatusDaemon {
     /// with the same 0.5s debounce Codex uses.
     private func handleClaudeHook(_ hook: HookInput) throws -> DaemonResponse {
         pruneEndedClaudeSessions()
+        pruneActiveSubagents()
+
+        // M6: handled before the `isSubagent` check even though `isSubagent`
+        // already carves these two events out -- keeping the branch here
+        // too makes the control flow self-evident without having to recall
+        // `HookInput.isSubagent`'s carve-out.
+        if hook.isSubagentLifecycleEvent {
+            return try handleSubagentLifecycle(hook)
+        }
 
         if hook.isSubagent {
             logger.log(
@@ -368,6 +409,7 @@ final class StatusDaemon {
         if hook.endsSession {
             pendingApprovals.cancel(sessionID: hook.sessionID)
             claudeSessions.removeValue(forKey: hook.sessionID)
+            activeSubagents.clear(sessionID: hook.sessionID)
             endedClaudeSessions.record(sessionID: hook.sessionID)
             let mutation = try stateStore.update(
                 sessionID: hook.sessionID,
@@ -394,13 +436,15 @@ final class StatusDaemon {
             return DaemonResponse(ok: true, message: "tombstoned session ignored", status: nil)
         }
 
+        let previousRawStatus = claudeSessions[hook.sessionID]?.rawStatus ?? .idle
         claudeSessions[hook.sessionID] = ClaudeSessionRecord(
             sourceKind: hook.effectiveSource,
             cwd: hook.projectKey,
             herdrWorkspaceID: hook.herdrWorkspaceID,
             navigation: claudeNavigationTarget(for: hook),
             configDir: hook.configDir ?? (NSHomeDirectory() + "/.claude"),
-            lastSeen: Date()
+            lastSeen: Date(),
+            rawStatus: previousRawStatus
         )
 
         guard let status = hook.status else {
@@ -410,9 +454,18 @@ final class StatusDaemon {
             )
             return DaemonResponse(ok: true, message: "hook ignored", status: nil)
         }
+        // Track the hook-mapped status separately from whatever ends up
+        // displayed (M6): `refreshSubagentOverride` reads this back once
+        // the session's last tracked subagent stops, so it must be kept
+        // current even while an override is suppressing it from ever
+        // reaching `StateStore` directly.
+        claudeSessions[hook.sessionID]?.rawStatus = status
+
+        let hasActiveSubagents = activeSubagents.isActive(sessionID: hook.sessionID)
+        let displayStatus: AgentStatus = hasActiveSubagents ? .working : status
 
         let projectKey = hook.projectKey
-        if status == .approval {
+        if displayStatus == .approval {
             // Ensure the session already has a key before its approval
             // color is (debounced-)displayed, in case this is the very
             // first hook seen for it.
@@ -430,19 +483,122 @@ final class StatusDaemon {
             sessionID: hook.sessionID,
             projectKey: projectKey,
             source: hook.effectiveSource,
-            status: status
+            status: displayStatus
         )
         guard let slot = mutation.slot else {
             throw CLIError.runtime("Hook session was not assigned a C100 key")
         }
         logger.log(
             .info,
-            "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) changed=\(mutation.changed)\(cancelledApproval ? " approval=resolved_before_display" : "")"
+            "hook event=\(hook.hookEventName) session=\(shortSession(hook.sessionID)) source=\(hook.effectiveSource.rawValue) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) changed=\(mutation.changed)\(cancelledApproval ? " approval=resolved_before_display" : "")\(hasActiveSubagents ? " raw_status=\(status.rawValue) action=subagent_override" : "")"
         )
         if mutation.changed {
             try applyLayerAwareUpdate(source: hook.effectiveSource, mutation: mutation, slot: slot)
         }
         return DaemonResponse(ok: true, message: "hook accepted on key \(slot.keyIndex)", status: slot.status)
+    }
+
+    /// M6: `SubagentStart`/`SubagentStop` bookkeeping. Neither event ever
+    /// carries a status of its own (`HookInput.status` is `nil` for both --
+    /// see `claudeStatus`); they only mutate `activeSubagents` and then let
+    /// `refreshSubagentOverride` decide what the session's display status
+    /// should be.
+    private func handleSubagentLifecycle(_ hook: HookInput) throws -> DaemonResponse {
+        let sessionID = hook.sessionID
+        if endedClaudeSessions.isTombstoned(sessionID: sessionID, ttl: claudeSessionEndTombstoneTTL) {
+            logger.log(
+                .debug,
+                "hook event=\(hook.hookEventName) session=\(shortSession(sessionID)) action=ignored_tombstoned\(hookDiagnosticContext(hook))"
+            )
+            return DaemonResponse(ok: true, message: "tombstoned session ignored", status: nil)
+        }
+
+        switch hook.hookEventName {
+        case "SubagentStart":
+            activeSubagents.start(sessionID: sessionID, agentID: hook.agentID)
+        case "SubagentStop":
+            activeSubagents.stop(sessionID: sessionID, agentID: hook.agentID)
+        default:
+            break
+        }
+
+        logger.log(
+            .info,
+            "hook event=\(hook.hookEventName) session=\(shortSession(sessionID)) active_subagents=\(activeSubagents.count(sessionID: sessionID))\(hookDiagnosticContext(hook))"
+        )
+        try refreshSubagentOverride(sessionID: sessionID)
+        return DaemonResponse(ok: true, message: "subagent lifecycle recorded", status: nil)
+    }
+
+    /// Re-derives `sessionID`'s displayed status from its raw hook status
+    /// plus whether it currently has any tracked subagent running, and
+    /// pushes the result to `StateStore`/the LEDs if it changed. A no-op if
+    /// the daemon has no hook-derived record for the session (nothing to
+    /// override yet, or it's already been torn down) -- `activeSubagents`
+    /// itself is left untouched in that case since a later hook may still
+    /// register the session before its subagents finish.
+    @discardableResult
+    private func refreshSubagentOverride(sessionID: String) throws -> Bool {
+        guard let record = claudeSessions[sessionID] else { return false }
+        let hasActiveSubagents = activeSubagents.isActive(sessionID: sessionID)
+        let displayStatus: AgentStatus = hasActiveSubagents ? .working : record.rawStatus
+        let mutation = try stateStore.update(
+            sessionID: sessionID,
+            projectKey: record.cwd,
+            source: record.sourceKind,
+            status: displayStatus
+        )
+        guard mutation.changed, let slot = mutation.slot else { return false }
+        logger.log(
+            .info,
+            "claude session=\(shortSession(sessionID)) source=\(record.sourceKind.rawValue) active_subagents=\(activeSubagents.count(sessionID: sessionID)) status=\(slot.status.rawValue) action=subagent_override_refreshed"
+        )
+        try applyLayerAwareUpdate(source: record.sourceKind, mutation: mutation, slot: slot)
+        return true
+    }
+
+    /// TTL sweep (M6): drops any tracked subagent whose `SubagentStart`
+    /// arrived more than `activeSubagentTTL` ago without a matching
+    /// `SubagentStop`. Cheap (in-memory only), so run on every hook as well
+    /// as every `syncCatalog` tick -- unlike `applyActiveSubagentStaleSweep`,
+    /// which stats a directory and is therefore sync-only.
+    private func pruneActiveSubagents(now: Date = Date()) {
+        let changedSessionIDs = activeSubagents.pruneExpired(now: now, ttl: activeSubagentTTL)
+        for sessionID in changedSessionIDs {
+            logger.log(
+                .info,
+                "claude session=\(shortSession(sessionID)) action=active_subagents_ttl_pruned remaining=\(activeSubagents.count(sessionID: sessionID)) threshold_s=\(Int(activeSubagentTTL))"
+            )
+            _ = try? refreshSubagentOverride(sessionID: sessionID)
+        }
+    }
+
+    /// On-disk staleness sweep (M6), run once per `syncCatalog` tick: if
+    /// every `agent-*.jsonl` under a tracked session's `subagents/`
+    /// directory has gone untouched for `activeSubagentStaleAfter`, the
+    /// daemon presumes every subagent it's still counting for that session
+    /// is actually dead (crashed, or its `SubagentStop` never arrived) and
+    /// clears them outright -- well before the 2h TTL would. A session
+    /// whose directory doesn't exist or can't be read is left to the TTL
+    /// alone, mirroring `ClaudeSessionsCatalog.isTranscriptStale`'s
+    /// "missing means unknown, not stale" rule.
+    private func applyActiveSubagentStaleSweep(now: Date = Date()) {
+        for sessionID in activeSubagents.activeSessionIDs {
+            guard let record = claudeSessions[sessionID] else { continue }
+            guard ClaudeSessionsCatalog.isSubagentActivityStale(
+                configDir: record.configDir,
+                cwd: record.cwd,
+                sessionID: sessionID,
+                now: now,
+                staleAfter: activeSubagentStaleAfter
+            ) == true else { continue }
+            activeSubagents.clear(sessionID: sessionID)
+            logger.log(
+                .info,
+                "claude session=\(shortSession(sessionID)) action=active_subagents_cleared reason=subagent_transcripts_stale threshold_s=\(Int(activeSubagentStaleAfter))"
+            )
+            _ = try? refreshSubagentOverride(sessionID: sessionID)
+        }
     }
 
     private func claudeNavigationTarget(for hook: HookInput) -> NavigationTarget {
@@ -484,16 +640,26 @@ final class StatusDaemon {
                     )
                     continue
                 }
+                // M6: the raw status this debounced approval represents is
+                // still `.approval` even if a subagent happens to be running
+                // concurrently (unusual, but not impossible) -- record it so
+                // `refreshSubagentOverride` restores to `.approval`, not
+                // whatever stale value predates it, once that subagent
+                // stops. The *displayed* status, however, still defers to
+                // the override for as long as it's active.
+                claudeSessions[entry.hook.sessionID]?.rawStatus = .approval
+                let hasActiveSubagents = activeSubagents.isActive(sessionID: entry.hook.sessionID)
+                let displayStatus: AgentStatus = hasActiveSubagents ? .working : .approval
                 let mutation = try stateStore.update(
                     sessionID: entry.hook.sessionID,
                     projectKey: resolvedProjectKey(for: entry.hook),
                     source: entry.hook.effectiveSource,
-                    status: .approval
+                    status: displayStatus
                 )
                 guard let slot = mutation.slot else { continue }
                 logger.log(
                     .info,
-                    "hook event=PermissionRequest session=\(shortSession(entry.hook.sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=approval action=waiting_for_user\(hookDiagnosticContext(entry.hook))"
+                    "hook event=PermissionRequest session=\(shortSession(entry.hook.sessionID)) project=\(slot.projectKey) row=\(slot.row) col=\(slot.column) key=\(slot.keyIndex) status=\(slot.status.rawValue) action=waiting_for_user\(hasActiveSubagents ? " raw_status=approval action=subagent_override" : "")\(hookDiagnosticContext(entry.hook))"
                 )
                 guard mutation.changed else { continue }
                 try applyLayerAwareUpdate(source: entry.hook.effectiveSource, mutation: mutation, slot: slot)
@@ -785,6 +951,8 @@ final class StatusDaemon {
     private func syncCatalog() {
         nextCatalogSync = Date().addingTimeInterval(2)
         pruneEndedClaudeSessions()
+        pruneActiveSubagents()
+        applyActiveSubagentStaleSweep()
         do {
             // Codex-authoritative view: approval routing, deferred-hook
             // promotion, and turn-abort monitoring below remain gated to Codex
@@ -833,6 +1001,7 @@ final class StatusDaemon {
             for sessionID in previousHerdrSessionIDs.subtracting(currentHerdrSessionIDs) {
                 pendingApprovals.cancel(sessionID: sessionID)
                 claudeSessions.removeValue(forKey: sessionID)
+                activeSubagents.clear(sessionID: sessionID)
                 herdrStatusStreaks.removeValue(forKey: sessionID)
                 endedClaudeSessions.record(sessionID: sessionID)
                 let mutation = try stateStore.update(
@@ -870,6 +1039,7 @@ final class StatusDaemon {
                 guard claudeSessions[sessionID]?.sourceKind == .claudeTerminal else { continue }
                 pendingApprovals.cancel(sessionID: sessionID)
                 claudeSessions.removeValue(forKey: sessionID)
+                activeSubagents.clear(sessionID: sessionID)
                 endedClaudeSessions.record(sessionID: sessionID)
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
@@ -901,6 +1071,7 @@ final class StatusDaemon {
                 guard claudeSessions[sessionID]?.sourceKind == .claudeDesktop else { continue }
                 pendingApprovals.cancel(sessionID: sessionID)
                 claudeSessions.removeValue(forKey: sessionID)
+                activeSubagents.clear(sessionID: sessionID)
                 endedClaudeSessions.record(sessionID: sessionID)
                 let mutation = try stateStore.update(
                     sessionID: sessionID,
@@ -1140,6 +1311,7 @@ final class StatusDaemon {
             ) else { continue }
             pendingApprovals.cancel(sessionID: sessionID)
             claudeSessions.removeValue(forKey: sessionID)
+            activeSubagents.clear(sessionID: sessionID)
             endedClaudeSessions.record(sessionID: sessionID)
             let mutation = try stateStore.update(
                 sessionID: sessionID,

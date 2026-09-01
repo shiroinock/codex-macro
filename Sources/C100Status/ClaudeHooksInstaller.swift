@@ -33,7 +33,8 @@ enum ClaudeHooksInstaller {
 
     static let eventOrder = [
         "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-        "PermissionRequest", "Notification", "Stop", "StopFailure", "SessionEnd",
+        "PermissionRequest", "Notification", "Stop", "StopFailure",
+        "SubagentStart", "SubagentStop", "SessionEnd",
     ]
 
     enum Status: String {
@@ -118,6 +119,8 @@ enum ClaudeHooksInstaller {
             ],
             "Stop": [entry(matcher: nil, commands: [standard])],
             "StopFailure": [entry(matcher: nil, commands: [standard])],
+            "SubagentStart": [entry(matcher: nil, commands: [standard])],
+            "SubagentStop": [entry(matcher: nil, commands: [standard])],
             "SessionEnd": [entry(matcher: nil, commands: [sessionEnd])],
         ]
     }

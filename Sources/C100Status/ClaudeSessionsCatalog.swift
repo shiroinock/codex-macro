@@ -211,4 +211,44 @@ final class ClaudeSessionsCatalog: SessionSourceProvider {
         }
         return now.timeIntervalSince(modifiedAt) > staleAfter
     }
+
+    /// M6: directory Claude Code writes a subagent's own transcript into
+    /// while it runs, one `agent-*.jsonl` file per subagent invocation.
+    static func subagentsDirectoryPath(configDir: String, cwd: String, sessionID: String) -> String {
+        configDir + "/projects/" + flattenedProjectDirectoryName(cwd: cwd) + "/" + sessionID + "/subagents"
+    }
+
+    /// Whether every `agent-*.jsonl` under `sessionID`'s subagents directory
+    /// has gone untouched for longer than `staleAfter` -- used by
+    /// `Daemon.applyActiveSubagentStaleSweep` as a take-over-if-lost check
+    /// for `SubagentStart`/`SubagentStop` bookkeeping, well ahead of that
+    /// tracking's own 2h TTL.
+    ///
+    /// Returns `nil` (rather than `false`) whenever the directory is
+    /// missing/unreadable or contains no matching files -- deliberately
+    /// indistinguishable states, both meaning "nothing on disk to check
+    /// against", mirroring `isTranscriptStale`'s "missing means unknown, not
+    /// stale" rule so an unreadable directory never gets treated as a false
+    /// staleness signal. Only when at least one `agent-*.jsonl` is found,
+    /// and every one of them has an mtime older than `staleAfter`, does this
+    /// return `true`.
+    static func isSubagentActivityStale(
+        configDir: String,
+        cwd: String,
+        sessionID: String,
+        now: Date = Date(),
+        staleAfter: TimeInterval,
+        fileManager: FileManager = .default
+    ) -> Bool? {
+        let directory = subagentsDirectoryPath(configDir: configDir, cwd: cwd, sessionID: sessionID)
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else { return nil }
+        let agentFiles = entries.filter { $0.hasPrefix("agent-") && $0.hasSuffix(".jsonl") }
+        guard !agentFiles.isEmpty else { return nil }
+        for file in agentFiles {
+            guard let attributes = try? fileManager.attributesOfItem(atPath: directory + "/" + file),
+                  let modifiedAt = attributes[.modificationDate] as? Date else { continue }
+            if now.timeIntervalSince(modifiedAt) <= staleAfter { return false }
+        }
+        return true
+    }
 }

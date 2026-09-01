@@ -159,6 +159,8 @@ Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Cod
 
 The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). herdr, plain-terminal (Ghostty), and Claude Desktop Claude Code sessions are all implemented.
 
+A session with at least one subagent running stays blue (`working`) even while its main thread is idle waiting on that subagent -- e.g. the main agent has already handed a turn off to a subagent and gone quiet, which would otherwise `Stop`/`idle_prompt` the key to green/dim white while real work is still happening. This is driven by the `SubagentStart`/`SubagentStop` hooks: the daemon counts a session's currently-running subagents and, whenever that count is above zero, overrides whatever status the session's own hooks would otherwise show; the override is lifted, falling back to that underlying status, once the last tracked subagent stops. A subagent whose matching `SubagentStop` never arrives (crashed process, dropped async hook) doesn't pin the key at working forever: the count is force-cleared after 2 hours, or sooner if the session's on-disk `subagents/agent-*.jsonl` transcripts have all gone untouched for 30 minutes.
+
 ### Installing the Claude Code hooks
 
 Claude Code reads hooks from `settings.json` in one of three config directories, depending on how it's launched:

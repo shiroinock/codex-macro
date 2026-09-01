@@ -75,8 +75,26 @@ struct HookInput: Codable {
     /// top-level session is tracked. Codex's own `agent_id` semantics
     /// (executor turns) are untouched since this is only consulted on the
     /// Claude path.
+    ///
+    /// `SubagentStart`/`SubagentStop` are a deliberate exception (M6): per
+    /// Claude Code's hooks reference, these fire with the *parent* session's
+    /// `session_id` plus an `agent_id` identifying the subagent that just
+    /// started/stopped -- i.e. exactly the shape this check would otherwise
+    /// classify as "a subagent's own hook call" and drop. They need to reach
+    /// `Daemon` (to drive the working-while-a-subagent-runs override), so
+    /// they're carved out here rather than only at the `Daemon` call site,
+    /// keeping this predicate the single source of truth for "is this hook
+    /// call ignorable".
     var isSubagent: Bool {
-        agentID != nil || (transcriptPath?.contains("/subagents/") ?? false)
+        guard !isSubagentLifecycleEvent else { return false }
+        return agentID != nil || (transcriptPath?.contains("/subagents/") ?? false)
+    }
+
+    /// `true` for the two hook events that report a subagent's own
+    /// lifecycle (as opposed to firing *because* the hook happens to run
+    /// inside a subagent, which is what `isSubagent` guards against).
+    var isSubagentLifecycleEvent: Bool {
+        hookEventName == "SubagentStart" || hookEventName == "SubagentStop"
     }
 
     var projectKey: String {
@@ -116,6 +134,12 @@ struct HookInput: Codable {
             }
         case "Stop": return .done
         case "StopFailure": return .error
+        // M6: recognized events, but they never carry a status of their own
+        // -- they're pure count-operation signals for `Daemon`'s
+        // `activeSubagents` bookkeeping (see `handleSubagentLifecycle`),
+        // which then decides whether to override the session's already-
+        // mapped status with `.working`.
+        case "SubagentStart", "SubagentStop": return nil
         default: return nil
         }
     }
@@ -289,6 +313,107 @@ struct ClaudeSessionEndTombstoneBuffer {
     mutating func prune(now: Date = Date(), ttl: TimeInterval) {
         guard !endedAtBySessionID.isEmpty else { return }
         endedAtBySessionID = endedAtBySessionID.filter { now.timeIntervalSince($0.value) < ttl }
+    }
+}
+
+/// M6: tracks Claude subagents currently running, grouped by their parent
+/// session id, purely to drive the "keep the session's key showing working
+/// while at least one of its subagents is still running" LED override --
+/// see `StatusDaemon.refreshSubagentOverride`. Extracted as its own struct
+/// (mirroring `DeferredHookBuffer`/`PendingApprovalBuffer`/
+/// `ClaudeSessionEndTombstoneBuffer` above) so the increment/decrement/TTL
+/// bookkeeping is unit-testable independent of `StatusDaemon`'s socket/HID
+/// plumbing.
+struct ActiveSubagentTracker {
+    /// sessionID -> (agentID or synthetic fallback key) -> when its
+    /// `SubagentStart` was recorded.
+    private(set) var startedAtByAgentID: [String: [String: Date]] = [:]
+    /// Per-session stack of synthetic keys minted for `SubagentStart` calls
+    /// that arrived without an `agent_id` -- see `start`/`stop`.
+    private var fallbackStackBySession: [String: [String]] = [:]
+
+    /// Every session id with at least one tracked subagent right now.
+    var activeSessionIDs: Set<String> { Set(startedAtByAgentID.keys) }
+
+    /// `true` while `sessionID` has at least one tracked subagent running.
+    func isActive(sessionID: String) -> Bool {
+        !(startedAtByAgentID[sessionID]?.isEmpty ?? true)
+    }
+
+    func count(sessionID: String) -> Int {
+        startedAtByAgentID[sessionID]?.count ?? 0
+    }
+
+    /// Records a `SubagentStart`. `agentID` should always be present per
+    /// Claude Code's hooks reference, but a missing one is tolerated: a
+    /// synthetic per-call key is minted and pushed onto a LIFO fallback
+    /// stack so a same-session `SubagentStop` that also lacks `agent_id`
+    /// can still be matched back to it (see `stop`).
+    mutating func start(sessionID: String, agentID: String?, at date: Date = Date()) {
+        let key = agentID ?? "fallback-\(UUID().uuidString)"
+        startedAtByAgentID[sessionID, default: [:]][key] = date
+        if agentID == nil {
+            fallbackStackBySession[sessionID, default: []].append(key)
+        }
+    }
+
+    /// Records a `SubagentStop`. Matches by `agentID` when present;
+    /// otherwise pops the most recently pushed no-id fallback key for this
+    /// session, and failing that (a same-session `SubagentStart` that *did*
+    /// have an `agent_id`, unexpected but not contractually ruled out)
+    /// drops whichever tracked entry has been running longest, so the count
+    /// never gets stuck inflated by a `SubagentStop` this tracker can't
+    /// otherwise attribute.
+    mutating func stop(sessionID: String, agentID: String?) {
+        if let agentID {
+            startedAtByAgentID[sessionID]?.removeValue(forKey: agentID)
+        } else if var stack = fallbackStackBySession[sessionID], let popped = stack.popLast() {
+            fallbackStackBySession[sessionID] = stack
+            startedAtByAgentID[sessionID]?.removeValue(forKey: popped)
+        } else if let oldestKey = startedAtByAgentID[sessionID]?.min(by: { $0.value < $1.value })?.key {
+            startedAtByAgentID[sessionID]?.removeValue(forKey: oldestKey)
+        }
+        if startedAtByAgentID[sessionID]?.isEmpty ?? false {
+            clear(sessionID: sessionID)
+        }
+    }
+
+    /// Drops every tracked subagent for `sessionID` outright -- used when
+    /// the session itself is torn down (`SessionEnd`, any cross-source GC)
+    /// so a leftover entry can't resurrect an override once the session id
+    /// is reused.
+    mutating func clear(sessionID: String) {
+        startedAtByAgentID.removeValue(forKey: sessionID)
+        fallbackStackBySession.removeValue(forKey: sessionID)
+    }
+
+    mutating func clearAll() {
+        startedAtByAgentID.removeAll()
+        fallbackStackBySession.removeAll()
+    }
+
+    /// Take-over-if-lost TTL sweep: drops any tracked subagent whose
+    /// `SubagentStart` is older than `ttl` (a `SubagentStop` that never
+    /// arrived -- crashed process, dropped async hook, ...). Returns the
+    /// session ids whose active count changed (including dropping to zero)
+    /// so the caller knows which sessions' displayed status needs
+    /// re-deriving.
+    @discardableResult
+    mutating func pruneExpired(now: Date = Date(), ttl: TimeInterval) -> Set<String> {
+        var changedSessionIDs: Set<String> = []
+        for sessionID in Array(startedAtByAgentID.keys) {
+            guard let perAgent = startedAtByAgentID[sessionID] else { continue }
+            let survivors = perAgent.filter { now.timeIntervalSince($0.value) < ttl }
+            guard survivors.count != perAgent.count else { continue }
+            changedSessionIDs.insert(sessionID)
+            if survivors.isEmpty {
+                clear(sessionID: sessionID)
+            } else {
+                startedAtByAgentID[sessionID] = survivors
+                fallbackStackBySession[sessionID] = fallbackStackBySession[sessionID]?.filter { survivors[$0] != nil }
+            }
+        }
+        return changedSessionIDs
     }
 }
 
