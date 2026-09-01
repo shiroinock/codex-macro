@@ -31,10 +31,14 @@ final class StatusDaemon {
     private lazy var navigator = CodexNavigator { [weak self] level, message in
         self?.logger.log(level, message)
     }
-    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator) { [weak self] level, message in
+    private lazy var navigationRouter = NavigationRouter(codexNavigator: navigator, herdrBinaryPath: herdrBinaryPath) { [weak self] level, message in
         self?.logger.log(level, message)
     }
-    private let providers: [SessionSourceProvider] = [CodexSourceProvider()]
+    private let herdrBinaryPath: String?
+    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath) { [weak self] level, message in
+        self?.logger.log(level, message)
+    }
+    private lazy var providers: [SessionSourceProvider] = [CodexSourceProvider(), herdrCatalog]
     /// Claude is hook-authoritative (M1): there is no on-disk catalog to
     /// scan yet (that's `ClaudeSessionsCatalog` in M3), so the daemon itself
     /// remembers every session a Claude hook has told it about -- cwd/source
@@ -54,8 +58,27 @@ final class StatusDaemon {
     /// resurrect an already-ended session. Pruned after `claudeSessionEndTombstoneTTL`.
     private var endedClaudeSessions = ClaudeSessionEndTombstoneBuffer()
     private let claudeSessionEndTombstoneTTL: TimeInterval = 60
+    /// herdr session IDs present in the *previous* sync's herdr snapshot, so
+    /// a session that vanishes (pane closed/killed) can be told apart from
+    /// one that was never there -- and torn down explicitly (M2) rather than
+    /// silently falling back to a stale hook-registered placement.
+    private var previousHerdrSessionIDs: Set<String> = []
+    /// Resolved navigation target for every session currently reported by
+    /// herdr, so a key-press on a herdr session the daemon hasn't received
+    /// any Claude hook for yet still navigates correctly.
+    private var herdrNavigationBySession: [String: NavigationTarget] = [:]
+    /// Consecutive-sync streak of a herdr-reported idle/done status per
+    /// session, used for hook-miss recovery (see `applyHerdrStatusHeuristics`).
+    private var herdrStatusStreaks: [String: (status: AgentStatus, count: Int, since: Date)] = [:]
 
-    init(socketPath: String, logURL: URL, locationID: Int?, grabberSocketPath: String, dryRun: Bool) throws {
+    init(
+        socketPath: String,
+        logURL: URL,
+        locationID: Int?,
+        grabberSocketPath: String,
+        dryRun: Bool,
+        herdrBinaryPath: String? = nil
+    ) throws {
         guard geteuid() != 0 else {
             throw CLIError.runtime(
                 "Refusing to run the user daemon as root. Install the helper once with sudo, then run c100-status without sudo."
@@ -65,6 +88,7 @@ final class StatusDaemon {
         self.locationID = locationID
         self.grabberSocketPath = grabberSocketPath
         self.dryRun = dryRun
+        self.herdrBinaryPath = herdrBinaryPath
         logger = try StatusLogger(fileURL: logURL)
     }
 
@@ -538,6 +562,7 @@ final class StatusDaemon {
             // hasn't seen a hook for yet) falls back to Codex-thread
             // navigation, matching pre-M1 behavior.
             let target = claudeSessions[assignment.sessionID]?.navigation
+                ?? herdrNavigationBySession[assignment.sessionID]
                 ?? .codexThread(sessionID: assignment.sessionID)
             let navigated = navigationRouter.handleTap(
                 keyIndex: keyIndex,
@@ -587,14 +612,58 @@ final class StatusDaemon {
             for provider in providers {
                 agentSessions.append(contentsOf: try provider.snapshot())
             }
-            // Claude has no on-disk catalog to snapshot yet (M3), so the
-            // sessions the daemon has learned about directly from hooks
-            // stand in here. This is what lets a hook-registered Claude
-            // session "move" from its provisional row (assigned by
-            // handleClaudeHook's stateStore.update) onto the UnifiedLayout
-            // row its herdrWorkspaceID/cwd grouping actually resolves to.
-            agentSessions.append(contentsOf: claudeSessions.map { sessionID, record in
-                AgentSession(
+
+            // herdr is placement-authoritative for any session it currently
+            // reports (M2): a session appearing in both the herdr snapshot
+            // and the hook-derived `claudeSessions` map is placed using the
+            // herdr entry only -- the hook-derived duplicate is dropped
+            // below so it doesn't create a second, conflicting placement for
+            // the same session id. Status, however, is decided separately
+            // (stateStore.reconcile below carries the existing status
+            // forward regardless of placement source; `handleClaudeHook`
+            // remains the only writer of status for sessions the daemon has
+            // ever received a hook for).
+            let herdrAgentSessions = agentSessions.filter { $0.sourceKind == .claudeHerdr }
+            let currentHerdrSessionIDs = Set(herdrAgentSessions.map(\.sessionID))
+            herdrNavigationBySession = Dictionary(
+                uniqueKeysWithValues: herdrAgentSessions.map { ($0.sessionID, $0.navigation) }
+            )
+
+            // A session herdr was reporting last sync but no longer reports
+            // this sync means its pane closed (or herdr lost track of it):
+            // tear it down outright rather than letting it fall back to a
+            // stale hook-derived placement below. Tombstoned so a late/
+            // reordered hook for it can't resurrect it either.
+            var herdrRemovalChanged = false
+            for sessionID in previousHerdrSessionIDs.subtracting(currentHerdrSessionIDs) {
+                pendingApprovals.cancel(sessionID: sessionID)
+                claudeSessions.removeValue(forKey: sessionID)
+                herdrStatusStreaks.removeValue(forKey: sessionID)
+                endedClaudeSessions.record(sessionID: sessionID)
+                let mutation = try stateStore.update(
+                    sessionID: sessionID,
+                    projectKey: "(herdr-pane-closed)",
+                    status: nil,
+                    remove: true
+                )
+                if mutation.changed {
+                    herdrRemovalChanged = true
+                    logger.log(.info, "herdr session=\(shortSession(sessionID)) action=removed reason=pane_closed")
+                }
+            }
+            previousHerdrSessionIDs = currentHerdrSessionIDs
+
+            // Claude has no on-disk catalog to snapshot yet for the
+            // terminal-direct path (M3), so the sessions the daemon has
+            // learned about directly from hooks stand in here -- except any
+            // session herdr already placed above. This is what lets a
+            // hook-registered Claude session "move" from its provisional row
+            // (assigned by handleClaudeHook's stateStore.update) onto the
+            // UnifiedLayout row its herdrWorkspaceID/cwd grouping actually
+            // resolves to.
+            agentSessions.append(contentsOf: claudeSessions.compactMap { sessionID, record -> AgentSession? in
+                guard !currentHerdrSessionIDs.contains(sessionID) else { return nil }
+                return AgentSession(
                     sourceKind: record.sourceKind,
                     sessionID: sessionID,
                     cwd: record.cwd,
@@ -623,6 +692,11 @@ final class StatusDaemon {
                     )
                 }
             )
+            let herdrStatusChanged = try applyHerdrStatusHeuristics(
+                herdrAgentSessions: herdrAgentSessions,
+                reconciliation: reconciliation
+            )
+
             catalogSessionIDs = nextCatalogSessionIDs
             let deferredDrain = deferredHooks.drain(
                 catalogSessionIDs: nextCatalogSessionIDs,
@@ -713,12 +787,85 @@ final class StatusDaemon {
                     "catalog sync projects=\(unified.projectRows.count) sessions=\(unified.placements.count) layout=updated"
                 )
             }
-            if reconciliation.changed || deferredChanged || interruptionChanged {
+            if reconciliation.changed || deferredChanged || interruptionChanged || herdrRemovalChanged || herdrStatusChanged {
                 try reconcileLEDs()
             }
         } catch {
             logger.log(.warning, "catalog sync failed error=\(error)")
         }
+    }
+
+    /// herdr `agent_status` is only ever used (a) to seed a brand-new
+    /// session's initial status when no Claude hook has registered it yet,
+    /// or (b) to recover from a missed hook: if herdr reports idle/done for
+    /// two consecutive syncs *and* the last hook seen for that session
+    /// predates that streak, the hook is presumed lost and herdr's status
+    /// wins. In every other case the hook remains authoritative (this
+    /// function never touches a session's status while its hook activity is
+    /// current).
+    private func applyHerdrStatusHeuristics(
+        herdrAgentSessions: [AgentSession],
+        reconciliation: GridReconciliation
+    ) throws -> Bool {
+        var changed = false
+        let currentHerdrSessionIDs = Set(herdrAgentSessions.map(\.sessionID))
+        herdrStatusStreaks = herdrStatusStreaks.filter { currentHerdrSessionIDs.contains($0.key) }
+
+        for session in herdrAgentSessions {
+            // (a) Seed brand-new sessions -- ones UnifiedLayout just placed
+            // for the first time (no previous slot) that no Claude hook has
+            // ever touched -- with herdr's reported status instead of the
+            // hard-coded `.idle` default `stateStore.reconcile` assigns.
+            if reconciliation.previous.sessions[session.sessionID] == nil,
+               claudeSessions[session.sessionID] == nil,
+               let seedStatus = session.seedStatus, seedStatus != .idle {
+                let mutation = try stateStore.update(
+                    sessionID: session.sessionID,
+                    projectKey: reconciliation.current.sessions[session.sessionID]?.projectKey ?? "(herdr)",
+                    status: seedStatus
+                )
+                if mutation.changed {
+                    changed = true
+                    logger.log(
+                        .info,
+                        "herdr session=\(shortSession(session.sessionID)) action=seeded status=\(seedStatus.rawValue)"
+                    )
+                }
+            }
+
+            // (b) Hook-miss recovery bookkeeping: only idle/done are ever
+            // used to correct a stuck status (working/approval streaks are
+            // ignored -- a stuck "working" LED is a much smaller nuisance
+            // than incorrectly clearing a genuine approval prompt).
+            guard let seedStatus = session.seedStatus, seedStatus == .idle || seedStatus == .done else {
+                herdrStatusStreaks.removeValue(forKey: session.sessionID)
+                continue
+            }
+            if let streak = herdrStatusStreaks[session.sessionID], streak.status == seedStatus {
+                herdrStatusStreaks[session.sessionID] = (seedStatus, streak.count + 1, streak.since)
+            } else {
+                herdrStatusStreaks[session.sessionID] = (seedStatus, 1, Date())
+            }
+        }
+
+        for (sessionID, streak) in herdrStatusStreaks where streak.count >= 2 {
+            guard let hookLastSeen = claudeSessions[sessionID]?.lastSeen, hookLastSeen < streak.since else { continue }
+            guard let currentSlot = reconciliation.current.sessions[sessionID], currentSlot.status != streak.status else { continue }
+            let mutation = try stateStore.update(
+                sessionID: sessionID,
+                projectKey: currentSlot.projectKey,
+                status: streak.status
+            )
+            if mutation.changed {
+                changed = true
+                logger.log(
+                    .info,
+                    "herdr session=\(shortSession(sessionID)) action=hook_miss_recovered status=\(streak.status.rawValue) streak=\(streak.count)"
+                )
+            }
+        }
+
+        return changed
     }
 
     private func resolvedProjectKey(for hook: HookInput) -> String {

@@ -22,6 +22,7 @@ struct Options {
     var ownerGID: gid_t?
     var hookSource = "codex"
     var notificationMatcher: String?
+    var herdrBinaryPath: String?
 }
 
 enum C100StatusCLI {
@@ -38,7 +39,8 @@ enum C100StatusCLI {
                 logURL: URL(fileURLWithPath: options.logPath),
                 locationID: options.locationID,
                 grabberSocketPath: options.grabberSocketPath,
-                dryRun: options.dryRun
+                dryRun: options.dryRun,
+                herdrBinaryPath: options.herdrBinaryPath
             )
             try daemon.run()
         case "grabber-service":
@@ -95,6 +97,24 @@ enum C100StatusCLI {
                     let session = placement.session
                     print("  key=\(placement.keyIndex) col=\(placement.column) session=\(session.sessionID) cwd=\(session.cwd)")
                 }
+            }
+            if let herdrBinary = HerdrBinaryResolver.resolve(explicitPath: options.herdrBinaryPath) {
+                do {
+                    let herdrSessions = try HerdrCatalog.fetchOnce(binary: herdrBinary)
+                    print("herdr sessions (binary=\(herdrBinary)):")
+                    for entry in herdrSessions.sorted(by: { $0.workspaceNumber < $1.workspaceNumber }) {
+                        print(
+                            "  workspace=\(entry.workspaceNumber) pane=\(entry.paneID) session=\(entry.sessionID) status=\(entry.seedStatus.rawValue) cwd=\(entry.cwd)"
+                        )
+                    }
+                    if herdrSessions.isEmpty {
+                        print("  (no claude agents reported by herdr)")
+                    }
+                } catch {
+                    print("herdr sessions: unavailable (\(error))")
+                }
+            } else {
+                print("herdr sessions: herdr binary not found (--herdr-bin / HERDR_BIN / PATH)")
             }
         case "request-input-access":
             let before = C100InputCapture.accessDescription
@@ -310,6 +330,12 @@ enum C100StatusCLI {
                     )
                 }
                 options.notificationMatcher = arguments[index]
+            case "--herdr-bin":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.usage("--herdr-bin requires a path")
+                }
+                options.herdrBinaryPath = arguments[index]
             default:
                 positionals.append(arguments[index])
             }
@@ -488,6 +514,185 @@ enum C100StatusCLI {
         tombstones.prune(now: Date(timeIntervalSince1970: 1_061), ttl: 60)
         guard tombstones.count == 0 else {
             throw CLIError.runtime("Claude SessionEnd tombstone pruning self-test failed")
+        }
+
+        // herdr (M2): fixed JSON parse test, shaped exactly like the real
+        // `herdr agent list` / `herdr workspace list` output captured from a
+        // live herdr instance (two workspaces, one Claude pane each, plus a
+        // non-Claude agent that must be filtered out).
+        let herdrAgentListJSON = #"""
+        {"id":"cli:agent:list","result":{"agents":[
+          {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"11111111-1111-1111-1111-111111111111"},"agent_status":"working","cwd":"/Users/dev/project-a","focused":false,"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},
+          {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"22222222-2222-2222-2222-222222222222"},"agent_status":"idle","cwd":"/Users/dev/project-b","focused":true,"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"},
+          {"agent":"codex","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"33333333-3333-3333-3333-333333333333"},"agent_status":"idle","cwd":"/Users/dev/project-c","focused":false,"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3"}
+        ],"type":"agent_list"}}
+        """#
+        let herdrWorkspaceListJSON = #"""
+        {"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+          {"active_tab_id":"w1:t1","agent_status":"working","focused":false,"label":"project-a","number":1,"pane_count":1,"tab_count":1,"workspace_id":"w1"},
+          {"active_tab_id":"w2:t1","agent_status":"idle","focused":true,"label":"project-b","number":2,"pane_count":1,"tab_count":1,"workspace_id":"w2"}
+        ]}}
+        """#
+        let herdrAgents = try decoder.decode(HerdrAgentListResponse.self, from: Data(herdrAgentListJSON.utf8)).result.agents
+        let herdrWorkspaces = try decoder.decode(HerdrWorkspaceListResponse.self, from: Data(herdrWorkspaceListJSON.utf8)).result.workspaces
+        guard herdrAgents.count == 3, herdrWorkspaces.count == 2 else {
+            throw CLIError.runtime("herdr fixture decode self-test failed")
+        }
+        let herdrEntries = HerdrCatalog.buildSessionEntries(agents: herdrAgents, workspaces: herdrWorkspaces)
+        guard herdrEntries.count == 2,
+              herdrEntries.map(\.sessionID) == ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
+              herdrEntries.map(\.workspaceNumber) == [1, 2],
+              herdrEntries.map(\.paneNumber) == [1, 1],
+              herdrEntries.map(\.seedStatus) == [.working, .idle] else {
+            throw CLIError.runtime("herdr agent-list/workspace-list parse self-test failed (codex agent must be filtered out)")
+        }
+
+        // herdr agent_status -> AgentStatus seed mapping (blocked -> approval,
+        // unknown -> idle, everything else 1:1).
+        let herdrStatusSamples: [(String, AgentStatus)] = [
+            ("idle", .idle),
+            ("working", .working),
+            ("blocked", .approval),
+            ("done", .done),
+            ("unknown", .idle),
+        ]
+        for (herdrStatus, expected) in herdrStatusSamples {
+            guard HerdrCatalog.seedStatus(forHerdrStatus: herdrStatus) == expected else {
+                throw CLIError.runtime("herdr status mapping self-test failed for \(herdrStatus)")
+            }
+        }
+
+        // Pane-id -> pane-number parsing.
+        guard HerdrCatalog.parsePaneNumber("w9:p1") == 1,
+              HerdrCatalog.parsePaneNumber("wA:p12") == 12,
+              HerdrCatalog.parsePaneNumber("not-a-pane-id") == nil,
+              HerdrCatalog.parsePaneNumber("w1:") == nil else {
+            throw CLIError.runtime("herdr pane-number parsing self-test failed")
+        }
+
+        // herdr binary resolution precedence: explicit path > HERDR_BIN env > PATH candidates.
+        let herdrBinaryFixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-herdr-bin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: herdrBinaryFixtureDirectory) }
+        try FileManager.default.createDirectory(at: herdrBinaryFixtureDirectory, withIntermediateDirectories: true)
+        let explicitHerdrBinary = herdrBinaryFixtureDirectory.appendingPathComponent("explicit-herdr")
+        let envHerdrBinary = herdrBinaryFixtureDirectory.appendingPathComponent("env-herdr")
+        try Data("#!/bin/sh\n".utf8).write(to: explicitHerdrBinary)
+        try Data("#!/bin/sh\n".utf8).write(to: envHerdrBinary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: explicitHerdrBinary.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: envHerdrBinary.path)
+        guard HerdrBinaryResolver.resolve(
+            explicitPath: explicitHerdrBinary.path,
+            environment: ["HERDR_BIN": envHerdrBinary.path]
+        ) == explicitHerdrBinary.path,
+              HerdrBinaryResolver.resolve(
+                  explicitPath: "/nonexistent/herdr",
+                  environment: ["HERDR_BIN": envHerdrBinary.path]
+              ) == envHerdrBinary.path,
+              HerdrBinaryResolver.resolve(explicitPath: nil, environment: [:]) == nil
+                  || HerdrBinaryResolver.pathCandidates.contains(
+                      HerdrBinaryResolver.resolve(explicitPath: nil, environment: [:]) ?? ""
+                  ) else {
+            throw CLIError.runtime("herdr binary resolution precedence self-test failed")
+        }
+
+        // HerdrProcessRunner: a command that outrun its timeout must fail
+        // with `.timedOut` rather than hang the caller.
+        var herdrTimeoutObserved = false
+        do {
+            _ = try HerdrProcessRunner.run(binary: "/bin/sleep", arguments: ["2"], timeout: 0.1)
+        } catch let error as HerdrProcessRunner.RunError {
+            if case .timedOut = error { herdrTimeoutObserved = true }
+        }
+        guard herdrTimeoutObserved else {
+            throw CLIError.runtime("herdr process timeout self-test failed")
+        }
+
+        // HerdrSnapshotStore: keeps the last successful snapshot available
+        // for 15s past its fetch time, then treats it as gone.
+        let herdrStore = HerdrSnapshotStore()
+        let herdrFetchTime = Date(timeIntervalSince1970: 10_000)
+        let herdrStoredEntries = [
+            HerdrCatalog.SessionEntry(
+                sessionID: "stale-test",
+                cwd: "/tmp",
+                workspaceID: "w1",
+                workspaceNumber: 1,
+                paneID: "w1:p1",
+                paneNumber: 1,
+                seedStatus: .idle
+            ),
+        ]
+        herdrStore.recordSuccess(herdrStoredEntries, at: herdrFetchTime)
+        guard herdrStore.currentEntries(now: herdrFetchTime.addingTimeInterval(14), staleGrace: 15) == herdrStoredEntries,
+              herdrStore.currentEntries(now: herdrFetchTime.addingTimeInterval(15), staleGrace: 15) == herdrStoredEntries,
+              herdrStore.currentEntries(now: herdrFetchTime.addingTimeInterval(15.5), staleGrace: 15).isEmpty else {
+            throw CLIError.runtime("herdr snapshot 15s stale-grace self-test failed")
+        }
+
+        // UnifiedLayout row ordering with herdr's negative-encoded rowRank:
+        // two herdr workspaces (numbers 3 and 1) must land ordered by
+        // ascending workspace number (workspace 1 before workspace 3), both
+        // ahead of an unranked Codex row, while an explicitly-ranked Codex
+        // row (absolute slot 0, exactly as CodexSourceProvider emits) keeps
+        // its literal slot untouched -- herdr rows pack into the remaining
+        // free rows rather than colliding with it.
+        let herdrOrderingSessions = [
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "codex-reserved",
+                cwd: "/repo/reserved",
+                rowHints: RowGroupingHints(codexProjectID: "reserved-project", herdrWorkspaceID: nil),
+                recency: 1,
+                rowRank: 0,
+                columnRank: 0,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "codex-reserved")
+            ),
+            AgentSession(
+                sourceKind: .codex,
+                sessionID: "codex-unranked",
+                cwd: "/repo/unranked",
+                rowHints: .none,
+                recency: 100,
+                rowRank: nil,
+                columnRank: nil,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "codex-unranked")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "herdr-ws3",
+                cwd: "/repo/ws3",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "w3"),
+                recency: 5,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
+                columnRank: 0,
+                seedStatus: .idle,
+                navigation: .herdrPane(paneID: "w3:p1")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "herdr-ws1",
+                cwd: "/repo/ws1",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "w1"),
+                recency: 5,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 1),
+                columnRank: 0,
+                seedStatus: .working,
+                navigation: .herdrPane(paneID: "w1:p1")
+            ),
+        ]
+        let herdrOrderingLayout = UnifiedLayout.compute(sessions: herdrOrderingSessions)
+        guard herdrOrderingLayout.projectRows["reserved-project"] == 0,
+              herdrOrderingLayout.warnings.isEmpty,
+              let herdrWS1Row = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "herdr-ws1" })?.row,
+              let herdrWS3Row = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "herdr-ws3" })?.row,
+              let codexUnrankedRow = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "codex-unranked" })?.row,
+              herdrWS1Row != 0, herdrWS3Row != 0,
+              herdrWS1Row < herdrWS3Row,
+              herdrWS3Row < codexUnrankedRow else {
+            throw CLIError.runtime("herdr row-ordering (workspace number ascending, ahead of unranked Codex rows) self-test failed")
         }
 
         let diagnosticJSON = #"{"session_id":"deferred","cwd":"/tmp/project","hook_event_name":"PostToolUse","turn_id":"turn-1","agent_id":"agent-1","agent_type":"executor","transcript_path":"/tmp/transcript.jsonl","permission_mode":"default","tool_name":"exec_command"}"#
@@ -982,7 +1187,7 @@ enum C100StatusCLI {
               physicalMap.resolve(usage: 99) == .unmapped else {
             throw CLIError.runtime("Keychron report self-test failed")
         }
-        print("self-test passed: hooks, Codex catalog, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
     }
 
     private static func writeDiagnostic(_ message: String) {
@@ -996,7 +1201,7 @@ enum C100StatusCLI {
     private static func printHelp() {
         print("""
         Usage:
-          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run]
+          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH]
           sudo c100-status install-helper --location 0x110000
           sudo c100-status uninstall-helper
           c100-status grabber-status [--grabber-socket PATH]
@@ -1016,6 +1221,8 @@ enum C100StatusCLI {
           c100-status apply <status> [--location 0x110000] [--dry-run]
           c100-status self-test
 
+        `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
+        If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
         `install-helper` performs the one-time root-owned LaunchDaemon installation.
         `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.
         While `run` is active, normal C100 keystrokes are suppressed and assigned keys navigate Codex tasks.

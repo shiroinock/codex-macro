@@ -134,6 +134,38 @@ Codex forks inherit their source task's project by following the recorded fork a
 
 Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Codex app is already running, one press navigates immediately. If Codex is not running, the same key must be pressed twice within 350 ms before the app is launched and navigated.
 
+## Claude Code (herdr / terminal / Claude Desktop)
+
+The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). As of M2, the herdr integration is implemented; plain-terminal and Claude Desktop navigation (M3/M4) still fall back to logging the intent instead of navigating.
+
+### Installing the Claude Code hooks
+
+Claude Code reads hooks from `settings.json` in one of three config directories, depending on how it's launched:
+
+- `~/.claude` (plain terminal and Claude Desktop)
+- `~/.claude-config/max`
+- `~/.claude-config/enterprise`
+
+For each config directory you use, merge the contents of `hooks.claude.example.json` into that directory's `settings.json`, replacing `/ABSOLUTE/PATH/TO/c100-status` with the release executable's absolute path. Claude Code requires reviewing and trusting non-managed hooks before they run.
+
+If you also use herdr, it manages its own `hooks/herdr-agent-state.sh` entries in the same `settings.json` files. **Add the `c100-status hook --source claude` entries as additional array entries alongside herdr's, not by editing or replacing them** -- each event array (e.g. `PostToolUse`) can hold multiple hook entries and Claude Code runs all of them. If herdr later regenerates `settings.json` (it can overwrite the file when its own config changes), the `c100-status` entries you added are not preserved by herdr and must be re-merged.
+
+### How the herdr integration works
+
+While `run` is active, a dedicated background thread polls `herdr agent list` and `herdr workspace list` every two seconds (independent of the daemon's 10 ms HID poll loop, so a slow or hung herdr call never affects key-press responsiveness). Only `"agent":"claude"` entries are tracked. Each herdr-reported session is placed using:
+
+- **Row**: herdr's `workspace_id`/`number` (ascending), merged onto an existing Codex row if their cwds are the same directory.
+- **Column**: the pane's number in its `pane_id` (e.g. `w9:p1` -> column 0).
+- **Initial status**: herdr's `agent_status` (`idle`/`working`/`blocked`/`done`/`unknown` -> `idle`/`working`/`approval`/`done`/`idle`), used only until the session's first Claude Code hook arrives -- after that, hook events are authoritative. If herdr keeps reporting `idle`/`done` for two consecutive polls while no hook has been seen since, the daemon treats the hook as missed and applies herdr's status directly (recovery path).
+
+If `herdr agent list`/`workspace list` fails, the daemon keeps showing the last successful snapshot for 15 seconds before treating herdr as empty (so a brief hiccup doesn't blank the grid). When a pane closes (or herdr stops reporting a session it previously reported), that session's key is released immediately, the same as a Codex session leaving the catalog.
+
+Pressing an assigned herdr session's key runs `herdr agent focus <pane_id>` (200 ms timeout, best-effort -- a timeout or failure is logged but does not block the rest of navigation) and then activates Ghostty (`com.mitchellh.ghostty`) via `NSWorkspace`, since herdr itself has no window-foregrounding capability. If Ghostty isn't installed, this is logged and the key press is otherwise a no-op.
+
+### Locating the herdr binary
+
+The daemon resolves `herdr` in this order: `--herdr-bin PATH` (on `run`) > `HERDR_BIN` environment variable > `/opt/homebrew/bin/herdr` > `/usr/local/bin/herdr` > `~/.cargo/bin/herdr`. If none resolve to an executable, herdr support is silently disabled (a single INFO log line at startup) and the daemon otherwise behaves exactly as it did before M2.
+
 ## Runtime paths and options
 
 - Socket: `/tmp/keychron-c100-status-<uid>.sock`; override with `--socket PATH` on both daemon and clients.
