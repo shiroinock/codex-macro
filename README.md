@@ -146,9 +146,18 @@ Claude Code reads hooks from `settings.json` in one of three config directories,
 - `~/.claude-config/max`
 - `~/.claude-config/enterprise`
 
-For each config directory you use, merge the contents of `hooks.claude.example.json` into that directory's `settings.json`, replacing `/ABSOLUTE/PATH/TO/c100-status` with the release executable's absolute path. Claude Code requires reviewing and trusting non-managed hooks before they run.
+The easiest way to install them is `c100-status install-claude-hooks`:
 
-If you also use herdr, it manages its own `hooks/herdr-agent-state.sh` entries in the same `settings.json` files. **Add the `c100-status hook --source claude` entries as additional array entries alongside herdr's, not by editing or replacing them** -- each event array (e.g. `PostToolUse`) can hold multiple hook entries and Claude Code runs all of them. If herdr later regenerates `settings.json` (it can overwrite the file when its own config changes), the `c100-status` entries you added are not preserved by herdr and must be re-merged.
+```
+c100-status install-claude-hooks --dry-run   # preview what would change
+c100-status install-claude-hooks             # write it for real
+```
+
+By default this targets `~/.claude`, `~/.claude-config/max`, `~/.claude-config/enterprise`, and any other subdirectory of `~/.claude-config` that exists; pass one or more `--config-dir PATH` to install into a different set instead, and `--binary PATH` to point at a specific executable instead of auto-detecting this one's absolute path. It's idempotent -- re-running it after a rebuild (to pick up a new absolute path) or with no changes at all is always safe, and it only ever adds/replaces the `c100-status`-owned entries: any other hooks already in `settings.json` (see herdr below) are left completely alone. Before writing, the current `settings.json` is copied to `settings.json.c100-backup-<epoch-ms>` alongside it. Run with `--uninstall` to remove only the `c100-status` entries again. A config directory with no `settings.json` is skipped (a warning is printed, nothing is created); a `settings.json` that fails to parse is left untouched and reported as an error rather than risking data loss. Claude Code still requires reviewing and trusting non-managed hooks before they run.
+
+If you'd rather do it by hand, merge the contents of `hooks.claude.example.json` into a config directory's `settings.json` yourself, replacing `/ABSOLUTE/PATH/TO/c100-status` with the release executable's absolute path.
+
+If you also use herdr, it manages its own `hooks/herdr-agent-state.sh` entries in the same `settings.json` files; `install-claude-hooks` (and, if merging by hand, you) must add the `c100-status hook --source claude` entries as additional array entries alongside herdr's, not by editing or replacing them -- each event array (e.g. `PostToolUse`) can hold multiple hook entries and Claude Code runs all of them. If herdr later regenerates `settings.json` (it can overwrite the file when its own config changes), the `c100-status` entries are not preserved by herdr and `install-claude-hooks` must be re-run.
 
 ### How the herdr integration works
 

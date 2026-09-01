@@ -25,6 +25,9 @@ struct Options {
     var herdrBinaryPath: String?
     var claudeConfigDirs: [String] = []
     var claudeDesktopDir: String?
+    var installClaudeHooksConfigDirs: [String] = []
+    var installClaudeHooksBinaryPath: String?
+    var uninstallClaudeHooks = false
 }
 
 enum C100StatusCLI {
@@ -195,6 +198,21 @@ enum C100StatusCLI {
                 }
                 print("status=\(status.rawValue) applied-directly persistence=volatile")
             }
+        case "install-claude-hooks":
+            let configDirs = options.installClaudeHooksConfigDirs.isEmpty
+                ? ClaudeHooksInstaller.defaultInstallConfigDirs()
+                : options.installClaudeHooksConfigDirs
+            let binaryPath = options.installClaudeHooksBinaryPath ?? HelperInstaller.currentExecutableURL().path
+            let results = ClaudeHooksInstaller.run(
+                configDirs: configDirs,
+                binaryPath: binaryPath,
+                dryRun: options.dryRun,
+                uninstall: options.uninstallClaudeHooks
+            )
+            for result in results {
+                print("config_dir=\(result.configDir) settings=\(result.settingsPath) status=\(result.status.rawValue) \(result.message)")
+            }
+            print("summary: \(ClaudeHooksInstaller.summarize(results)) binary=\(binaryPath)")
         case "hook":
             try runHook(options: options)
         case "clear":
@@ -373,6 +391,20 @@ enum C100StatusCLI {
                     throw CLIError.usage("--claude-desktop-dir requires a path")
                 }
                 options.claudeDesktopDir = arguments[index]
+            case "--config-dir":
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else {
+                    throw CLIError.usage("--config-dir requires a path")
+                }
+                options.installClaudeHooksConfigDirs.append(arguments[index])
+            case "--binary":
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else {
+                    throw CLIError.usage("--binary requires a path")
+                }
+                options.installClaudeHooksBinaryPath = arguments[index]
+            case "--uninstall":
+                options.uninstallClaudeHooks = true
             default:
                 positionals.append(arguments[index])
             }
@@ -1602,7 +1634,164 @@ enum C100StatusCLI {
             throw CLIError.runtime("OsascriptRunner timeout self-test failed")
         }
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, and physical-key resolution")
+        try selfTestClaudeHooksInstaller()
+
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, and install-claude-hooks")
+    }
+
+    /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end
+    /// against synthetic `settings.json` fixtures in a temporary directory
+    /// (never against the real `~/.claude*` profiles). Covers: install onto
+    /// a herdr-bearing file (all 9 events added, herdr entries kept),
+    /// re-install is a no-op, a binary-path change is picked up as an
+    /// update (no duplicate entries), `--dry-run` writes nothing,
+    /// `--uninstall` removes only the c100 entries, and a malformed
+    /// `settings.json` is left untouched and reported as an error.
+    private static func selfTestClaudeHooksInstaller() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("c100-status-claude-hooks-install-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let profileDir = root.appendingPathComponent("profile")
+        try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
+        let settingsPath = profileDir.appendingPathComponent("settings.json").path
+
+        let herdrFixture = """
+        {
+          "hooks": {
+            "SessionStart": [
+              { "matcher": "startup", "hooks": [ { "type": "command", "command": "/opt/herdr/hooks/herdr-agent-state.sh session-start", "timeout": 5 } ] }
+            ],
+            "PreToolUse": [
+              { "hooks": [ { "type": "command", "command": "/opt/herdr/hooks/herdr-agent-state.sh pre-tool" } ] }
+            ]
+          },
+          "otherTopLevelKey": { "foo": "bar" }
+        }
+        """
+        try Data(herdrFixture.utf8).write(to: URL(fileURLWithPath: settingsPath))
+
+        func readSettings() throws -> [String: Any] {
+            let data = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CLIError.runtime("install-claude-hooks self-test: settings.json did not decode as an object")
+            }
+            return object
+        }
+        func hookCommands(_ settings: [String: Any], event: String) -> [String] {
+            guard let hooks = settings["hooks"] as? [String: Any], let entries = hooks[event] as? [[String: Any]] else { return [] }
+            return entries.flatMap { entry -> [String] in
+                (entry["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String }
+            }
+        }
+        func backupCount() -> Int {
+            (try? FileManager.default.contentsOfDirectory(atPath: profileDir.path))?
+                .filter { $0.contains(".c100-backup-") }.count ?? 0
+        }
+
+        // 1. Install onto the herdr fixture: all 9 events gain a c100 entry,
+        // herdr's untouched, unrelated top-level key preserved, one backup written.
+        let binaryA = "/tmp/c100-status-fake-a"
+        let installResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryA, dryRun: false, uninstall: false)
+        guard installResults.count == 1, installResults[0].status == .installed else {
+            throw CLIError.runtime("install-claude-hooks self-test: initial install status was not .installed")
+        }
+        guard backupCount() == 1 else {
+            throw CLIError.runtime("install-claude-hooks self-test: initial install did not write exactly one backup")
+        }
+        var settings = try readSettings()
+        guard (settings["otherTopLevelKey"] as? [String: Any])?["foo"] as? String == "bar" else {
+            throw CLIError.runtime("install-claude-hooks self-test: unrelated top-level key was not preserved")
+        }
+        for event in ClaudeHooksInstaller.eventOrder {
+            guard hookCommands(settings, event: event).contains(where: { $0.contains(binaryA) }) else {
+                throw CLIError.runtime("install-claude-hooks self-test: event \(event) missing its c100 entry after install")
+            }
+        }
+        guard hookCommands(settings, event: "SessionStart").contains(where: { $0.contains("herdr-agent-state.sh") }),
+              hookCommands(settings, event: "PreToolUse").contains(where: { $0.contains("herdr-agent-state.sh") }) else {
+            throw CLIError.runtime("install-claude-hooks self-test: herdr entries were dropped by install")
+        }
+        guard hookCommands(settings, event: "Notification").filter({ $0.contains(binaryA) }).count == 4 else {
+            throw CLIError.runtime("install-claude-hooks self-test: Notification should gain exactly 4 c100 entries")
+        }
+
+        // 2. Re-install with the same binary path: unchanged, no new backup.
+        let reinstallResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryA, dryRun: false, uninstall: false)
+        guard reinstallResults.count == 1, reinstallResults[0].status == .unchanged, backupCount() == 1 else {
+            throw CLIError.runtime("install-claude-hooks self-test: re-install with the same binary path was not a no-op")
+        }
+
+        // 3. Install with a different binary path: updated, old command gone, no duplicates.
+        let binaryB = "/tmp/c100-status-fake-b"
+        let updateResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryB, dryRun: false, uninstall: false)
+        guard updateResults.count == 1, updateResults[0].status == .updated, backupCount() == 2 else {
+            throw CLIError.runtime("install-claude-hooks self-test: binary-path change was not reported as .updated")
+        }
+        settings = try readSettings()
+        for event in ClaudeHooksInstaller.eventOrder {
+            let commands = hookCommands(settings, event: event)
+            guard commands.contains(where: { $0.contains(binaryB) }), !commands.contains(where: { $0.contains(binaryA) }) else {
+                throw CLIError.runtime("install-claude-hooks self-test: event \(event) did not cleanly switch to the new binary path")
+            }
+        }
+        guard hookCommands(settings, event: "SessionStart").contains(where: { $0.contains("herdr-agent-state.sh") }) else {
+            throw CLIError.runtime("install-claude-hooks self-test: herdr entry lost across a binary-path update")
+        }
+
+        // 4. --uninstall removes only the c100 entries; herdr's remain.
+        let uninstallResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryB, dryRun: false, uninstall: true)
+        guard uninstallResults.count == 1, uninstallResults[0].status == .uninstalled else {
+            throw CLIError.runtime("install-claude-hooks self-test: uninstall was not reported as .uninstalled")
+        }
+        settings = try readSettings()
+        let hooksAfterUninstall = settings["hooks"] as? [String: Any] ?? [:]
+        for event in ClaudeHooksInstaller.eventOrder where event != "SessionStart" && event != "PreToolUse" {
+            guard hooksAfterUninstall[event] == nil else {
+                throw CLIError.runtime("install-claude-hooks self-test: event \(event) should have been removed entirely by uninstall")
+            }
+        }
+        guard hookCommands(settings, event: "SessionStart") == ["/opt/herdr/hooks/herdr-agent-state.sh session-start"],
+              hookCommands(settings, event: "PreToolUse") == ["/opt/herdr/hooks/herdr-agent-state.sh pre-tool"] else {
+            throw CLIError.runtime("install-claude-hooks self-test: herdr entries were not left intact by uninstall")
+        }
+        let reuninstallResults = ClaudeHooksInstaller.run(configDirs: [profileDir.path], binaryPath: binaryB, dryRun: false, uninstall: true)
+        guard reuninstallResults.count == 1, reuninstallResults[0].status == .unchanged else {
+            throw CLIError.runtime("install-claude-hooks self-test: re-uninstall was not a no-op")
+        }
+
+        // 5. --dry-run reports the change but never touches disk.
+        let dryRunProfileDir = root.appendingPathComponent("dry-run-profile")
+        try FileManager.default.createDirectory(at: dryRunProfileDir, withIntermediateDirectories: true)
+        let dryRunSettingsPath = dryRunProfileDir.appendingPathComponent("settings.json").path
+        try Data(#"{"hooks":{}}"#.utf8).write(to: URL(fileURLWithPath: dryRunSettingsPath))
+        let beforeDryRun = try Data(contentsOf: URL(fileURLWithPath: dryRunSettingsPath))
+        let dryRunResults = ClaudeHooksInstaller.run(configDirs: [dryRunProfileDir.path], binaryPath: binaryA, dryRun: true, uninstall: false)
+        let afterDryRun = try Data(contentsOf: URL(fileURLWithPath: dryRunSettingsPath))
+        guard dryRunResults.count == 1, dryRunResults[0].status == .installed, beforeDryRun == afterDryRun else {
+            throw CLIError.runtime("install-claude-hooks self-test: --dry-run reported wrong status or modified the file")
+        }
+
+        // 6. A missing settings.json is skipped, not created.
+        let missingProfileDir = root.appendingPathComponent("missing-profile")
+        try FileManager.default.createDirectory(at: missingProfileDir, withIntermediateDirectories: true)
+        let missingResults = ClaudeHooksInstaller.run(configDirs: [missingProfileDir.path], binaryPath: binaryA, dryRun: false, uninstall: false)
+        guard missingResults.count == 1, missingResults[0].status == .skipped else {
+            throw CLIError.runtime("install-claude-hooks self-test: a config dir with no settings.json should be .skipped")
+        }
+
+        // 7. A malformed settings.json is left byte-for-byte untouched and reported as .error.
+        let brokenProfileDir = root.appendingPathComponent("broken-profile")
+        try FileManager.default.createDirectory(at: brokenProfileDir, withIntermediateDirectories: true)
+        let brokenSettingsPath = brokenProfileDir.appendingPathComponent("settings.json").path
+        let brokenContents = Data("{ not valid json".utf8)
+        try brokenContents.write(to: URL(fileURLWithPath: brokenSettingsPath))
+        let brokenResults = ClaudeHooksInstaller.run(configDirs: [brokenProfileDir.path], binaryPath: binaryA, dryRun: false, uninstall: false)
+        let brokenAfter = try Data(contentsOf: URL(fileURLWithPath: brokenSettingsPath))
+        guard brokenResults.count == 1, brokenResults[0].status == .error, brokenAfter == brokenContents else {
+            throw CLIError.runtime("install-claude-hooks self-test: malformed settings.json should be left untouched and reported as .error")
+        }
     }
 
     private static func writeDiagnostic(_ message: String) {
@@ -1634,8 +1823,10 @@ enum C100StatusCLI {
           c100-status watch-input [SECONDS] [--location 0x110000]
           c100-status watch-matrix [SECONDS] [--location 0x110000]
           c100-status apply <status> [--location 0x110000] [--dry-run]
+          c100-status install-claude-hooks [--config-dir PATH]... [--binary PATH] [--dry-run] [--uninstall]
           c100-status self-test
 
+        `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (default config dirs: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise, plus any other ~/.claude-config/* subdirectory), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
         `--claude-config-dirs` adds extra Claude profile directories (scanned for sessions/<pid>.json) on top of the defaults: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise.
