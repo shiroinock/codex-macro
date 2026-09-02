@@ -17,6 +17,10 @@ final class StatusDaemon {
     private var connection: C100Connection?
     private var grabberLease: GrabberLeaseClient?
     private var nextGrabberHeartbeat = Date.distantFuture
+    /// Set on the first failed heartbeat since the last success; cleared on
+    /// recovery. Used to bound how long we tolerate a flaky grabber link
+    /// before giving up and letting `run()` exit (KeepAlive restarts us).
+    private var grabberHeartbeatFailureSince: Date?
     private var protocolVersion = 0
     private var pressedKeyIndexes: Set<Int> = []
     private var nextCatalogSync = Date.distantPast
@@ -919,14 +923,70 @@ final class StatusDaemon {
         }
     }
 
+    /// Retry interval after a single failed heartbeat: fast enough that a
+    /// transient socket hiccup (e.g. the 500ms `SocketTransport` read
+    /// timeout) is retried well within the helper's lease window.
+    private static let grabberHeartbeatRetryInterval: TimeInterval = 0.25
+    /// If heartbeats keep failing for longer than this, proactively try a
+    /// fresh `acquire()` rather than keep heartbeating a lease the helper
+    /// may already consider expired (helper `leaseDuration` is 3s -- see
+    /// GrabberService.swift:66).
+    private static let grabberReacquireGraceInterval: TimeInterval = 2.5
+    /// Total time we tolerate a lost/unreachable grabber before giving up
+    /// and throwing (which exits the daemon; launchd KeepAlive restarts it).
+    private static let grabberFailureTimeout: TimeInterval = 10
+
     private func renewGrabberLease() throws {
         guard let grabberLease else { return }
         do {
             try grabberLease.heartbeat()
             nextGrabberHeartbeat = Date().addingTimeInterval(1)
+            if let failureSince = grabberHeartbeatFailureSince {
+                logger.log(
+                    .info,
+                    "privileged grabber lease recovered downtime_ms="
+                        + "\(Int(Date().timeIntervalSince(failureSince) * 1_000))"
+                )
+                grabberHeartbeatFailureSince = nil
+            }
         } catch {
-            logger.log(.error, "privileged grabber lease lost error=\(error)")
-            throw error
+            let now = Date()
+            let failureSince = grabberHeartbeatFailureSince ?? now
+            grabberHeartbeatFailureSince = failureSince
+            let failureDurationMs = Int(now.timeIntervalSince(failureSince) * 1_000)
+            logger.log(.warning, "privileged grabber heartbeat failed duration_ms=\(failureDurationMs) error=\(error)")
+
+            let leaseLost: Bool
+            if case GrabberLeaseError.leaseLost = error {
+                leaseLost = true
+            } else {
+                leaseLost = false
+            }
+            if leaseLost || now.timeIntervalSince(failureSince) >= Self.grabberReacquireGraceInterval {
+                do {
+                    try grabberLease.acquire()
+                    nextGrabberHeartbeat = Date().addingTimeInterval(1)
+                    logger.log(
+                        .info,
+                        "privileged grabber lease recovered via reacquire downtime_ms="
+                            + "\(Int(Date().timeIntervalSince(failureSince) * 1_000))"
+                    )
+                    grabberHeartbeatFailureSince = nil
+                    return
+                } catch let reacquireError {
+                    logger.log(
+                        .warning,
+                        "privileged grabber lease reacquire failed duration_ms="
+                            + "\(Int(Date().timeIntervalSince(failureSince) * 1_000)) error=\(reacquireError)"
+                    )
+                }
+            }
+
+            if now.timeIntervalSince(failureSince) >= Self.grabberFailureTimeout {
+                logger.log(.error, "privileged grabber lease lost error=\(error)")
+                throw error
+            }
+            nextGrabberHeartbeat = Date().addingTimeInterval(Self.grabberHeartbeatRetryInterval)
         }
     }
 

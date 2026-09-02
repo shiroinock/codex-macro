@@ -24,6 +24,20 @@ struct GrabberResponse: Codable {
     let capturing: Bool
 }
 
+/// Distinguishes "the helper told us our lease is gone" (worth reacquiring
+/// immediately) from transport-level failures like a socket timeout (worth a
+/// quick retry first, since the helper may still hold the lease).
+enum GrabberLeaseError: Error, CustomStringConvertible {
+    case leaseLost(String)
+
+    var description: String {
+        switch self {
+        case .leaseLost(let message):
+            return "Privileged C100 grabber lease was lost: \(message)"
+        }
+    }
+}
+
 final class GrabberLeaseClient {
     private let socketPath: String
     private let locationID: Int
@@ -43,7 +57,7 @@ final class GrabberLeaseClient {
     func heartbeat() throws {
         let response = try send(.heartbeat)
         guard response.ok, response.capturing else {
-            throw CLIError.runtime("Privileged C100 grabber lease was lost: \(response.message)")
+            throw GrabberLeaseError.leaseLost(response.message)
         }
     }
 
