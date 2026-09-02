@@ -32,14 +32,16 @@ struct UnifiedLayoutResult: Equatable {
 /// (0..<10) rather than mere sort priorities: a group/session with an
 /// explicit rank claims that exact row/column, and only sessions without a
 /// usable rank (nil, out of range, or colliding with an already-claimed
-/// slot) get packed into the remaining free slots by recency. This matters
-/// for Codex parity: `CodexCatalog.layout()` reserves row numbers for
-/// sidebar projects that currently have zero active sessions (so the
-/// physical row a project occupies stays stable as sessions come and go).
-/// `CodexSourceProvider` hands over the exact resolved row/column indices
-/// `CodexCatalog.layout()` already computed, so replaying them here as
-/// literal slots reproduces byte-for-byte the same placements the pre-M0
-/// `Daemon.syncCatalog()` produced.
+/// slot) get packed into the remaining free slots by recency. Both sources
+/// rely on this to reserve a stable row for something with zero active
+/// sessions: `CodexCatalog.layout()` reserves row numbers for sidebar
+/// projects that currently have no sessions, and `HerdrCatalog.rowRank`
+/// reserves `number - 1` for a herdr workspace the same way, so a workspace
+/// with no Claude session yet still holds its row rather than letting later
+/// workspaces shift up to fill the gap. `CodexSourceProvider` hands over the
+/// exact resolved row/column indices `CodexCatalog.layout()` already
+/// computed, so replaying them here as literal slots reproduces byte-for-byte
+/// the same placements the pre-M0 `Daemon.syncCatalog()` produced.
 enum UnifiedLayout {
     static let maxRows = 10
     static let maxColumns = 10

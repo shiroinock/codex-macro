@@ -256,19 +256,20 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         }
     }
 
-    /// Negative-encoded absolute row rank: `UnifiedLayout.assignSlots`
-    /// treats an explicit rank as a literal slot only when it falls in
-    /// `0..<capacity`; a negative value can therefore never collide with (or
-    /// steal) one of Codex's already-resolved absolute row slots (which are
-    /// always `>= 0`). It still participates in the slot-assignment sort
-    /// ahead of every unranked (`nil`) row, and ahead of any other explicit
-    /// non-negative rank, so herdr rows are packed into the lowest *free*
-    /// rows first, in ascending workspace-`number` order -- realizing row
-    /// ordering rule (1) from the design ("herdr rows first, by workspace
-    /// number") without requiring changes to `UnifiedLayout`'s core
-    /// absolute-slot algorithm or touching the Codex-only golden test.
+    /// Absolute row slot for a herdr workspace: herdr's `workspace list`
+    /// `number` is the UI's own 1..N display position (renumbered on
+    /// reorder), so `number - 1` is exactly the 0-based row a user sees that
+    /// workspace occupy in the terminal. Returning it as a literal slot (see
+    /// `UnifiedLayout.assignSlots`'s `0..<capacity` in-range check) means a
+    /// workspace's row is reserved the moment it exists, even before it has
+    /// any Claude session -- mirroring `CodexCatalog.orderedLayout`, which
+    /// reserves sidebar-project rows the same way. A workspace whose number
+    /// falls outside `0..<capacity` (more workspaces than grid rows) simply
+    /// has no in-range claim, so `assignSlots` falls back to packing it into
+    /// whatever free row remains -- the same fallback Codex relies on via
+    /// `namedRowLimit`.
     static func rowRank(forWorkspaceNumber number: Int) -> Int {
-        -1_000_000 + number
+        number - 1
     }
 
     static func seedStatus(forHerdrStatus agentStatus: String) -> AgentStatus {

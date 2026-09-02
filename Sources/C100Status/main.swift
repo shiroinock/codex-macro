@@ -812,13 +812,14 @@ enum C100StatusCLI {
             throw CLIError.runtime("herdr snapshot 15s stale-grace self-test failed")
         }
 
-        // UnifiedLayout row ordering with herdr's negative-encoded rowRank:
-        // two herdr workspaces (numbers 3 and 1) must land ordered by
-        // ascending workspace number (workspace 1 before workspace 3), both
-        // ahead of an unranked Codex row, while an explicitly-ranked Codex
-        // row (absolute slot 0, exactly as CodexSourceProvider emits) keeps
-        // its literal slot untouched -- herdr rows pack into the remaining
-        // free rows rather than colliding with it.
+        // UnifiedLayout row ordering with herdr's absolute-slot rowRank
+        // (`number - 1`, mirroring Codex's own absolute row slots): a herdr
+        // workspace's row is the same 0-based row the herdr UI shows for it
+        // (number=1 -> row 0, number=3 -> row 2), an explicitly-ranked Codex
+        // row (a real absolute slot, exactly as CodexSourceProvider emits)
+        // keeps its own literal slot untouched, and an unranked Codex row
+        // packs into whatever slot remains free rather than colliding with
+        // either.
         let herdrOrderingSessions = [
             AgentSession(
                 sourceKind: .codex,
@@ -826,7 +827,7 @@ enum C100StatusCLI {
                 cwd: "/repo/reserved",
                 rowHints: RowGroupingHints(codexProjectID: "reserved-project", herdrWorkspaceID: nil),
                 recency: 1,
-                rowRank: 0,
+                rowRank: 5,
                 columnRank: 0,
                 seedStatus: nil,
                 navigation: .codexThread(sessionID: "codex-reserved")
@@ -866,15 +867,16 @@ enum C100StatusCLI {
             ),
         ]
         let herdrOrderingLayout = UnifiedLayout.compute(sessions: herdrOrderingSessions)
-        guard herdrOrderingLayout.projectRows["reserved-project"] == 0,
+        guard herdrOrderingLayout.projectRows["reserved-project"] == 5,
               herdrOrderingLayout.warnings.isEmpty,
               let herdrWS1Row = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "herdr-ws1" })?.row,
               let herdrWS3Row = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "herdr-ws3" })?.row,
               let codexUnrankedRow = herdrOrderingLayout.placements.first(where: { $0.session.sessionID == "codex-unranked" })?.row,
-              herdrWS1Row != 0, herdrWS3Row != 0,
-              herdrWS1Row < herdrWS3Row,
-              herdrWS3Row < codexUnrankedRow else {
-            throw CLIError.runtime("herdr row-ordering (workspace number ascending, ahead of unranked Codex rows) self-test failed")
+              herdrWS1Row == 0, herdrWS3Row == 2,
+              codexUnrankedRow != herdrWS1Row,
+              codexUnrankedRow != herdrWS3Row,
+              codexUnrankedRow != 5 else {
+            throw CLIError.runtime("herdr row-ordering (absolute slot = workspace number - 1) self-test failed")
         }
 
         // HerdrHookMissRecovery: the pure decision behind (b) of
@@ -1523,10 +1525,12 @@ enum C100StatusCLI {
 
         // Root-cause regression: a merged row group must not lose its real,
         // in-range row claim just because another session sharing its cwd
-        // contributes an out-of-range "ordering hint" rank (herdr's
-        // negative-encoded rowRank). Taking a plain min() across the whole
-        // group used to let the hint clobber the real claim, demoting the
-        // row to "unranked" and making it bounce around the pending pack.
+        // contributes an out-of-range "ordering hint" rank (e.g. a herdr
+        // workspace numbered beyond the grid's row capacity, which
+        // `HerdrCatalog.rowRank` still returns verbatim as `number - 1`).
+        // Taking a plain min() across the whole group used to let the hint
+        // clobber the real claim, demoting the row to "unranked" and making
+        // it bounce around the pending pack.
         let rowMergeSessions = [
             AgentSession(
                 sourceKind: .codex,
@@ -1545,7 +1549,7 @@ enum C100StatusCLI {
                 cwd: "/repo/shared-row",
                 rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wY"),
                 recency: 1,
-                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 9),
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 99),
                 columnRank: 0,
                 seedStatus: .idle,
                 navigation: .herdrPane(paneID: "wY:p1")
@@ -1677,10 +1681,9 @@ enum C100StatusCLI {
         }
         // A session with a real, in-range explicit row claim (Codex's
         // absolute row, resolved by `CodexCatalog.layout()` and handed to
-        // `UnifiedLayout` as a literal slot -- unlike herdr's row "rank",
-        // which is a deliberately out-of-range *ordering hint* and is
-        // therefore free to move under a repack same as any unranked row)
-        // must keep that exact row even under a repack.
+        // `UnifiedLayout` as a literal slot -- herdr's `number - 1` row rank
+        // is the same kind of literal, in-range claim) must keep that exact
+        // row even under a repack.
         let rankedSession = AgentSession(
             sourceKind: .codex,
             sessionID: "ranked",
