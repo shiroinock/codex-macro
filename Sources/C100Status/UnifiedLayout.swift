@@ -21,9 +21,20 @@ struct UnifiedLayoutResult: Equatable {
 }
 
 /// Computes the source-agnostic 10x10 grid placement described in the
-/// implementation plan: rows are keyed by normalized cwd, merged via
-/// union-find whenever sessions share a row-grouping hint (Codex project id,
-/// herdr workspace id, ...); columns are ordered within each row.
+/// implementation plan: rows are keyed by a per-session grouping node (see
+/// `groupingNode(for:)`) merged via union-find whenever sessions share a
+/// row-grouping hint. Sessions carrying a `codexProjectID`, and sessions
+/// with no row-grouping hint at all, are keyed by their (normalized) cwd, so
+/// they union across cwd whenever they share that project id -- e.g. the
+/// worktree case, where a Codex session and its worktree sibling have
+/// different cwds but the same project id. Sessions carrying a
+/// `herdrWorkspaceID` are instead keyed by that workspace id alone and never
+/// join a cwd-based union: two herdr panes from the *same* workspace still
+/// land on one row (because they share that workspace-id node) even when
+/// their cwds differ, but two panes from *different* workspaces that happen
+/// to share a cwd (e.g. both point at the same git worktree path) no longer
+/// collapse onto the same row -- each herdr workspace keeps its own,
+/// independent row. Columns are ordered within each row.
 ///
 /// This is a pure function: given the same `sessions`, it always produces
 /// the same result.
@@ -78,29 +89,28 @@ enum UnifiedLayout {
 
         var unionFind = UnionFind()
         for session in sessions {
-            unionFind.addNode(session.cwd)
+            unionFind.addNode(groupingNode(for: session))
         }
-        var cwdsByCodexProject: [String: [String]] = [:]
-        var cwdsByHerdrWorkspace: [String: [String]] = [:]
+        var nodesByCodexProject: [String: [String]] = [:]
         for session in sessions {
             if let projectID = session.rowHints.codexProjectID {
-                cwdsByCodexProject[projectID, default: []].append(session.cwd)
-            }
-            if let workspaceID = session.rowHints.herdrWorkspaceID {
-                cwdsByHerdrWorkspace[workspaceID, default: []].append(session.cwd)
+                nodesByCodexProject[projectID, default: []].append(groupingNode(for: session))
             }
         }
-        for group in cwdsByCodexProject.values { unionFind.unionAll(group) }
-        for group in cwdsByHerdrWorkspace.values { unionFind.unionAll(group) }
+        for group in nodesByCodexProject.values { unionFind.unionAll(group) }
 
-        var groupIDByCWD: [String: String] = [:]
-        for session in sessions where groupIDByCWD[session.cwd] == nil {
-            groupIDByCWD[session.cwd] = unionFind.find(session.cwd)
+        var groupIDByNode: [String: String] = [:]
+        for session in sessions {
+            let node = groupingNode(for: session)
+            if groupIDByNode[node] == nil {
+                groupIDByNode[node] = unionFind.find(node)
+            }
         }
 
         var sessionsByGroup: [String: [AgentSession]] = [:]
         for session in sessions {
-            let groupID = groupIDByCWD[session.cwd] ?? session.cwd
+            let node = groupingNode(for: session)
+            let groupID = groupIDByNode[node] ?? node
             sessionsByGroup[groupID, default: []].append(session)
         }
 
@@ -298,6 +308,22 @@ enum UnifiedLayout {
         let counts = Dictionary(grouping: values, by: { $0 }).mapValues(\.count)
         let maxCount = counts.values.max() ?? 0
         return counts.filter { $0.value == maxCount }.keys.min()
+    }
+
+    /// The union-find node a session merges its row through. A session with
+    /// a `herdrWorkspaceID` is keyed by that workspace id alone, so it only
+    /// ever merges with other sessions from the *same* herdr workspace and
+    /// never merges purely because it happens to share a cwd with something
+    /// else (another herdr workspace, a Codex session, ...) -- see the
+    /// doc comment on `compute(sessions:previousPlacements:maxRows:)` for
+    /// why. Everything else (Codex sessions, hint-less sessions) is keyed by
+    /// its cwd as before, so `codexProjectID` union across differing cwds
+    /// (the worktree case) still works.
+    private static func groupingNode(for session: AgentSession) -> String {
+        if let workspaceID = session.rowHints.herdrWorkspaceID {
+            return "herdr:\(workspaceID)"
+        }
+        return session.cwd
     }
 
     private static func rowLabel(for sessions: [AgentSession]) -> String {

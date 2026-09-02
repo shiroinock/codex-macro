@@ -1570,8 +1570,9 @@ enum C100StatusCLI {
         }
 
         // Anti-flicker regression #1: reproduces the shiro-task-vault
-        // incident's column conflict -- a Codex thread and a herdr-tracked
-        // Claude pane share one cwd (merged onto the same row) and both
+        // incident's column conflict -- two herdr panes from the *same*
+        // workspace (merged onto one row via their shared workspace-id
+        // union-find node, not via cwd -- see `groupingNode(for:)`) both
         // claim absolute column 0. herdr's recency is always "now" (always
         // climbing every 2s poll), so if the conflict's winner were decided
         // by recency, it would keep "winning harder" each sync without ever
@@ -1581,54 +1582,54 @@ enum C100StatusCLI {
         // in this one case. Two calls with wildly different (and reversed)
         // recency values, with no previous-placement info at all, must
         // still agree byte-for-byte on who gets column 0.
-        func flickerColumnSessions(codexRecency: Double, herdrRecency: Double) -> [AgentSession] {
+        func flickerColumnSessions(firstRecency: Double, secondRecency: Double) -> [AgentSession] {
             [
                 AgentSession(
-                    sourceKind: .codex,
-                    sessionID: "codex-thread",
-                    cwd: "/repo/shared",
-                    rowHints: RowGroupingHints(codexProjectID: "shared-proj", herdrWorkspaceID: nil),
-                    recency: codexRecency,
-                    rowRank: 2,
+                    sourceKind: .claudeHerdr,
+                    sessionID: "herdr-pane-a",
+                    cwd: "/repo/shared/a",
+                    rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wX"),
+                    recency: firstRecency,
+                    rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
                     columnRank: 0,
-                    seedStatus: nil,
-                    navigation: .codexThread(sessionID: "codex-thread")
+                    seedStatus: .idle,
+                    navigation: .herdrPane(paneID: "wX:p0")
                 ),
                 AgentSession(
                     sourceKind: .claudeHerdr,
-                    sessionID: "herdr-pane",
-                    cwd: "/repo/shared",
+                    sessionID: "herdr-pane-b",
+                    cwd: "/repo/shared/b",
                     rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wX"),
-                    recency: herdrRecency,
-                    rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 5),
+                    recency: secondRecency,
+                    rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
                     columnRank: 0,
                     seedStatus: .idle,
                     navigation: .herdrPane(paneID: "wX:p1")
                 ),
             ]
         }
-        let flickerLow = UnifiedLayout.compute(sessions: flickerColumnSessions(codexRecency: 1_000, herdrRecency: 2_000))
-        let flickerHigh = UnifiedLayout.compute(sessions: flickerColumnSessions(codexRecency: 5, herdrRecency: 999_999))
+        let flickerLow = UnifiedLayout.compute(sessions: flickerColumnSessions(firstRecency: 1_000, secondRecency: 2_000))
+        let flickerHigh = UnifiedLayout.compute(sessions: flickerColumnSessions(firstRecency: 5, secondRecency: 999_999))
         func columnsBySessionID(_ result: UnifiedLayoutResult) -> [String: Int] {
             Dictionary(uniqueKeysWithValues: result.placements.map { ($0.session.sessionID, $0.column) })
         }
         guard !flickerLow.warnings.isEmpty,
-              flickerLow.projectRows["shared-proj"] == 2,
+              flickerLow.projectRows["wX"] == 2,
               columnsBySessionID(flickerLow) == columnsBySessionID(flickerHigh) else {
             throw CLIError.runtime("UnifiedLayout column-conflict recency-invariance self-test failed")
         }
 
         // Anti-flicker regression #2: sticky reclaim. Once a session has
-        // lost a column conflict and settled into a fallback slot, a *new*,
-        // unrelated session joining the same row (e.g. a Claude Desktop/
-        // terminal session freshly seen at the same cwd, which happens
-        // continuously as those sources rescan) must not bump it to a
-        // different column just because the newcomer sorts earlier in the
-        // no-explicit-rank fill order -- it should keep the slot it already
-        // held, and the newcomer takes what's left.
-        let stickyBase = flickerColumnSessions(codexRecency: 1_000, herdrRecency: 2_000)
+        // lost a column conflict and settled into a fallback slot, a *new*
+        // session joining the same row (e.g. a third pane freshly seen in
+        // the same herdr workspace, which happens continuously as that
+        // source rescans) must not bump it to a different column just
+        // because the newcomer sorts earlier in the no-explicit-rank fill
+        // order -- it should keep the slot it already held, and the
+        // newcomer takes what's left.
+        let stickyBase = flickerColumnSessions(firstRecency: 1_000, secondRecency: 2_000)
         let stickyFirst = UnifiedLayout.compute(sessions: stickyBase)
-        guard let herdrColumn = stickyFirst.placements.first(where: { $0.session.sessionID == "herdr-pane" })?.column,
+        guard let herdrColumn = stickyFirst.placements.first(where: { $0.session.sessionID == "herdr-pane-b" })?.column,
               herdrColumn != 0 else {
             throw CLIError.runtime("UnifiedLayout sticky-reclaim baseline self-test failed")
         }
@@ -1636,33 +1637,32 @@ enum C100StatusCLI {
             ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
         })
         let newcomer = AgentSession(
-            sourceKind: .claudeTerminal,
+            sourceKind: .claudeHerdr,
             sessionID: "newcomer",
-            cwd: "/repo/shared",
-            rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: nil),
+            cwd: "/repo/shared/c",
+            rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wX"),
             recency: 999_999, // sorts ahead of everyone in no-rank fill order
-            rowRank: nil,
+            rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
             columnRank: nil,
-            seedStatus: nil,
-            navigation: .claudeDesktop
+            seedStatus: .idle,
+            navigation: .herdrPane(paneID: "wX:p2")
         )
         let stickyNext = UnifiedLayout.compute(
             sessions: stickyBase + [newcomer],
             previousPlacements: stickyPrevious
         )
-        guard stickyNext.placements.first(where: { $0.session.sessionID == "herdr-pane" })?.column == herdrColumn,
+        guard stickyNext.placements.first(where: { $0.session.sessionID == "herdr-pane-b" })?.column == herdrColumn,
               stickyNext.placements.first(where: { $0.session.sessionID == "newcomer" })?.column != herdrColumn else {
             throw CLIError.runtime("UnifiedLayout sticky-reclaim-under-churn self-test failed")
         }
 
         // Root-cause regression: a merged row group must not lose its real,
-        // in-range row claim just because another session sharing its cwd
-        // contributes an out-of-range "ordering hint" rank (e.g. a herdr
-        // workspace numbered beyond the grid's row capacity, which
-        // `HerdrCatalog.rowRank` still returns verbatim as `number - 1`).
-        // Taking a plain min() across the whole group used to let the hint
-        // clobber the real claim, demoting the row to "unranked" and making
-        // it bounce around the pending pack.
+        // in-range row claim just because another session merged into the
+        // same group (via a shared codexProjectID -- the worktree case)
+        // contributes an out-of-range "ordering hint" rank. Taking a plain
+        // min() across the whole group used to let the hint clobber the
+        // real claim, demoting the row to "unranked" and making it bounce
+        // around the pending pack.
         let rowMergeSessions = [
             AgentSession(
                 sourceKind: .codex,
@@ -1676,20 +1676,75 @@ enum C100StatusCLI {
                 navigation: .codexThread(sessionID: "codex-in-shared-row")
             ),
             AgentSession(
-                sourceKind: .claudeHerdr,
-                sessionID: "herdr-in-shared-row",
-                cwd: "/repo/shared-row",
-                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wY"),
+                sourceKind: .codex,
+                sessionID: "codex-worktree-in-shared-row",
+                cwd: "/repo/shared-row-worktree",
+                rowHints: RowGroupingHints(codexProjectID: "shared-row-proj", herdrWorkspaceID: nil),
                 recency: 1,
-                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 99),
-                columnRank: 0,
-                seedStatus: .idle,
-                navigation: .herdrPane(paneID: "wY:p1")
+                rowRank: 99, // out-of-range ordering hint, must not clobber the rank-2 claim above
+                columnRank: 1,
+                seedStatus: nil,
+                navigation: .codexThread(sessionID: "codex-worktree-in-shared-row")
             ),
         ]
         let rowMergeLayout = UnifiedLayout.compute(sessions: rowMergeSessions)
         guard rowMergeLayout.projectRows["shared-row-proj"] == 2 else {
             throw CLIError.runtime("UnifiedLayout row-rank-merge (real claim over out-of-range hint) self-test failed")
+        }
+
+        // Cross-workspace cwd-collision regression: two *different* herdr
+        // workspaces (wA, number 3; wD, number 5) that each happen to have a
+        // pane checked out at the exact same cwd (e.g. both worktree'd into
+        // the same path at different times) must NOT merge onto one row --
+        // each herdr workspace keeps its own independent row (`number - 1`),
+        // because the union-find node for a herdr session is keyed by its
+        // workspace id (`groupingNode(for:)`), never by cwd. Meanwhile two
+        // panes within the *same* workspace but with different cwds must
+        // still land on that workspace's single row, as before.
+        let crossWorkspaceCollisionSessions = [
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "wA:p3",
+                cwd: "/Users/kota-inaba/git/freee-payroll/.claude/worktrees/parking-payroll-formal",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wA"),
+                recency: 2,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
+                columnRank: 0,
+                seedStatus: .idle,
+                navigation: .herdrPane(paneID: "wA:p3")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "wA:p0",
+                cwd: "/Users/kota-inaba/git/freee-payroll",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wA"),
+                recency: 1,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 3),
+                columnRank: 1,
+                seedStatus: .idle,
+                navigation: .herdrPane(paneID: "wA:p0")
+            ),
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: "wD:p1",
+                cwd: "/Users/kota-inaba/git/freee-payroll/.claude/worktrees/parking-payroll-formal",
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: "wD"),
+                recency: 3,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: 5),
+                columnRank: 0,
+                seedStatus: .idle,
+                navigation: .herdrPane(paneID: "wD:p1")
+            ),
+        ]
+        let crossWorkspaceCollisionLayout = UnifiedLayout.compute(sessions: crossWorkspaceCollisionSessions)
+        guard crossWorkspaceCollisionLayout.projectRows["wA"] == 2,
+              crossWorkspaceCollisionLayout.projectRows["wD"] == 4,
+              crossWorkspaceCollisionLayout.placements.filter({ $0.row == 2 }).map(\.session.sessionID).sorted()
+                  == ["wA:p0", "wA:p3"],
+              crossWorkspaceCollisionLayout.placements.filter({ $0.row == 4 }).map(\.session.sessionID)
+                  == ["wD:p1"],
+              crossWorkspaceCollisionLayout.warnings.isEmpty else {
+            throw CLIError.runtime("UnifiedLayout cross-workspace cwd-collision self-test failed")
         }
 
         let forkSessionMeta = Data(#"{"type":"session_meta","payload":{"id":"fork","forked_from_id":"subagent"}}"#.utf8)
