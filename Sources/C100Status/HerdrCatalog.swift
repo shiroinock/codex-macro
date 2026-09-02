@@ -108,24 +108,30 @@ enum HerdrProcessRunner {
 
 // MARK: - Wire types
 
-struct HerdrAgentListResponse: Decodable {
+/// `pane list` response. Superset of `agent list` (adds `tab_id`, which
+/// `agent list` doesn't expose), so `HerdrCatalog.fetchOnce` uses this in
+/// place of `agent list` to get the pane->tab mapping needed for column
+/// ordering without an extra process call.
+struct HerdrPaneListResponse: Decodable {
     struct ResultPayload: Decodable {
-        let agents: [HerdrAgentEntry]
+        let panes: [HerdrPaneEntry]
     }
 
     let result: ResultPayload
 }
 
-struct HerdrAgentEntry: Decodable {
+struct HerdrPaneEntry: Decodable {
     struct Session: Decodable {
         let value: String
     }
 
-    let agent: String
-    let agentSession: Session
-    let agentStatus: String
+    /// `nil` for a plain shell pane with no recognized agent.
+    let agent: String?
+    let agentSession: Session?
+    let agentStatus: String?
     let cwd: String?
     let paneID: String
+    let tabID: String
     let workspaceID: String
 
     enum CodingKeys: String, CodingKey {
@@ -134,8 +140,69 @@ struct HerdrAgentEntry: Decodable {
         case agentStatus = "agent_status"
         case cwd
         case paneID = "pane_id"
+        case tabID = "tab_id"
         case workspaceID = "workspace_id"
     }
+}
+
+/// `tab list` response: gives each tab's on-screen display `number` (the
+/// basis for column ordering across tabs) and `pane_count` (used to decide
+/// whether a `pane layout` call is worth making for that tab).
+struct HerdrTabListResponse: Decodable {
+    struct ResultPayload: Decodable {
+        let tabs: [HerdrTabEntry]
+    }
+
+    let result: ResultPayload
+}
+
+struct HerdrTabEntry: Decodable {
+    let tabID: String
+    let number: Int
+    let workspaceID: String
+    let paneCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case number
+        case workspaceID = "workspace_id"
+        case paneCount = "pane_count"
+    }
+}
+
+/// `pane layout --pane <id>` response: rects for every pane in that pane's
+/// tab (so one call per multi-pane tab is enough to place all its panes).
+struct HerdrPaneLayoutResponse: Decodable {
+    struct ResultPayload: Decodable {
+        let layout: Layout
+    }
+
+    struct Layout: Decodable {
+        let tabID: String
+        let panes: [LayoutPane]
+
+        enum CodingKeys: String, CodingKey {
+            case tabID = "tab_id"
+            case panes
+        }
+    }
+
+    struct LayoutPane: Decodable {
+        let paneID: String
+        let rect: Rect
+
+        enum CodingKeys: String, CodingKey {
+            case paneID = "pane_id"
+            case rect
+        }
+    }
+
+    struct Rect: Decodable {
+        let x: Int
+        let y: Int
+    }
+
+    let result: ResultPayload
 }
 
 struct HerdrWorkspaceListResponse: Decodable {
@@ -186,9 +253,10 @@ final class HerdrSnapshotStore: @unchecked Sendable {
     }
 }
 
-/// herdr-backed `SessionSourceProvider` (M2): polls `herdr agent list` /
-/// `herdr workspace list` on a dedicated background thread every 2 seconds
-/// and exposes the result via a lock-protected snapshot so `snapshot()` --
+/// herdr-backed `SessionSourceProvider` (M2): polls `herdr pane list` /
+/// `herdr workspace list` / `herdr tab list` (plus `herdr pane layout` for
+/// any multi-pane tab) on a dedicated background thread every 2 seconds and
+/// exposes the result via a lock-protected snapshot so `snapshot()` --
 /// called from the daemon's main loop -- never blocks on a process spawn.
 final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     let kind: SessionSourceKind = .claudeHerdr
@@ -200,6 +268,12 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         let workspaceNumber: Int
         let paneID: String
         let paneNumber: Int?
+        /// 0-based ordinal among this workspace's Claude sessions, packed by
+        /// on-screen order (tab number, then pane rect y/x, then pane number
+        /// as a last-resort tiebreak) -- see `columnRanks(for:)`. `nil` only
+        /// if the pane couldn't be placed at all (shouldn't happen in
+        /// practice since `parsePaneNumber` covers the final fallback).
+        let columnRank: Int?
         let seedStatus: AgentStatus
     }
 
@@ -249,7 +323,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
                 rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: entry.workspaceID),
                 recency: recency,
                 rowRank: Self.rowRank(forWorkspaceNumber: entry.workspaceNumber),
-                columnRank: entry.paneNumber.map { $0 - 1 },
+                columnRank: entry.columnRank,
                 seedStatus: entry.seedStatus,
                 navigation: .herdrPane(paneID: entry.paneID)
             )
@@ -291,40 +365,156 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         return Int(paneComponent.dropFirst())
     }
 
-    /// Pure function combining one `agent list` + `workspace list` response
-    /// pair into session entries. Only `agent == "claude"` entries are kept;
-    /// agents whose workspace id has no matching workspace-list entry are
-    /// dropped (can't determine row order for them).
+    /// The subset of a claude pane's fields needed to decide its on-screen
+    /// column order within its workspace. `rectX`/`rectY` are only known for
+    /// panes whose tab's `pane layout` call succeeded (or wasn't needed
+    /// because the tab has a single pane); `tabNumber` is `nil` only if the
+    /// pane's `tab_id` had no matching `tab list` entry.
+    struct PaneOrderingInfo: Equatable {
+        let paneID: String
+        let workspaceID: String
+        let tabNumber: Int?
+        let rectX: Int?
+        let rectY: Int?
+        let paneNumber: Int?
+    }
+
+    /// Sort key implementing the spec order: tab display number ascending,
+    /// then pane rect y ascending (top before bottom), then rect x
+    /// ascending (left before right), then -- for ties or missing data --
+    /// pane number ascending, then pane id as a final deterministic
+    /// tiebreak. Any missing component sorts last within its own tier via
+    /// `Int.max`, so a pane with no layout/tab data still participates
+    /// (falling all the way back to pane-number order) rather than being
+    /// dropped.
+    private static func paneOrderingKey(_ pane: PaneOrderingInfo) -> (Int, Int, Int, Int, String) {
+        (
+            pane.tabNumber ?? Int.max,
+            pane.rectY ?? Int.max,
+            pane.rectX ?? Int.max,
+            pane.paneNumber ?? Int.max,
+            pane.paneID
+        )
+    }
+
+    /// Packs each workspace's claude panes into a dense `0..<n` column
+    /// ordinal, ordered by `paneOrderingKey`. Grouping by `workspaceID`
+    /// before packing is what closes gaps from closed panes (herdr never
+    /// renumbers panes) without letting one workspace's pane count affect
+    /// another's column assignment.
+    static func columnRanks(for panes: [PaneOrderingInfo]) -> [String: Int] {
+        var result: [String: Int] = [:]
+        let grouped = Dictionary(grouping: panes, by: \.workspaceID)
+        for group in grouped.values {
+            let ordered = group.sorted { paneOrderingKey($0) < paneOrderingKey($1) }
+            for (index, pane) in ordered.enumerated() {
+                result[pane.paneID] = index
+            }
+        }
+        return result
+    }
+
+    /// Pure function combining one `pane list` + `workspace list` + `tab
+    /// list` response set (plus whatever `pane layout` rects were
+    /// successfully fetched) into session entries. Only `agent == "claude"`
+    /// panes are kept; panes whose workspace id has no matching
+    /// workspace-list entry are dropped (can't determine row order for
+    /// them). `layoutByPaneID` maps pane id -> rect `(x, y)` and is expected
+    /// to be a partial map: any tab whose `pane layout` call failed or
+    /// wasn't attempted simply has no entries for its panes, which
+    /// `paneOrderingKey` gracefully falls back from.
     static func buildSessionEntries(
-        agents: [HerdrAgentEntry],
-        workspaces: [HerdrWorkspaceEntry]
+        panes: [HerdrPaneEntry],
+        workspaces: [HerdrWorkspaceEntry],
+        tabs: [HerdrTabEntry],
+        layoutByPaneID: [String: (x: Int, y: Int)] = [:]
     ) -> [SessionEntry] {
         let workspaceByID = Dictionary(uniqueKeysWithValues: workspaces.map { ($0.workspaceID, $0) })
-        return agents.compactMap { agent -> SessionEntry? in
-            guard agent.agent == "claude" else { return nil }
-            guard let workspace = workspaceByID[agent.workspaceID] else { return nil }
+        let tabByID = Dictionary(uniqueKeysWithValues: tabs.map { ($0.tabID, $0) })
+        let claudePanes = panes.filter { $0.agent == "claude" }
+
+        let orderingInfos = claudePanes.map { pane in
+            PaneOrderingInfo(
+                paneID: pane.paneID,
+                workspaceID: pane.workspaceID,
+                tabNumber: tabByID[pane.tabID]?.number,
+                rectX: layoutByPaneID[pane.paneID]?.x,
+                rectY: layoutByPaneID[pane.paneID]?.y,
+                paneNumber: parsePaneNumber(pane.paneID)
+            )
+        }
+        let columnRanks = Self.columnRanks(for: orderingInfos)
+
+        return claudePanes.compactMap { pane -> SessionEntry? in
+            guard let session = pane.agentSession else { return nil }
+            guard let workspace = workspaceByID[pane.workspaceID] else { return nil }
             return SessionEntry(
-                sessionID: agent.agentSession.value,
-                cwd: agent.cwd ?? "",
-                workspaceID: agent.workspaceID,
+                sessionID: session.value,
+                cwd: pane.cwd ?? "",
+                workspaceID: pane.workspaceID,
                 workspaceNumber: workspace.number,
-                paneID: agent.paneID,
-                paneNumber: parsePaneNumber(agent.paneID),
-                seedStatus: seedStatus(forHerdrStatus: agent.agentStatus)
+                paneID: pane.paneID,
+                paneNumber: parsePaneNumber(pane.paneID),
+                columnRank: columnRanks[pane.paneID],
+                seedStatus: seedStatus(forHerdrStatus: pane.agentStatus ?? "unknown")
             )
         }
     }
 
-    /// One synchronous `agent list` + `workspace list` round trip. Used both
-    /// by the background refresh loop and by `c100-status catalog` (a
-    /// one-shot CLI display, where spinning up the polling thread would be
-    /// pointless).
-    static func fetchOnce(binary: String, timeout: TimeInterval = 2) throws -> [SessionEntry] {
-        let agentData = try HerdrProcessRunner.run(binary: binary, arguments: ["agent", "list"], timeout: timeout)
+    /// One synchronous `workspace list` + `pane list` + `tab list` round
+    /// trip, plus one `pane layout` call per multi-pane tab that contains a
+    /// claude pane (single-pane tabs need no rect: their order is already
+    /// fully determined by tab number). Used both by the background refresh
+    /// loop and by `c100-status catalog` (a one-shot CLI display, where
+    /// spinning up the polling thread would be pointless).
+    ///
+    /// A `pane layout` failure for one tab is logged and skipped rather than
+    /// failing the whole fetch: `buildSessionEntries` falls back to pane-
+    /// number order for just that tab's panes via the `Int.max` fallback in
+    /// `paneOrderingKey`.
+    static func fetchOnce(
+        binary: String,
+        timeout: TimeInterval = 2,
+        log: (StatusLogger.Level, String) -> Void = { _, _ in }
+    ) throws -> [SessionEntry] {
         let workspaceData = try HerdrProcessRunner.run(binary: binary, arguments: ["workspace", "list"], timeout: timeout)
-        let agents = try JSONDecoder().decode(HerdrAgentListResponse.self, from: agentData).result.agents
+        let paneData = try HerdrProcessRunner.run(binary: binary, arguments: ["pane", "list"], timeout: timeout)
+        let tabData = try HerdrProcessRunner.run(binary: binary, arguments: ["tab", "list"], timeout: timeout)
         let workspaces = try JSONDecoder().decode(HerdrWorkspaceListResponse.self, from: workspaceData).result.workspaces
-        return buildSessionEntries(agents: agents, workspaces: workspaces)
+        let panes = try JSONDecoder().decode(HerdrPaneListResponse.self, from: paneData).result.panes
+        let tabs = try JSONDecoder().decode(HerdrTabListResponse.self, from: tabData).result.tabs
+
+        let tabByID = Dictionary(uniqueKeysWithValues: tabs.map { ($0.tabID, $0) })
+        let claudePanes = panes.filter { $0.agent == "claude" }
+        // One representative pane per multi-pane tab is enough: `pane
+        // layout --pane <id>` returns rects for every pane in that pane's
+        // tab, not just the one asked about.
+        var representativePaneIDByTab: [String: String] = [:]
+        for pane in claudePanes {
+            guard let tab = tabByID[pane.tabID], tab.paneCount >= 2 else { continue }
+            if representativePaneIDByTab[pane.tabID] == nil {
+                representativePaneIDByTab[pane.tabID] = pane.paneID
+            }
+        }
+
+        var layoutByPaneID: [String: (x: Int, y: Int)] = [:]
+        for (tabID, representativePaneID) in representativePaneIDByTab {
+            do {
+                let layoutData = try HerdrProcessRunner.run(
+                    binary: binary,
+                    arguments: ["pane", "layout", "--pane", representativePaneID],
+                    timeout: timeout
+                )
+                let layout = try JSONDecoder().decode(HerdrPaneLayoutResponse.self, from: layoutData).result.layout
+                for layoutPane in layout.panes {
+                    layoutByPaneID[layoutPane.paneID] = (x: layoutPane.rect.x, y: layoutPane.rect.y)
+                }
+            } catch {
+                log(.warning, "herdr pane layout failed tab=\(tabID) pane=\(representativePaneID) error=\(error) -- falling back to pane-number order for that tab")
+            }
+        }
+
+        return buildSessionEntries(panes: panes, workspaces: workspaces, tabs: tabs, layoutByPaneID: layoutByPaneID)
     }
 
     private func startBackgroundRefresh() {
@@ -342,7 +532,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     private func refreshOnce() {
         guard let binaryPath else { return }
         do {
-            let entries = try Self.fetchOnce(binary: binaryPath, timeout: processTimeout)
+            let entries = try Self.fetchOnce(binary: binaryPath, timeout: processTimeout, log: log)
             store.recordSuccess(entries)
         } catch {
             log(.warning, "herdr sync failed error=\(error)")

@@ -110,9 +110,9 @@ enum C100StatusCLI {
                 do {
                     let herdrSessions = try HerdrCatalog.fetchOnce(binary: herdrBinary)
                     print("herdr sessions (binary=\(herdrBinary)):")
-                    for entry in herdrSessions.sorted(by: { $0.workspaceNumber < $1.workspaceNumber }) {
+                    for entry in herdrSessions.sorted(by: { ($0.workspaceNumber, $0.columnRank ?? Int.max) < ($1.workspaceNumber, $1.columnRank ?? Int.max) }) {
                         print(
-                            "  workspace=\(entry.workspaceNumber) pane=\(entry.paneID) session=\(entry.sessionID) status=\(entry.seedStatus.rawValue) cwd=\(entry.cwd)"
+                            "  workspace=\(entry.workspaceNumber) col=\(entry.columnRank.map(String.init) ?? "nil") pane=\(entry.paneID) session=\(entry.sessionID) status=\(entry.seedStatus.rawValue) cwd=\(entry.cwd)"
                         )
                     }
                     if herdrSessions.isEmpty {
@@ -699,15 +699,23 @@ enum C100StatusCLI {
         }
 
         // herdr (M2): fixed JSON parse test, shaped exactly like the real
-        // `herdr agent list` / `herdr workspace list` output captured from a
-        // live herdr instance (two workspaces, one Claude pane each, plus a
-        // non-Claude agent that must be filtered out).
-        let herdrAgentListJSON = #"""
-        {"id":"cli:agent:list","result":{"agents":[
+        // `herdr pane list` / `herdr tab list` / `herdr workspace list`
+        // output captured from a live herdr instance (two workspaces, one
+        // Claude pane each, plus a non-Claude agent that must be filtered
+        // out).
+        let herdrPaneListJSON = #"""
+        {"id":"cli:pane:list","result":{"panes":[
           {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"11111111-1111-1111-1111-111111111111"},"agent_status":"working","cwd":"/Users/dev/project-a","focused":false,"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},
           {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"22222222-2222-2222-2222-222222222222"},"agent_status":"idle","cwd":"/Users/dev/project-b","focused":true,"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"},
           {"agent":"codex","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"33333333-3333-3333-3333-333333333333"},"agent_status":"idle","cwd":"/Users/dev/project-c","focused":false,"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3"}
-        ],"type":"agent_list"}}
+        ],"type":"pane_list"}}
+        """#
+        let herdrTabListJSON = #"""
+        {"id":"cli:tab:list","result":{"type":"tab_list","tabs":[
+          {"agent_status":"working","focused":false,"label":"1","number":1,"pane_count":1,"tab_id":"w1:t1","workspace_id":"w1"},
+          {"agent_status":"idle","focused":true,"label":"1","number":1,"pane_count":1,"tab_id":"w2:t1","workspace_id":"w2"},
+          {"agent_status":"idle","focused":false,"label":"1","number":1,"pane_count":1,"tab_id":"w3:t1","workspace_id":"w3"}
+        ]}}
         """#
         let herdrWorkspaceListJSON = #"""
         {"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
@@ -715,18 +723,20 @@ enum C100StatusCLI {
           {"active_tab_id":"w2:t1","agent_status":"idle","focused":true,"label":"project-b","number":2,"pane_count":1,"tab_count":1,"workspace_id":"w2"}
         ]}}
         """#
-        let herdrAgents = try decoder.decode(HerdrAgentListResponse.self, from: Data(herdrAgentListJSON.utf8)).result.agents
+        let herdrPanes = try decoder.decode(HerdrPaneListResponse.self, from: Data(herdrPaneListJSON.utf8)).result.panes
+        let herdrTabs = try decoder.decode(HerdrTabListResponse.self, from: Data(herdrTabListJSON.utf8)).result.tabs
         let herdrWorkspaces = try decoder.decode(HerdrWorkspaceListResponse.self, from: Data(herdrWorkspaceListJSON.utf8)).result.workspaces
-        guard herdrAgents.count == 3, herdrWorkspaces.count == 2 else {
+        guard herdrPanes.count == 3, herdrTabs.count == 3, herdrWorkspaces.count == 2 else {
             throw CLIError.runtime("herdr fixture decode self-test failed")
         }
-        let herdrEntries = HerdrCatalog.buildSessionEntries(agents: herdrAgents, workspaces: herdrWorkspaces)
+        let herdrEntries = HerdrCatalog.buildSessionEntries(panes: herdrPanes, workspaces: herdrWorkspaces, tabs: herdrTabs)
         guard herdrEntries.count == 2,
               herdrEntries.map(\.sessionID) == ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
               herdrEntries.map(\.workspaceNumber) == [1, 2],
               herdrEntries.map(\.paneNumber) == [1, 1],
+              herdrEntries.map(\.columnRank) == [0, 0],
               herdrEntries.map(\.seedStatus) == [.working, .idle] else {
-            throw CLIError.runtime("herdr agent-list/workspace-list parse self-test failed (codex agent must be filtered out)")
+            throw CLIError.runtime("herdr pane-list/workspace-list/tab-list parse self-test failed (codex agent must be filtered out)")
         }
 
         // herdr agent_status -> AgentStatus seed mapping (blocked -> approval,
@@ -750,6 +760,75 @@ enum C100StatusCLI {
               HerdrCatalog.parsePaneNumber("not-a-pane-id") == nil,
               HerdrCatalog.parsePaneNumber("w1:") == nil else {
             throw CLIError.runtime("herdr pane-number parsing self-test failed")
+        }
+
+        // herdr column ordering (`HerdrCatalog.columnRanks`): the on-screen
+        // packed ordinal within a workspace, replacing the old
+        // `paneNumber - 1` absolute-slot scheme (which went gappy the moment
+        // herdr closed a pane, since herdr never renumbers panes).
+
+        // (a) Five surviving panes with numbers 1,2,3,4,6 (5 closed) in
+        // ascending-tab-number, single-pane-per-tab tabs -- exactly the
+        // shape captured from a live "wA" workspace with p5 closed -- must
+        // pack into columns 0..4 with no gap at the old slot 4 (formerly
+        // p5's `paneNumber - 1`).
+        let herdrGapColumnPanes: [HerdrCatalog.PaneOrderingInfo] = [1, 2, 3, 4, 6].enumerated().map { index, paneNumber -> HerdrCatalog.PaneOrderingInfo in
+            HerdrCatalog.PaneOrderingInfo(
+                paneID: "wA:p\(paneNumber as Int)",
+                workspaceID: "wA",
+                tabNumber: index + 1,
+                rectX: nil,
+                rectY: nil,
+                paneNumber: paneNumber
+            )
+        }
+        let herdrGapColumnRanks = HerdrCatalog.columnRanks(for: herdrGapColumnPanes)
+        guard herdrGapColumnRanks["wA:p1"] == 0,
+              herdrGapColumnRanks["wA:p2"] == 1,
+              herdrGapColumnRanks["wA:p3"] == 2,
+              herdrGapColumnRanks["wA:p4"] == 3,
+              herdrGapColumnRanks["wA:p6"] == 4 else {
+            throw CLIError.runtime("herdr column ordering: closed-pane gap must pack into dense 0..4 self-test failed")
+        }
+
+        // (b) Two panes sharing one tab (tab number irrelevant -- both
+        // panes are in the same tab): a vertical split (differing y, same
+        // x) must place the smaller-y pane first; a horizontal split
+        // (differing x, same y) must place the smaller-x pane first.
+        let herdrVerticalSplitRanks = HerdrCatalog.columnRanks(for: [
+            HerdrCatalog.PaneOrderingInfo(paneID: "wV:p2", workspaceID: "wV", tabNumber: 1, rectX: 0, rectY: 41, paneNumber: 2),
+            HerdrCatalog.PaneOrderingInfo(paneID: "wV:p1", workspaceID: "wV", tabNumber: 1, rectX: 0, rectY: 1, paneNumber: 1),
+        ])
+        guard herdrVerticalSplitRanks["wV:p1"] == 0, herdrVerticalSplitRanks["wV:p2"] == 1 else {
+            throw CLIError.runtime("herdr column ordering: vertical split must order by y ascending self-test failed")
+        }
+        let herdrHorizontalSplitRanks = HerdrCatalog.columnRanks(for: [
+            HerdrCatalog.PaneOrderingInfo(paneID: "wH:p2", workspaceID: "wH", tabNumber: 1, rectX: 80, rectY: 0, paneNumber: 2),
+            HerdrCatalog.PaneOrderingInfo(paneID: "wH:p1", workspaceID: "wH", tabNumber: 1, rectX: 0, rectY: 0, paneNumber: 1),
+        ])
+        guard herdrHorizontalSplitRanks["wH:p1"] == 0, herdrHorizontalSplitRanks["wH:p2"] == 1 else {
+            throw CLIError.runtime("herdr column ordering: horizontal split must order by x ascending self-test failed")
+        }
+
+        // (c) Two single-pane tabs in the same workspace: the pane in the
+        // lower-numbered tab must come first, regardless of pane number.
+        let herdrTabOrderRanks = HerdrCatalog.columnRanks(for: [
+            HerdrCatalog.PaneOrderingInfo(paneID: "wT:p9", workspaceID: "wT", tabNumber: 1, rectX: nil, rectY: nil, paneNumber: 9),
+            HerdrCatalog.PaneOrderingInfo(paneID: "wT:p1", workspaceID: "wT", tabNumber: 2, rectX: nil, rectY: nil, paneNumber: 1),
+        ])
+        guard herdrTabOrderRanks["wT:p9"] == 0, herdrTabOrderRanks["wT:p1"] == 1 else {
+            throw CLIError.runtime("herdr column ordering: lower tab number must come first self-test failed")
+        }
+
+        // (d) Same tab, no layout rects available (e.g. `pane layout`
+        // failed for that tab): must fall back to pane-number ascending
+        // order rather than an arbitrary/unstable order.
+        let herdrNoLayoutFallbackRanks = HerdrCatalog.columnRanks(for: [
+            HerdrCatalog.PaneOrderingInfo(paneID: "wF:p3", workspaceID: "wF", tabNumber: 1, rectX: nil, rectY: nil, paneNumber: 3),
+            HerdrCatalog.PaneOrderingInfo(paneID: "wF:p1", workspaceID: "wF", tabNumber: 1, rectX: nil, rectY: nil, paneNumber: 1),
+        ])
+        guard herdrNoLayoutFallbackRanks["wF:p1"] == 0, herdrNoLayoutFallbackRanks["wF:p3"] == 1 else {
+            throw CLIError.runtime("herdr column ordering: missing layout must fall back to pane-number order self-test failed")
         }
 
         // herdr binary resolution precedence: explicit path > HERDR_BIN env > PATH candidates.
@@ -802,6 +881,7 @@ enum C100StatusCLI {
                 workspaceNumber: 1,
                 paneID: "w1:p1",
                 paneNumber: 1,
+                columnRank: 0,
                 seedStatus: .idle
             ),
         ]
@@ -877,6 +957,58 @@ enum C100StatusCLI {
               codexUnrankedRow != herdrWS3Row,
               codexUnrankedRow != 5 else {
             throw CLIError.runtime("herdr row-ordering (absolute slot = workspace number - 1) self-test failed")
+        }
+
+        // New case: workspace numbers 1, 2, 3 where number 2 currently has no
+        // Claude session at all. Its row must stay reserved and empty --
+        // workspace 3's row must not slide up to fill the gap -- exactly
+        // matching what the herdr UI shows (workspace 3 always sits in the
+        // 3rd row regardless of whether workspace 2 has an active session).
+        let herdrGapPaneListJSON = #"""
+        {"id":"cli:pane:list","result":{"type":"pane_list","panes":[
+          {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"gap-1"},"agent_status":"idle","cwd":"/repo/gap1","focused":false,"pane_id":"g1:p1","tab_id":"g1:t1","workspace_id":"g1"},
+          {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"gap-3"},"agent_status":"idle","cwd":"/repo/gap3","focused":false,"pane_id":"g3:p1","tab_id":"g3:t1","workspace_id":"g3"}
+        ]}}
+        """#
+        let herdrGapTabListJSON = #"""
+        {"id":"cli:tab:list","result":{"type":"tab_list","tabs":[
+          {"agent_status":"idle","focused":false,"label":"1","number":1,"pane_count":1,"tab_id":"g1:t1","workspace_id":"g1"},
+          {"agent_status":"idle","focused":false,"label":"1","number":1,"pane_count":1,"tab_id":"g3:t1","workspace_id":"g3"}
+        ]}}
+        """#
+        let herdrGapWorkspaceListJSON = #"""
+        {"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+          {"active_tab_id":"g1:t1","agent_status":"idle","focused":false,"label":"gap-1","number":1,"pane_count":1,"tab_count":1,"workspace_id":"g1"},
+          {"active_tab_id":"g2:t1","agent_status":"idle","focused":false,"label":"gap-2","number":2,"pane_count":0,"tab_count":1,"workspace_id":"g2"},
+          {"active_tab_id":"g3:t1","agent_status":"idle","focused":false,"label":"gap-3","number":3,"pane_count":1,"tab_count":1,"workspace_id":"g3"}
+        ]}}
+        """#
+        let herdrGapPanes = try decoder.decode(HerdrPaneListResponse.self, from: Data(herdrGapPaneListJSON.utf8)).result.panes
+        let herdrGapTabs = try decoder.decode(HerdrTabListResponse.self, from: Data(herdrGapTabListJSON.utf8)).result.tabs
+        let herdrGapWorkspaces = try decoder.decode(HerdrWorkspaceListResponse.self, from: Data(herdrGapWorkspaceListJSON.utf8)).result.workspaces
+        let herdrGapEntries = HerdrCatalog.buildSessionEntries(panes: herdrGapPanes, workspaces: herdrGapWorkspaces, tabs: herdrGapTabs)
+        guard herdrGapEntries.count == 2 else {
+            throw CLIError.runtime("herdr empty-middle-workspace fixture decode self-test failed")
+        }
+        let herdrGapSessions = herdrGapEntries.map { entry in
+            AgentSession(
+                sourceKind: .claudeHerdr,
+                sessionID: entry.sessionID,
+                cwd: entry.cwd,
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: entry.workspaceID),
+                recency: 1,
+                rowRank: HerdrCatalog.rowRank(forWorkspaceNumber: entry.workspaceNumber),
+                columnRank: entry.columnRank,
+                seedStatus: entry.seedStatus,
+                navigation: .herdrPane(paneID: entry.paneID)
+            )
+        }
+        let herdrGapLayout = UnifiedLayout.compute(sessions: herdrGapSessions)
+        guard herdrGapLayout.placements.first(where: { $0.session.sessionID == "gap-1" })?.row == 0,
+              herdrGapLayout.placements.first(where: { $0.session.sessionID == "gap-3" })?.row == 2,
+              !herdrGapLayout.placements.contains(where: { $0.row == 1 }),
+              herdrGapLayout.warnings.isEmpty else {
+            throw CLIError.runtime("herdr empty-middle-workspace row reservation self-test failed")
         }
 
         // HerdrHookMissRecovery: the pure decision behind (b) of
