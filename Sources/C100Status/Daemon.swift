@@ -1452,12 +1452,30 @@ final class StatusDaemon {
 
     /// herdr `agent_status` is only ever used (a) to seed a brand-new
     /// session's initial status when no Claude hook has registered it yet,
-    /// or (b) to recover from a missed hook: if herdr reports idle/done for
-    /// two consecutive syncs *and* the last hook seen for that session
-    /// predates that streak, the hook is presumed lost and herdr's status
-    /// wins. In every other case the hook remains authoritative (this
-    /// function never touches a session's status while its hook activity is
-    /// current).
+    /// or (b) to recover from a genuinely missed hook: when the current
+    /// slot is stuck in `.working`/`.approval` (never `.done`/`.idle` --
+    /// see below) and herdr reports idle/done for at least
+    /// `HerdrHookMissRecovery.minStreakSeconds` worth of consecutive syncs
+    /// *and* the last hook seen for that session predates that streak, the
+    /// hook is presumed lost and herdr's status wins. In every other case
+    /// the hook remains authoritative (this function never touches a
+    /// session's status while its hook activity is current). The actual
+    /// eligibility decision for (b) lives in `HerdrHookMissRecovery`, kept
+    /// separate so it can be unit-tested without a live `StatusDaemon`.
+    ///
+    /// Two guards exist specifically to stop a real race: herdr's
+    /// `agent_status` has no "done" concept of its own and reports idle
+    /// almost immediately after a Claude Stop hook lands, which used to
+    /// read as a "missed hook" within a couple of sync cycles and demote a
+    /// just-finished `.done` session back to `.idle` (full-frame repaint,
+    /// visible flicker). To prevent that:
+    ///   - recovery never fires when the current slot is already
+    ///     `.done` or `.idle` -- those states are terminal enough from
+    ///     herdr's perspective that there is nothing to "recover"; a
+    ///     `.done -> .idle` downgrade in particular must never happen here.
+    ///   - the idle/done streak must have persisted for a minimum wall-clock
+    ///     duration, not just a minimum sync count, since two consecutive
+    ///     syncs can both land within a second of the hook firing.
     private func applyHerdrStatusHeuristics(
         herdrAgentSessions: [AgentSession],
         reconciliation: GridReconciliation
@@ -1504,20 +1522,24 @@ final class StatusDaemon {
             }
         }
 
-        for (sessionID, streak) in herdrStatusStreaks where streak.count >= 2 {
-            guard let hookLastSeen = claudeSessions[sessionID]?.lastSeen, hookLastSeen < streak.since else { continue }
-            guard let currentSlot = reconciliation.current.sessions[sessionID], currentSlot.status != streak.status else { continue }
+        for (sessionID, streak) in herdrStatusStreaks {
+            guard let currentSlot = reconciliation.current.sessions[sessionID] else { continue }
+            guard let recovered = HerdrHookMissRecovery.recoveredStatus(
+                streak: streak,
+                hookLastSeen: claudeSessions[sessionID]?.lastSeen,
+                currentStatus: currentSlot.status
+            ) else { continue }
             let mutation = try stateStore.update(
                 sessionID: sessionID,
                 projectKey: currentSlot.projectKey,
                 source: .claudeHerdr,
-                status: streak.status
+                status: recovered
             )
             if mutation.changed {
                 changed = true
                 logger.log(
                     .info,
-                    "herdr session=\(shortSession(sessionID)) action=hook_miss_recovered status=\(streak.status.rawValue) streak=\(streak.count)"
+                    "herdr session=\(shortSession(sessionID)) action=hook_miss_recovered status=\(recovered.rawValue) streak=\(streak.count)"
                 )
             }
         }

@@ -432,6 +432,44 @@ struct ActiveSubagentTracker {
     }
 }
 
+/// Pure decision logic for hook-miss recovery (b) in
+/// `StatusDaemon.applyHerdrStatusHeuristics`, extracted (mirroring
+/// `ActiveSubagentTracker` above) so it is unit-testable independent of
+/// `StatusDaemon`'s stateStore/socket/HID plumbing.
+///
+/// herdr's `agent_status` has no "done" concept of its own and reports idle
+/// almost immediately after a Claude Stop hook fires, so two back-to-back
+/// idle/done syncs alone do not mean the hook was actually lost -- they can
+/// just mean herdr hasn't caught up yet. `recoveredStatus` therefore only
+/// fires when the current slot is genuinely stuck in `.working`/`.approval`
+/// (never `.done`/`.idle` -- a `.done -> .idle` downgrade in particular must
+/// never happen here) and the idle/done streak has persisted for at least
+/// `minStreakSeconds` of wall-clock time, not just a minimum sync count.
+enum HerdrHookMissRecovery {
+    /// See the type doc above for why this exists: it exists purely to stop
+    /// a `.done -> .idle` flicker caused by herdr reporting idle within a
+    /// sync cycle or two of a Claude Stop hook landing.
+    static let minStreakSeconds: TimeInterval = 15
+
+    /// Returns the status hook-miss recovery should apply, or `nil` if it
+    /// should not fire for this session right now.
+    static func recoveredStatus(
+        streak: (status: AgentStatus, count: Int, since: Date),
+        hookLastSeen: Date?,
+        currentStatus: AgentStatus,
+        now: Date = Date()
+    ) -> AgentStatus? {
+        guard streak.count >= 2 else { return nil }
+        guard now.timeIntervalSince(streak.since) >= minStreakSeconds else { return nil }
+        guard let hookLastSeen, hookLastSeen < streak.since else { return nil }
+        guard currentStatus != streak.status else { return nil }
+        // Only a session stuck in `.working`/`.approval` is eligible --
+        // never demote a slot that's already `.done` or `.idle`.
+        guard currentStatus == .working || currentStatus == .approval else { return nil }
+        return streak.status
+    }
+}
+
 enum LEDColorName: String, CaseIterable {
     case off
     case white

@@ -877,6 +877,80 @@ enum C100StatusCLI {
             throw CLIError.runtime("herdr row-ordering (workspace number ascending, ahead of unranked Codex rows) self-test failed")
         }
 
+        // HerdrHookMissRecovery: the pure decision behind (b) of
+        // `StatusDaemon.applyHerdrStatusHeuristics` -- see the regression
+        // this guards against in that function's doc comment (a Claude
+        // Stop hook landing `.done`, then herdr's near-immediate idle
+        // report being misread as "the hook was lost" and flickering the
+        // whole grid back to `.idle`).
+        let hookMissStreakStart = Date(timeIntervalSince1970: 100_000)
+        let hookMissLongAfterStreak = hookMissStreakStart.addingTimeInterval(HerdrHookMissRecovery.minStreakSeconds + 5)
+        let hookMissShortlyAfterStreak = hookMissStreakStart.addingTimeInterval(2)
+        let hookMissHookBeforeStreak = hookMissStreakStart.addingTimeInterval(-1)
+        let hookMissHookDuringStreak = hookMissStreakStart.addingTimeInterval(1)
+
+        // A `.done` session (just finished via Stop hook) must never be
+        // demoted to `.idle` by herdr's streak, no matter how long the
+        // streak has run -- this is the exact flicker from the bug report.
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .idle, count: 5, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookBeforeStreak,
+            currentStatus: .done,
+            now: hookMissLongAfterStreak
+        ) == nil else {
+            throw CLIError.runtime("herdr hook-miss recovery must not demote .done to .idle self-test failed")
+        }
+        // Likewise an already-`.idle` slot is never touched by recovery
+        // (nothing to "recover").
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .done, count: 5, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookBeforeStreak,
+            currentStatus: .idle,
+            now: hookMissLongAfterStreak
+        ) == nil else {
+            throw CLIError.runtime("herdr hook-miss recovery must not touch an already-idle slot self-test failed")
+        }
+        // A streak that hasn't persisted long enough yet must not fire,
+        // even for an eligible stuck `.working` slot.
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .idle, count: 5, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookBeforeStreak,
+            currentStatus: .working,
+            now: hookMissShortlyAfterStreak
+        ) == nil else {
+            throw CLIError.runtime("herdr hook-miss recovery must require a minimum streak duration self-test failed")
+        }
+        // A hook seen *during* the streak (i.e. still current) means the
+        // hook was not actually lost -- must not fire even if the streak is
+        // long-lived.
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .idle, count: 5, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookDuringStreak,
+            currentStatus: .working,
+            now: hookMissLongAfterStreak
+        ) == nil else {
+            throw CLIError.runtime("herdr hook-miss recovery must require hook activity to predate the streak self-test failed")
+        }
+        // The genuine rescue case this heuristic exists for: a session
+        // stuck `.working`/`.approval` whose hook truly went missing (last
+        // seen before a long-lived idle/done streak) is recovered.
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .idle, count: 3, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookBeforeStreak,
+            currentStatus: .working,
+            now: hookMissLongAfterStreak
+        ) == .idle else {
+            throw CLIError.runtime("herdr hook-miss recovery must still rescue a genuinely stuck .working slot self-test failed")
+        }
+        guard HerdrHookMissRecovery.recoveredStatus(
+            streak: (status: .done, count: 3, since: hookMissStreakStart),
+            hookLastSeen: hookMissHookBeforeStreak,
+            currentStatus: .approval,
+            now: hookMissLongAfterStreak
+        ) == .done else {
+            throw CLIError.runtime("herdr hook-miss recovery must still rescue a genuinely stuck .approval slot self-test failed")
+        }
+
         let diagnosticJSON = #"{"session_id":"deferred","cwd":"/tmp/project","hook_event_name":"PostToolUse","turn_id":"turn-1","agent_id":"agent-1","agent_type":"executor","transcript_path":"/tmp/transcript.jsonl","permission_mode":"default","tool_name":"exec_command"}"#
         let diagnosticInput = try decoder.decode(HookInput.self, from: Data(diagnosticJSON.utf8))
         guard diagnosticInput.turnID == "turn-1",
