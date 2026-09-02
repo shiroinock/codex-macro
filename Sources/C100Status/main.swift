@@ -2044,6 +2044,65 @@ enum C100StatusCLI {
             throw CLIError.runtime("Keychron report self-test failed")
         }
 
+        // Anti-flicker: `FrameDiff.compute` is the pure diff behind
+        // `C100Connection.update`, which lets `reconcileLEDs` repaint only
+        // the LEDs that actually changed on a session add/remove instead of
+        // the full-frame blackout-then-redraw `apply(colorsByIndex:...)`
+        // always does.
+        let diffOff = LEDColorName.off.color
+        let diffPrevious: [Int: HSVColor] = [1: AgentStatus.working.color, 2: AgentStatus.idle.color]
+        // Unrelated key set unchanged, one color changed (idle -> done at 2).
+        let diffColorOnly = FrameDiff.compute(
+            previousColorsByIndex: diffPrevious,
+            colorsByIndex: [1: AgentStatus.working.color, 2: AgentStatus.done.color],
+            defaultColor: diffOff,
+            ledCount: 10
+        )
+        guard diffColorOnly.changedColors.map(\.index) == [2],
+              diffColorOnly.changedColors.first?.color == AgentStatus.done.color,
+              diffColorOnly.regionsChanged == false,
+              diffColorOnly.isEmpty == false else {
+            throw CLIError.runtime("FrameDiff color-only-change self-test failed")
+        }
+        // No change at all -> nothing to send.
+        let diffNoChange = FrameDiff.compute(
+            previousColorsByIndex: diffPrevious,
+            colorsByIndex: diffPrevious,
+            defaultColor: diffOff,
+            ledCount: 10
+        )
+        guard diffNoChange.isEmpty else {
+            throw CLIError.runtime("FrameDiff no-change self-test failed")
+        }
+        // New session added (key 3 goes from unassigned/default to a color):
+        // the assigned-key set changes, so regions must resend, plus the new
+        // key's own color report.
+        let diffNewKey = FrameDiff.compute(
+            previousColorsByIndex: diffPrevious,
+            colorsByIndex: [1: AgentStatus.working.color, 2: AgentStatus.idle.color, 3: AgentStatus.working.color],
+            defaultColor: diffOff,
+            ledCount: 10
+        )
+        guard diffNewKey.changedColors.map(\.index) == [3],
+              diffNewKey.changedColors.first?.color == AgentStatus.working.color,
+              diffNewKey.regionsChanged == true else {
+            throw CLIError.runtime("FrameDiff new-key self-test failed")
+        }
+        // Session removed (key 2 drops out): its resolved color falls back
+        // to `defaultColor`, so it's both a color change (to off) and a
+        // region change.
+        let diffRemovedKey = FrameDiff.compute(
+            previousColorsByIndex: diffPrevious,
+            colorsByIndex: [1: AgentStatus.working.color],
+            defaultColor: diffOff,
+            ledCount: 10
+        )
+        guard diffRemovedKey.changedColors.map(\.index) == [2],
+              diffRemovedKey.changedColors.first?.color == diffOff,
+              diffRemovedKey.regionsChanged == true else {
+            throw CLIError.runtime("FrameDiff removed-key self-test failed")
+        }
+
         // M3: `sessions/<pid>.json` decode against the real schema confirmed
         // from a live Claude Code process (fields beyond pid/sessionId/cwd
         // are present on the real file but irrelevant here and must be
@@ -2520,7 +2579,7 @@ enum C100StatusCLI {
         try selfTestClaudeHooksInstaller()
         try selfTestAgentInstaller()
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, physical-key resolution, install-claude-hooks, install-agent, and fd-leak regressions for HerdrProcessRunner/OsascriptRunner")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, FrameDiff incremental repaint, physical-key resolution, install-claude-hooks, install-agent, and fd-leak regressions for HerdrProcessRunner/OsascriptRunner")
     }
 
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end

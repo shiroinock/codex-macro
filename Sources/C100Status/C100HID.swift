@@ -29,6 +29,7 @@ final class C100Connection {
     private var responses: [[UInt8]] = []
     private var isOpen = false
     private var reportObserver: (([UInt8]) -> Void)?
+    private var cachedLedCount: Int?
 
     var locationID: Int {
         Self.propertyInt(device, key: kIOHIDLocationIDKey)
@@ -102,6 +103,13 @@ final class C100Connection {
         // individual LED off. MIXED_RGB solves that without firmware changes:
         // region 0 renders assigned keys with PER_KEY_RGB; region 1 has no
         // effect and remains black after the temporary global-off transition.
+        //
+        // This is the full-frame path: it always blacks out the board for
+        // ~50ms via `turnOff()` and re-establishes MIXED_RGB from scratch, so
+        // it visibly flickers. Only call it when the board's actual state is
+        // unknown (first paint, reconnect, `.clear`) -- once MIXED_RGB is
+        // already active, prefer `update(colorsByIndex:defaultColor:previousColorsByIndex:)`,
+        // which only touches the LEDs that actually changed.
         try turnOff()
         let ledCount = try ledCount()
         var colors = [HSVColor](repeating: defaultColor, count: ledCount)
@@ -125,6 +133,52 @@ final class C100Connection {
             try transact(report, expecting: .setEffectList)
         }
         try send(KeychronProtocol.setEffectReport(KeychronProtocol.mixedEffect))
+    }
+
+    /// Incremental repaint for when MIXED_RGB is already active on the board
+    /// (i.e. a prior `apply(colorsByIndex:defaultColor:)` or `update` already
+    /// ran since the last reconnect/clear). Unlike the full-frame path, this
+    /// never calls `turnOff()`, resends `mixedEffectListReports()`, or resets
+    /// the effect -- doing so would re-run the ~50ms blackout-then-redraw
+    /// that causes the whole grid to visibly flicker on every session
+    /// add/remove. Instead it diffs against `previousColorsByIndex` (the
+    /// last frame this connection actually painted) and only:
+    ///   1. sends `setColorReport` for LEDs whose resolved color changed, and
+    ///   2. resends the region map only if the *set* of assigned indexes
+    ///      changed, always after step 1 so a key moving from region 1
+    ///      (black) to region 0 already holds its real color the instant it
+    ///      becomes visible instead of flashing black first.
+    /// Sends nothing at all if neither changed.
+    func update(
+        colorsByIndex: [Int: HSVColor],
+        defaultColor: HSVColor,
+        previousColorsByIndex: [Int: HSVColor]
+    ) throws {
+        let ledCount = try ledCount()
+        for index in colorsByIndex.keys {
+            guard index >= 0 && index < ledCount else {
+                throw CLIError.runtime("Key index \(index) is outside the device LED range 0...\(ledCount - 1)")
+            }
+        }
+        let diff = FrameDiff.compute(
+            previousColorsByIndex: previousColorsByIndex,
+            colorsByIndex: colorsByIndex,
+            defaultColor: defaultColor,
+            ledCount: ledCount
+        )
+        guard !diff.isEmpty else { return }
+        for (index, color) in diff.changedColors {
+            try transact(KeychronProtocol.setColorReport(index: index, color: color), expecting: .setLEDColor)
+        }
+        if diff.regionsChanged {
+            let assignedIndexes = Set(colorsByIndex.keys)
+            for report in KeychronProtocol.setRegionsReports(
+                assignedIndexes: assignedIndexes,
+                ledCount: ledCount
+            ) {
+                try transact(report, expecting: .setRegions)
+            }
+        }
     }
 
     func currentLayer() throws -> Int {
@@ -271,6 +325,11 @@ final class C100Connection {
     }
 
     private func ledCount() throws -> Int {
+        // The device's addressable LED count can't change for the lifetime
+        // of a connection, and diffed single-key writes (`apply(color:at:)`,
+        // `update(colorsByIndex:...)`) call this far more often than the
+        // full-frame path did, so cache it after the first round-trip.
+        if let cachedLedCount { return cachedLedCount }
         let countResponse = try transact(KeychronProtocol.ledCountReport(), expecting: .ledCount)
         guard countResponse.count > 3 else {
             throw CLIError.runtime("C100 returned an invalid LED-count response")
@@ -279,6 +338,7 @@ final class C100Connection {
         guard ledCount > 0 else {
             throw CLIError.runtime("C100 reported zero addressable LEDs")
         }
+        cachedLedCount = ledCount
         return ledCount
     }
 

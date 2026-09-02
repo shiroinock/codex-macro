@@ -49,6 +49,17 @@ final class StatusDaemon {
     /// timer only issues a single-key HID write when a key's color actually
     /// changed instead of re-sending all 4 every tick.
     private var lastPaintedLayerColors: [Int: HSVColor] = [:]
+    /// The `colorsByIndex` map (assigned keys only, keys 0-93) that this
+    /// connection last actually painted onto the board, so `reconcileLEDs`
+    /// can send an incremental `C100Connection.update` instead of a
+    /// full-frame `apply` that blacks out the whole grid for ~50ms first.
+    /// `nil` means the board's real state is unknown (never painted since
+    /// this connection was established, or a paint might have partially
+    /// failed) and the next `reconcileLEDs` must fall back to a full frame.
+    /// Every place that can leave the board in a state this daemon didn't
+    /// just write -- a fresh/reconnected `connection`, `.clear`, or an HID
+    /// write failure that discards `connection` -- resets this to `nil`.
+    private var lastPaintedFrame: [Int: HSVColor]?
     /// Toggled every ~600ms by the main loop; flips which of (attention
     /// status color / layer base color) a blinking layer key currently
     /// shows -- see `LayerKeyColorLogic.color`.
@@ -722,12 +733,17 @@ final class StatusDaemon {
         if connection == nil {
             connection = try C100Connection.connect(locationID: locationID)
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
+            lastPaintedFrame = nil
         }
         do {
             try connection?.apply(status: status)
             logger.log(.info, "HID applied status=\(status.rawValue) persistence=volatile")
+            // Whole-board effect write, same as `applyAll` -- invalidates any
+            // MIXED_RGB per-key frame `reconcileLEDs` had cached.
+            lastPaintedFrame = nil
         } catch {
             connection = nil
+            lastPaintedFrame = nil
             logger.log(.warning, "HID connection discarded after failure")
             throw error
         }
@@ -752,15 +768,33 @@ final class StatusDaemon {
         )
         for (key, color) in layerKeyColors() { colors[key] = color }
         try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
+        // Manual command: rare (admin-triggered), always a deliberate
+        // full-frame overwrite. Still keep `lastPaintedFrame` in sync with
+        // what's actually on the board so the *next* `reconcileLEDs` diffs
+        // against reality instead of a stale cached frame.
+        lastPaintedFrame = colors
         logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
     }
 
-    /// Full-frame repaint: keys 0-89 show `activeLayer`'s sessions only
-    /// (every other layer's sessions stay tracked in `StateStore` but never
-    /// reach the LEDs while inactive -- see the M5 doc comment on
-    /// `GridState`), keys 90-93 show the layer bar (base color, or
-    /// blinking between base/attention color -- see `LayerKeyColorLogic`),
-    /// and keys 94-99 are always off (unused, per the M5 spec).
+    /// Repaints keys 0-89 with `activeLayer`'s sessions only (every other
+    /// layer's sessions stay tracked in `StateStore` but never reach the
+    /// LEDs while inactive -- see the M5 doc comment on `GridState`), keys
+    /// 90-93 with the layer bar (base color, or blinking between
+    /// base/attention color -- see `LayerKeyColorLogic`), and keys 94-99
+    /// always off (unused, per the M5 spec).
+    ///
+    /// Sends an incremental diff (`C100Connection.update`) against
+    /// `lastPaintedFrame` whenever that cache is populated, so a session
+    /// being added or removed only touches the LEDs that actually changed
+    /// instead of blacking out and redrawing the whole grid. Falls back to
+    /// the full-frame `apply` (and its ~50ms blackout) only when the board's
+    /// state is unknown -- see `lastPaintedFrame`'s doc comment for exactly
+    /// when that happens. Note this method is also the fallback any caller
+    /// reaches for a *non*-active-layer change (see `syncCatalog`'s
+    /// `anyReconciliationChanged` etc.): once `lastPaintedFrame` is warm,
+    /// such a call computes the same `colors` as last time, so the diff is
+    /// empty and `update` sends nothing at all -- there's no need to
+    /// separately restrict those triggers to the active layer.
     private func reconcileLEDs() throws {
         let assignments = try stateStore.assignments(source: activeLayer)
         let layerColors = layerKeyColors()
@@ -776,8 +810,14 @@ final class StatusDaemon {
             uniqueKeysWithValues: assignments.map { ($0.slot.keyIndex, $0.slot.status.color) }
         )
         for (key, color) in layerColors { colors[key] = color }
-        try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
-        logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
+        if let previous = lastPaintedFrame {
+            try connection.update(colorsByIndex: colors, defaultColor: LEDColorName.off.color, previousColorsByIndex: previous)
+            logger.log(.info, "HID applied diff assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
+        } else {
+            try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
+            logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
+        }
+        lastPaintedFrame = colors
     }
 
     /// Colors for the 4 layer keys (90-93) right now, given the current
@@ -822,9 +862,14 @@ final class StatusDaemon {
     /// session still updates `StateStore` (see every `stateStore.update`
     /// call site), but must never repaint keys 0-89, which only ever show
     /// `activeLayer`. `mutation.previousSlot == nil` (a session's very first
-    /// placement) still forces a full `reconcileLEDs()` rather than a
-    /// single-key write, matching the pre-M5 behavior: a brand-new key can
-    /// only be trusted alongside a full-frame repaint of its neighbors.
+    /// placement) still goes through `reconcileLEDs()` rather than a
+    /// single-key write, since only `reconcileLEDs()` knows how to bring a
+    /// brand-new key into the assigned-region set (see
+    /// `KeychronProtocol.setRegionsReports`). That used to mean a full-frame
+    /// blackout-then-redraw of every key; now that `reconcileLEDs()` diffs
+    /// against `lastPaintedFrame`, it costs exactly one `setColorReport` for
+    /// the new key plus one region-map resend -- no more than this method's
+    /// own single-key path already costs for the region resend.
     private func applyLayerAwareUpdate(source: SessionSourceKind, mutation: SessionMutation, slot: SessionSlot) throws {
         guard source == activeLayer else { return }
         if mutation.previousSlot == nil {
@@ -860,6 +905,11 @@ final class StatusDaemon {
         // so this is the only other place besides the daemon's first sync
         // that can move an unranked session's row.
         syncCatalog(forceRepackSources: [newLayer])
+        // Force a full-frame repaint rather than diffing against the
+        // outgoing layer's frame: a layer switch is meant to read as a
+        // deliberate, whole-grid change (see the doc comment above), not an
+        // incremental one.
+        lastPaintedFrame = nil
         do {
             try reconcileLEDs()
         } catch {
@@ -875,12 +925,21 @@ final class StatusDaemon {
         if connection == nil {
             connection = try C100Connection.connect(locationID: locationID)
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
+            // Freshly (re)connected: the board's real state is unknown, so
+            // the next `reconcileLEDs()` must fall back to a full frame
+            // instead of diffing against a stale `lastPaintedFrame`.
+            lastPaintedFrame = nil
         }
         do {
             try connection?.apply(color: color, at: index)
             logger.log(.info, "HID applied key=\(index) persistence=volatile")
+            // Keep the diff cache in sync with this single-key write so a
+            // later `reconcileLEDs()` diff doesn't redundantly resend a key
+            // this call already painted.
+            lastPaintedFrame?[index] = color
         } catch {
             connection = nil
+            lastPaintedFrame = nil
             logger.log(.warning, "HID connection discarded after failure")
             throw error
         }
@@ -895,12 +954,22 @@ final class StatusDaemon {
             throw CLIError.runtime("C100 vendor HID connection is unavailable")
         }
         try connection.apply(color: color)
+        // `apply(color:)` sets a single whole-board effect (or turns
+        // everything off), not MIXED_RGB per-key state -- the board no
+        // longer matches whatever `reconcileLEDs` last painted, so the next
+        // call must repaint everything from scratch.
+        lastPaintedFrame = nil
         logger.log(.info, "HID applied all_keys persistence=volatile")
     }
 
     private func setupHardware() throws {
         let connection = try C100Connection.connect(locationID: locationID)
         self.connection = connection
+        // A fresh connection's board state is unknown (could be a first
+        // boot, or a reconnect after this daemon or another process left it
+        // in some other effect/frame), so the next `reconcileLEDs` must do a
+        // full frame rather than trust a diff against stale state.
+        lastPaintedFrame = nil
         let actualLocation = connection.locationID
         logger.log(.info, "HID connected location=\(String(format: "0x%X", actualLocation))")
 

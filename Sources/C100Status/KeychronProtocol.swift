@@ -158,3 +158,39 @@ enum KeychronProtocol {
         bytes.count >= 2 && bytes[0] == keychronRGB && bytes[1] == command.rawValue
     }
 }
+
+/// Pure computation of what changed between two `colorsByIndex` frames, so
+/// `C100Connection.update(colorsByIndex:defaultColor:previousColorsByIndex:)`
+/// can send only the LEDs that actually need a new color and skip the
+/// region-map report entirely when the assigned-key set didn't change. Kept
+/// free of any HID/IOKit dependency so it can be exercised directly by
+/// `main.swift`'s self-test.
+struct FrameDiff {
+    /// Every LED whose resolved color (its entry in `colorsByIndex`, or
+    /// `defaultColor` if unassigned) differs from the previous frame's,
+    /// ordered by index for deterministic report ordering.
+    let changedColors: [(index: Int, color: HSVColor)]
+    /// Whether the *set* of assigned indexes differs, i.e. whether
+    /// `setRegionsReports` needs to be resent at all.
+    let regionsChanged: Bool
+
+    var isEmpty: Bool { changedColors.isEmpty && !regionsChanged }
+
+    static func compute(
+        previousColorsByIndex: [Int: HSVColor],
+        colorsByIndex: [Int: HSVColor],
+        defaultColor: HSVColor,
+        ledCount: Int
+    ) -> FrameDiff {
+        var changed: [(index: Int, color: HSVColor)] = []
+        for index in 0..<ledCount {
+            let newColor = colorsByIndex[index] ?? defaultColor
+            let oldColor = previousColorsByIndex[index] ?? defaultColor
+            if newColor != oldColor {
+                changed.append((index, newColor))
+            }
+        }
+        let regionsChanged = Set(colorsByIndex.keys) != Set(previousColorsByIndex.keys)
+        return FrameDiff(changedColors: changed, regionsChanged: regionsChanged)
+    }
+}
