@@ -9,6 +9,27 @@ private let inputReportCallback: IOHIDReportCallback = {
     connection.receive(Array(UnsafeBufferPointer(start: report, count: reportLength)))
 }
 
+/// Distinguishes the two ways `C100Connection.connect` can fail to hand
+/// back a device, so callers can decide *how* to react without resorting
+/// to string-matching `CLIError.runtime`'s message: `.notFound` means "the
+/// keyboard may simply not be plugged in yet" (worth waiting and retrying,
+/// e.g. `StatusDaemon.setupHardware`), while `.multipleDevices` is a
+/// configuration problem (`--location` is required) that retrying can
+/// never resolve on its own.
+enum C100ConnectionError: Error, CustomStringConvertible {
+    case notFound
+    case multipleDevices
+
+    var description: String {
+        switch self {
+        case .notFound:
+            "Keychron C100 8K vendor HID was not found"
+        case .multipleDevices:
+            "Multiple C100 devices found; pass --location with a value from `list`"
+        }
+    }
+}
+
 struct C100Descriptor {
     let product: String
     let vendorID: Int
@@ -64,10 +85,10 @@ final class C100Connection {
             devices.filter { propertyInt($0, key: kIOHIDLocationIDKey) == wanted }
         } ?? devices
         guard let device = candidates.first else {
-            throw CLIError.runtime("Keychron C100 8K vendor HID was not found")
+            throw C100ConnectionError.notFound
         }
         if candidates.count > 1 && locationID == nil {
-            throw CLIError.runtime("Multiple C100 devices found; pass --location with a value from `list`")
+            throw C100ConnectionError.multipleDevices
         }
         let connection = C100Connection(manager: manager, device: device)
         try connection.open()

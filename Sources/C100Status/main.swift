@@ -2576,6 +2576,27 @@ enum C100StatusCLI {
             )
         }
 
+        // `C100ConnectionError` distinguishes "keyboard not plugged in yet"
+        // (StatusDaemon.waitForConnection retries this indefinitely) from a
+        // configuration problem no amount of retrying can fix (StatusDaemon
+        // rethrows this immediately, still via the fatal-error file log).
+        // Confirm the classification stays fixed rather than string-matched.
+        guard case C100ConnectionError.notFound = C100ConnectionError.notFound,
+              "\(C100ConnectionError.notFound)" == "Keychron C100 8K vendor HID was not found" else {
+            throw CLIError.runtime("C100ConnectionError.notFound self-test failed")
+        }
+        guard case C100ConnectionError.multipleDevices = C100ConnectionError.multipleDevices,
+              "\(C100ConnectionError.multipleDevices)" == "Multiple C100 devices found; pass --location with a value from `list`" else {
+            throw CLIError.runtime("C100ConnectionError.multipleDevices self-test failed")
+        }
+        func isRetryable(_ error: Error) -> Bool {
+            if case C100ConnectionError.notFound = error { return true }
+            return false
+        }
+        guard isRetryable(C100ConnectionError.notFound), !isRetryable(C100ConnectionError.multipleDevices) else {
+            throw CLIError.runtime("C100ConnectionError retry-classification self-test failed")
+        }
+
         try selfTestClaudeHooksInstaller()
         try selfTestAgentInstaller()
 

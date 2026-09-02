@@ -226,7 +226,24 @@ final class StatusDaemon {
         logger = try StatusLogger(fileURL: logURL)
     }
 
+    /// Every throwing exit from `runLoop()` -- including one that unwinds
+    /// all the way out of `setupHardware()` before the log file even has a
+    /// "daemon started" line -- otherwise leaves no trace anywhere: the
+    /// LaunchAgent's stdout/stderr are `/dev/null` (see the plist), so the
+    /// only way to know *why* the daemon exited is this file log. Log the
+    /// error here (the outermost point that still has `logger` in scope)
+    /// and rethrow unchanged so `main.swift`'s top-level catch keeps
+    /// printing/exiting exactly as before.
     func run() throws {
+        do {
+            try runLoop()
+        } catch {
+            logger.log(.error, "daemon exiting error=\(error)")
+            throw error
+        }
+    }
+
+    private func runLoop() throws {
         defer { grabberLease?.release() }
         daemonStopRequested = 0
         Darwin.signal(SIGINT, requestDaemonStop)
@@ -237,7 +254,10 @@ final class StatusDaemon {
         if dryRun {
             logger.log(.info, "HID writes and input capture are disabled")
         } else {
-            try setupHardware()
+            guard try setupHardware() else {
+                logger.log(.info, "daemon stopping signal=received_during_hid_wait")
+                return
+            }
         }
         let instanceLock = try DaemonInstanceLock(socketPath: socketPath)
         _ = instanceLock
@@ -962,8 +982,52 @@ final class StatusDaemon {
         logger.log(.info, "HID applied all_keys persistence=volatile")
     }
 
-    private func setupHardware() throws {
-        let connection = try C100Connection.connect(locationID: locationID)
+    /// Retry interval while waiting for the C100 vendor HID to appear (see
+    /// `waitForConnection`). Must stay comfortably below launchd's 10s
+    /// KeepAlive minimum runtime so a genuinely-missing keyboard doesn't
+    /// masquerade as a crash loop, while still being coarse enough not to
+    /// spin the CPU.
+    private static let hidRetryInterval: TimeInterval = 3
+
+    /// How often the "still waiting for the HID" line repeats while
+    /// retrying -- logged once immediately so the log isn't silent, then
+    /// throttled to this interval so a keyboard left unplugged for hours
+    /// doesn't fill the log with a line every 3s.
+    private static let hidWaitLogInterval: TimeInterval = 60
+
+    /// Blocks (retrying every `hidRetryInterval`) until the C100 vendor HID
+    /// is found, `locationID` resolves to more than one candidate (a
+    /// configuration problem retrying can never fix -- rethrown
+    /// immediately), or a shutdown signal arrives. Returns `nil` only in
+    /// the shutdown case so `runLoop()` can exit cleanly instead of racing
+    /// this loop.
+    private func waitForConnection() throws -> C100Connection? {
+        var lastWaitLogAt: Date?
+        while daemonStopRequested == 0 {
+            do {
+                return try C100Connection.connect(locationID: locationID)
+            } catch C100ConnectionError.notFound {
+                let now = Date()
+                if lastWaitLogAt == nil || now.timeIntervalSince(lastWaitLogAt!) >= Self.hidWaitLogInterval {
+                    logger.log(
+                        .info,
+                        "HID waiting reason=not_found location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto") retry_interval_s=\(Int(Self.hidRetryInterval))"
+                    )
+                    lastWaitLogAt = now
+                }
+                Thread.sleep(forTimeInterval: Self.hidRetryInterval)
+            }
+        }
+        return nil
+    }
+
+    /// Returns `false` only when a shutdown signal interrupted
+    /// `waitForConnection()` before a device ever appeared, telling
+    /// `runLoop()` to exit cleanly instead of proceeding without hardware.
+    private func setupHardware() throws -> Bool {
+        guard let connection = try waitForConnection() else {
+            return false
+        }
         self.connection = connection
         // A fresh connection's board state is unknown (could be a first
         // boot, or a reconnect after this daemon or another process left it
@@ -990,6 +1054,7 @@ final class StatusDaemon {
                     + "Install it once with `sudo c100-status install-helper --location \(String(format: "0x%X", actualLocation))`; error: \(error)"
             )
         }
+        return true
     }
 
     /// Retry interval after a single failed heartbeat: fast enough that a
