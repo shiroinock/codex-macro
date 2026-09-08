@@ -869,6 +869,29 @@ enum C100StatusCLI {
             throw CLIError.runtime("herdr process timeout self-test failed")
         }
 
+        // Regression test for the pipe-buffer deadlock bug: a child whose
+        // combined stdout exceeds the pipe's buffer (macOS can shrink a
+        // fresh pipe's buffer to as little as 512 bytes under fd pressure)
+        // used to block forever in write(2) because the old implementation
+        // only read stdout *after* the child exited. `herdr workspace
+        // list`'s ~1.3KB of JSON output hit exactly this, timing out every
+        // 2s sync cycle. Emit >64KB (well past any plausible pipe buffer
+        // size) and assert it comes back whole, within the timeout, instead
+        // of tripping `.timedOut`.
+        let herdrLargeOutputExpectedByteCount = 200_000
+        let herdrLargeOutputData = try HerdrProcessRunner.run(
+            binary: "/bin/sh",
+            arguments: ["-c", "head -c \(herdrLargeOutputExpectedByteCount) /dev/zero | tr '\\0' x"],
+            timeout: 2
+        )
+        guard herdrLargeOutputData.count == herdrLargeOutputExpectedByteCount,
+              herdrLargeOutputData.allSatisfy({ $0 == UInt8(ascii: "x") }) else {
+            throw CLIError.runtime(
+                "herdr large-output pipe-drain self-test failed: got \(herdrLargeOutputData.count) bytes, "
+                    + "expected \(herdrLargeOutputExpectedByteCount)"
+            )
+        }
+
         // HerdrSnapshotStore: keeps the last successful snapshot available
         // for 15s past its fetch time, then treats it as gone.
         let herdrStore = HerdrSnapshotStore()

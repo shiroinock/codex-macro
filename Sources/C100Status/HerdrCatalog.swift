@@ -28,6 +28,64 @@ enum HerdrBinaryResolver {
     }
 }
 
+/// Drains one end of a `Pipe` on a background thread while its writer
+/// (a child process's stdout/stderr) may still be running.
+///
+/// Both `HerdrProcessRunner` and `OsascriptRunner` used to wait for the
+/// child to exit (via `isRunning` polling) *before* calling
+/// `readDataToEndOfFile()`. That deadlocks whenever the child's combined
+/// stdout+stderr exceeds the pipe's buffer: macOS shrinks a newly-created
+/// pipe's buffer to as little as 512 bytes when the system-wide pipe count
+/// is high, so a child emitting a few KB (e.g. `herdr workspace list`'s
+/// ~1.3KB JSON) blocks forever in `write(2)` with nobody reading the other
+/// end, and the wall-clock timeout fires even though the child would have
+/// finished instantly. `PipeDrainer` starts reading immediately after
+/// `process.run()`, in parallel with the `isRunning` deadline poll, so the
+/// child's writes are always drained and it can actually finish.
+///
+/// `finish()` blocks until the read end sees EOF -- i.e. until every writer
+/// of the pipe's write end has closed it, which happens either when the
+/// child exits normally or after the caller calls `terminate()` on the
+/// timeout path. Callers must call `finish()` (directly or via `start()`
+/// having already run) before closing the pipe's read-end fd themselves,
+/// otherwise the drain thread's `readDataToEndOfFile()` would spin against
+/// a closed fd.
+final class PipeDrainer: @unchecked Sendable {
+    private let pipe: Pipe
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var buffer = Data()
+
+    init(pipe: Pipe) {
+        self.pipe = pipe
+    }
+
+    /// Begins draining on a background queue. Call once, immediately after
+    /// the owning process has been started.
+    func start() {
+        group.enter()
+        let handle = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = handle.readDataToEndOfFile()
+            if let self {
+                self.lock.lock()
+                self.buffer = data
+                self.lock.unlock()
+            }
+            self?.group.leave()
+        }
+    }
+
+    /// Blocks until the read end has hit EOF and returns everything read.
+    /// Safe to call more than once; subsequent calls return the same data.
+    func finish() -> Data {
+        group.wait()
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
+}
+
 /// Runs a `herdr` subcommand with a hard wall-clock timeout (herdr talks to
 /// a local unix socket, so a hang means the socket/daemon is wedged -- this
 /// must never block the daemon's 10ms HID poll loop or its background
@@ -78,7 +136,15 @@ enum HerdrProcessRunner {
             try? stdout.fileHandleForWriting.close()
             try? stderr.fileHandleForWriting.close()
         }
+        // Drain stdout/stderr concurrently with the child's execution (see
+        // `PipeDrainer`'s doc comment) -- otherwise a child whose combined
+        // output exceeds the pipe buffer deadlocks against our own
+        // isRunning-polling deadline below.
+        let stdoutDrainer = PipeDrainer(pipe: stdout)
+        let stderrDrainer = PipeDrainer(pipe: stderr)
         try process.run()
+        stdoutDrainer.start()
+        stderrDrainer.start()
 
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning, Date() < deadline {
@@ -87,15 +153,18 @@ enum HerdrProcessRunner {
         if process.isRunning {
             process.terminate()
             process.waitUntilExit()
+            // terminate() + waitUntilExit() closes the child's write ends,
+            // which is what lets the drain threads' readDataToEndOfFile()
+            // see EOF and return -- must happen before the `defer` above
+            // closes our read-end fds.
+            _ = stdoutDrainer.finish()
+            _ = stderrDrainer.finish()
             throw RunError.timedOut(command: arguments.joined(separator: " "), seconds: timeout)
         }
         process.waitUntilExit()
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        let data = stdoutDrainer.finish()
         guard process.terminationStatus == 0 else {
-            let errorText = String(
-                decoding: stderr.fileHandleForReading.readDataToEndOfFile(),
-                as: UTF8.self
-            )
+            let errorText = String(decoding: stderrDrainer.finish(), as: UTF8.self)
             throw RunError.nonZeroExit(
                 command: arguments.joined(separator: " "),
                 status: process.terminationStatus,

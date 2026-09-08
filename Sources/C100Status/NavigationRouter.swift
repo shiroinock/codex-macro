@@ -229,7 +229,14 @@ enum OsascriptRunner {
             try? stdout.fileHandleForWriting.close()
             try? stderr.fileHandleForWriting.close()
         }
+        // Drain stdout/stderr concurrently with the child's execution --
+        // see `PipeDrainer`'s doc comment in HerdrCatalog.swift for why
+        // waiting for exit before reading can deadlock.
+        let stdoutDrainer = PipeDrainer(pipe: stdout)
+        let stderrDrainer = PipeDrainer(pipe: stderr)
         try process.run()
+        stdoutDrainer.start()
+        stderrDrainer.start()
 
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning, Date() < deadline {
@@ -238,12 +245,17 @@ enum OsascriptRunner {
         if process.isRunning {
             process.terminate()
             process.waitUntilExit()
+            // terminate() + waitUntilExit() closes the child's write ends,
+            // letting the drain threads see EOF -- must happen before the
+            // `defer` above closes our read-end fds.
+            _ = stdoutDrainer.finish()
+            _ = stderrDrainer.finish()
             throw RunError.timedOut(seconds: timeout)
         }
         process.waitUntilExit()
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        let data = stdoutDrainer.finish()
         guard process.terminationStatus == 0 else {
-            let errorText = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let errorText = String(decoding: stderrDrainer.finish(), as: UTF8.self)
             throw RunError.nonZeroExit(status: process.terminationStatus, stderr: errorText)
         }
         return data
