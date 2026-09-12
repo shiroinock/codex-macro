@@ -1,5 +1,7 @@
 # Keychron C100 Codex status daemon
 
+English | [日本語](README.ja.md)
+
 A small foreground daemon and CLI that map Codex lifecycle hook events to the Keychron C100 8K's per-key RGB LEDs. Each Codex task owns one key. The daemon also suppresses the C100's normal keystrokes, reads its physical 10 by 10 switch matrix, and turns assigned key presses into Codex task navigation.
 
 This is an unofficial, experimental personal project. It is not affiliated with or endorsed by OpenAI, Keychron, or QMK. It currently targets macOS 13 or later and has been tested only with the Keychron C100 8K identified as VID `0x3434`, PID `0x042c`. Its Codex integration depends on undocumented local Codex Desktop interfaces that can change between releases.
