@@ -1,0 +1,27 @@
+const {chromium}=require('playwright');
+const assert=require('node:assert/strict');
+(async()=>{
+ const browser=await chromium.launch({headless:true,channel:'chrome'});
+ const page=await browser.newPage({viewport:{width:1200,height:1000},acceptDownloads:true});
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.route('**/transport.mjs',route=>route.fulfill({contentType:'text/javascript',body:`export async function connectUSB(){let current=new Uint8Array(262144).fill(7);return {transferSize:2048,device:{device_:{},abortToIdle:async()=>{},erase:async(a,n)=>{current=new Uint8Array(n)},dfuseCommand:async(c,a)=>{window.offset=a-0x08000000},download:async(chunk)=>{if(chunk.byteLength)current.set(new Uint8Array(chunk),window.offset);return chunk.byteLength},poll_until_idle:async()=>({state:5,status:0}),do_upload:async(x,n)=>new Blob([current.slice(0,n)]),getStatus:async()=>({status:0,state:2}),close:async()=>{}}};}`}));
+ await page.goto(process.env.C100_TEST_URL || 'http://127.0.0.1:8765');
+ await page.getByText(/SHA-256 確認済み/).waitFor();
+ assert.equal(await page.locator('#flash').isDisabled(),true);
+ await page.locator('#model').check();await page.locator('#connect').click();
+ await page.locator('#backup').click();await page.locator('#save').waitFor({state:'visible'});
+ assert.equal(await page.locator('#flash').isDisabled(),true);
+ const downloadPromise=page.waitForEvent('download');await page.locator('#save').click();const download=await downloadPromise;await download.saveAs('/private/tmp/c100-synthetic-backup.bin');
+ await page.locator('#confirmBackup').setInputFiles({name:'bad.bin',mimeType:'application/octet-stream',buffer:Buffer.alloc(262144,8)});
+ await page.getByRole('status').filter({hasText:'一致しません'}).waitFor();assert.equal(await page.locator('#flash').isDisabled(),true);
+ await page.locator('#confirmBackup').setInputFiles('/private/tmp/c100-synthetic-backup.bin');
+ await page.getByRole('status').filter({hasText:'保存内容を確認'}).waitFor();
+ await page.locator('#consent').check();await page.locator('#flash').click();
+ await page.getByRole('status').filter({hasText:'読み戻し一致'}).waitFor();assert.equal(await page.locator('#restart').isEnabled(),true);
+ await page.screenshot({path:'/private/tmp/c100-web-desktop.png',fullPage:true});
+ await page.locator('#restoreFile').setInputFiles('/private/tmp/c100-synthetic-backup.bin');await page.locator('#restoreConsent').check();await page.locator('#restore').click();await page.getByRole('status').filter({hasText:'読み戻し一致'}).waitFor();
+ await page.locator('#restart').click();await page.getByRole('status').filter({hasText:'DFU 接続を終了'}).waitFor();assert.equal(await page.locator('#flash').isDisabled(),true);
+ await page.setViewportSize({width:390,height:844});await page.screenshot({path:'/private/tmp/c100-web-mobile.png',fullPage:true});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+ assert.deepEqual(errors,[]);console.log('Browser smoke passed: backup download/reselection, mismatch gate, write/readback, restore, restart reset, mobile width, no JS errors');await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

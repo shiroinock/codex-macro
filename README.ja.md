@@ -281,3 +281,7 @@ sudo .build/release/c100-status uninstall-helper
 ## ライセンスとプロトコル資料
 
 このリポジトリの独自 Swift ソースは MIT ライセンスです。[LICENSE](LICENSE)を参照してください。相互運用性に関する注記と第三者への謝辞は [NOTICE.md](NOTICE.md) にあります。
+
+## ブラウザからファームウェアを導入する
+
+[Web Flasher（実験版）](https://shiroinock.github.io/codex-macro/) は、macOS の Chrome 向けのバックアップ・書き込み・復元サイトです。保存したバックアップの再選択と照合を必須にし、書き込み後は読み戻してから再起動します。バックアップをサーバーへ送信しません。ブラウザ経由の実機検証は未完了です。CLI による確認済みの手順は [導入・復元ガイド](firmware/FLASHING.ja.md) を参照してください。

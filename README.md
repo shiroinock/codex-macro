@@ -260,3 +260,7 @@ The original Swift source in this repository is licensed under the MIT License. 
 The settings window has three tabs. **Layout** uses an inline right panel for clicked keys, with function selection, action search, position/size controls and drag-to-move. There is no placed-parts list or assignment modal. **Actions** shows outgoing shortcuts for selected services and distinguishes imported Codex settings, bundled Claude Code-tab defaults and unsupported routes. **Services** configures enabled providers, initial display and profile/data paths.
 
 Assign one semantic action per key. Enabled services and the foreground app determine the outgoing shortcut; disabled services never receive it. Multiple keys may share an action. Claude Desktop settings import and Claude archive delivery remain unsupported. Claude CLI/herdr task tracking/navigation works, but their keyboard action routes are not implemented. See [the layout editor](docs/layout-editor.md).
+
+## Browser firmware installer
+
+The [experimental Web Flasher](https://shiroinock.github.io/codex-macro/) targets Chrome on macOS. It requires a downloaded backup to be reselected and compared before writing, verifies flash by reading it back, and supports restoring a device backup. Backups stay local. Browser-to-device validation is still pending; use the [CLI guide](firmware/FLASHING.ja.md) for the previously validated flashing path.

@@ -1,0 +1,47 @@
+name: Firmware website
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['web/**', 'firmware/companion/**', 'scripts/prepare-companion.py', 'scripts/package-web-firmware.py', '.github/workflows/pages.yml']
+permissions:
+  contents: read
+concurrency:
+  group: firmware-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test web/tests/*.test.mjs
+      - name: Build pinned QMK firmware
+        run: |
+          git clone --branch 2025q3 --single-branch https://github.com/Keychron/qmk_firmware.git "$RUNNER_TEMP/qmk"
+          git -C "$RUNNER_TEMP/qmk" checkout 9ada9b7baecb9591c469b9b068146ac5891a480a
+          git -C "$RUNNER_TEMP/qmk" submodule update --init lib/chibios lib/chibios-contrib lib/printf lib/lufa
+          python3 scripts/prepare-companion.py "$RUNNER_TEMP/qmk"
+          docker run --rm --network none -e SKIP_GIT=yes -e QMK_USERSPACE= -v "$RUNNER_TEMP/qmk:/qmk_firmware" -w /qmk_firmware ghcr.io/qmk/qmk_cli@sha256:b7d7fa8fb4432b569931de5ad59098cb788f440ed61a62c5126746b71aee0f4a make keychron/c100_8k:companion -j4
+      - name: Stage firmware and corresponding source
+        run: |
+          python3 scripts/package-web-firmware.py "$RUNNER_TEMP/qmk/keychron_c100_8k_companion.bin" web
+          tar --exclude=.git --exclude=.build --exclude='*.bin' --exclude='*.hex' -czf web/firmware/qmk-source.tar.gz -C "$RUNNER_TEMP/qmk" .
+          cp LICENSE web/LICENSE.host
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

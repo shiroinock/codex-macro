@@ -2,3 +2,5 @@
 .swiftpm/
 .DS_Store
 firmware/build/
+web/firmware/
+web/LICENSE.host
