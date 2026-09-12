@@ -63,12 +63,17 @@ enum AgentInstaller {
 
     // MARK: - plist generation
 
-    static func plist(label: String, binaryPath: String, locationID: Int?) -> String {
+    static func plist(label: String, binaryPath: String, locationID: Int?, companion: Bool = false, additionalArguments: [String] = [], environment: [String: String] = [:]) -> String {
         var argumentStrings = [binaryPath, "run"]
+        if companion { argumentStrings.append("--companion") }
         if let locationID {
             argumentStrings.append("--location")
             argumentStrings.append("0x\(String(locationID, radix: 16))")
         }
+        argumentStrings += additionalArguments
+        let environmentXML = environment.isEmpty ? "" : "<key>EnvironmentVariables</key><dict>" + environment.keys.sorted().map {
+            "<key>\(xmlEscape($0))</key><string>\(xmlEscape(environment[$0]!))</string>"
+        }.joined() + "</dict>"
         let argumentsXML = argumentStrings
             .map { "    <string>\(xmlEscape($0))</string>" }
             .joined(separator: "\n")
@@ -83,6 +88,7 @@ enum AgentInstaller {
           <array>
         \(argumentsXML)
           </array>
+          \(environmentXML)
           <key>RunAtLoad</key>
           <true/>
           <key>KeepAlive</key>
@@ -155,6 +161,9 @@ enum AgentInstaller {
         locationID: Int?,
         dryRun: Bool,
         uninstall: Bool,
+        companion: Bool = false,
+        additionalArguments: [String] = [],
+        environment: [String: String] = [:],
         homeDirectory: String = NSHomeDirectory(),
         uid: uid_t = getuid(),
         launchctl: LaunchctlRunner = defaultLaunchctlRunner
@@ -194,7 +203,7 @@ enum AgentInstaller {
         }
 
         try validateBinaryPath(binaryPath)
-        let newContents = plist(label: label, binaryPath: binaryPath, locationID: locationID)
+        let newContents = plist(label: label, binaryPath: binaryPath, locationID: locationID, companion: companion, additionalArguments: additionalArguments, environment: environment)
         let newParsed = parsedPlist(newContents)
 
         let existingContents = FileManager.default.fileExists(atPath: path)

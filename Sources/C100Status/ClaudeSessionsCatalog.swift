@@ -1,31 +1,18 @@
 import Darwin
 import Foundation
 
-/// The three Claude profile directories hook payloads and `sessions/*.json`
-/// files live under (`c100-status`'s own confirmed environment facts --
-/// see the implementation plan). `--claude-config-dirs` (main.swift) can add
-/// further directories on top of this default set.
+/// Explicit profile lists replace the generic default; discovery and hook
+/// installation share this policy. Environment resolution lives in Configuration.
 enum ClaudeConfigDirs {
     static func defaults(homeDirectory: String = NSHomeDirectory()) -> [String] {
-        [
-            homeDirectory + "/.claude",
-            homeDirectory + "/.claude-config/max",
-            homeDirectory + "/.claude-config/enterprise",
-        ]
+        [homeDirectory + "/.claude"]
     }
 
-    /// Merges the default three directories with any `--claude-config-dirs`
-    /// additions, de-duplicating (a directory passed on the command line that
-    /// happens to already be a default is not scanned twice).
     static func resolved(additional: [String], homeDirectory: String = NSHomeDirectory()) -> [String] {
         var seen = Set<String>()
-        var result: [String] = []
-        for dir in defaults(homeDirectory: homeDirectory) + additional {
-            let normalized = URL(fileURLWithPath: dir).standardizedFileURL.path
-            guard seen.insert(normalized).inserted else { continue }
-            result.append(normalized)
-        }
-        return result
+        return (additional.isEmpty ? defaults(homeDirectory: homeDirectory) : additional).map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        }.filter { seen.insert($0).inserted }
     }
 }
 

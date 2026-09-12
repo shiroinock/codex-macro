@@ -12,6 +12,10 @@ final class StatusDaemon {
     private let locationID: Int?
     private let grabberSocketPath: String
     private let dryRun: Bool
+    private let companion: Bool
+    private let codexPaths: CodexPaths
+    private let defaultLayer: SessionSourceKind
+    private let claudeDesktopConfigDir: String
     private let logger: StatusLogger
     private let stateStore = StateStore()
     private var connection: C100Connection?
@@ -94,11 +98,12 @@ final class StatusDaemon {
     private let claudeDesktopDir: String
     private lazy var claudeDesktopCatalog = ClaudeDesktopCatalog(
         desktopSessionsDir: claudeDesktopDir,
+        configDir: claudeDesktopConfigDir,
         isHookRegistered: { [weak self] sessionID in self?.claudeSessions[sessionID]?.sourceKind == .claudeDesktop },
         log: { [weak self] level, message in self?.logger.log(level, message) }
     )
     private lazy var providers: [SessionSourceProvider] = [
-        CodexSourceProvider(), herdrCatalog, claudeSessionsCatalog, claudeDesktopCatalog,
+        CodexSourceProvider(paths: codexPaths), herdrCatalog, claudeSessionsCatalog, claudeDesktopCatalog,
     ]
     /// Claude is hook-authoritative (M1): the daemon itself remembers every
     /// session a Claude hook has told it about -- cwd/source for
@@ -207,9 +212,13 @@ final class StatusDaemon {
         locationID: Int?,
         grabberSocketPath: String,
         dryRun: Bool,
+        companion: Bool = false,
         herdrBinaryPath: String? = nil,
         claudeConfigDirs: [String]? = nil,
-        claudeDesktopDir: String? = nil
+        claudeDesktopDir: String? = nil,
+        claudeDesktopConfigDir: String? = nil,
+        codexPaths: CodexPaths = CodexPaths(),
+        defaultLayer: SessionSourceKind = .codex
     ) throws {
         guard geteuid() != 0 else {
             throw CLIError.runtime(
@@ -220,6 +229,10 @@ final class StatusDaemon {
         self.locationID = locationID
         self.grabberSocketPath = grabberSocketPath
         self.dryRun = dryRun
+        self.companion = companion
+        self.codexPaths = codexPaths
+        self.defaultLayer = defaultLayer
+        self.claudeDesktopConfigDir = claudeDesktopConfigDir ?? NSHomeDirectory() + "/.claude"
         self.herdrBinaryPath = herdrBinaryPath
         self.claudeConfigDirs = claudeConfigDirs ?? ClaudeConfigDirs.resolved(additional: [])
         self.claudeDesktopDir = claudeDesktopDir ?? ClaudeDesktopCatalog.defaultSessionsDir()
@@ -244,12 +257,14 @@ final class StatusDaemon {
     }
 
     private func runLoop() throws {
-        defer { grabberLease?.release() }
+        defer { connection?.stopCompanion(); grabberLease?.release() }
         daemonStopRequested = 0
         Darwin.signal(SIGINT, requestDaemonStop)
         Darwin.signal(SIGTERM, requestDaemonStop)
         Darwin.signal(SIGPIPE, SIG_IGN)
 
+        let instanceLock = try DaemonInstanceLock(socketPath: socketPath)
+        _ = instanceLock
         logger.log(.info, "daemon initializing pid=\(getpid()) dry_run=\(dryRun) euid=\(geteuid())")
         if dryRun {
             logger.log(.info, "HID writes and input capture are disabled")
@@ -259,11 +274,9 @@ final class StatusDaemon {
                 return
             }
         }
-        let instanceLock = try DaemonInstanceLock(socketPath: socketPath)
-        _ = instanceLock
         try stateStore.clear()
         try stateStore.discardLegacyEndedSessions()
-        activeLayer = layerStore.load()
+        activeLayer = layerStore.load(defaultLayer: defaultLayer)
         logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
         // Bug fix (M5.1): force a fresh repack of every layer on this first
@@ -400,7 +413,7 @@ final class StatusDaemon {
         }
         deferredHooks.remove(sessionID: hook.sessionID)
         if hook.requestsPermission {
-            switch CodexApprovalRouting.displayRoute(for: hook) {
+            switch CodexApprovalRouting.displayRoute(for: hook, paths: codexPaths) {
             case let .user(reason):
                 pendingApprovals.record(hook)
                 logger.log(
@@ -498,7 +511,7 @@ final class StatusDaemon {
             cwd: hook.projectKey,
             herdrWorkspaceID: hook.herdrWorkspaceID,
             navigation: claudeNavigationTarget(for: hook),
-            configDir: hook.configDir ?? (NSHomeDirectory() + "/.claude"),
+            configDir: hook.configDir ?? (hook.effectiveSource == .claudeDesktop ? claudeDesktopConfigDir : (claudeConfigDirs.first ?? NSHomeDirectory() + "/.claude")),
             lastSeen: Date(),
             rawStatus: previousRawStatus
         )
@@ -751,7 +764,7 @@ final class StatusDaemon {
             return
         }
         if connection == nil {
-            connection = try C100Connection.connect(locationID: locationID)
+            connection = try C100Connection.connect(locationID: locationID, companion: companion)
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             lastPaintedFrame = nil
         }
@@ -943,7 +956,7 @@ final class StatusDaemon {
             return
         }
         if connection == nil {
-            connection = try C100Connection.connect(locationID: locationID)
+            connection = try C100Connection.connect(locationID: locationID, companion: companion)
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             // Freshly (re)connected: the board's real state is unknown, so
             // the next `reconcileLEDs()` must fall back to a full frame
@@ -1005,7 +1018,7 @@ final class StatusDaemon {
         var lastWaitLogAt: Date?
         while daemonStopRequested == 0 {
             do {
-                return try C100Connection.connect(locationID: locationID)
+                return try C100Connection.connect(locationID: locationID, companion: companion)
             } catch C100ConnectionError.notFound {
                 let now = Date()
                 if lastWaitLogAt == nil || now.timeIntervalSince(lastWaitLogAt!) >= Self.hidWaitLogInterval {
@@ -1037,6 +1050,11 @@ final class StatusDaemon {
         let actualLocation = connection.locationID
         logger.log(.info, "HID connected location=\(String(format: "0x%X", actualLocation))")
 
+        if companion {
+            pressedKeyIndexes = try connection.drainCompanionStates().last ?? []
+            logger.log(.info, "input capture=firmware transport=companion normal_keystrokes=suppressed matrix_polling=disabled")
+            return true
+        }
         protocolVersion = try connection.protocolVersion()
         pressedKeyIndexes = try connection.pressedKeyIndexes(protocolVersion: protocolVersion)
         logger.log(.info, "matrix polling=enabled protocol=\(protocolVersion) layout=10x10 interval_ms=10")
@@ -1128,11 +1146,13 @@ final class StatusDaemon {
         guard let connection else {
             throw CLIError.runtime("C100 vendor HID connection is unavailable during matrix polling")
         }
-        let current = try connection.pressedKeyIndexes(protocolVersion: protocolVersion)
-        let newlyPressed = current.subtracting(pressedKeyIndexes)
-        pressedKeyIndexes = current
-        for keyIndex in newlyPressed.sorted() {
-            handleKeyPress(keyIndex: keyIndex)
+        let states = companion ? try connection.drainCompanionStates() : [try connection.pressedKeyIndexes(protocolVersion: protocolVersion)]
+        for current in states {
+            let newlyPressed = current.subtracting(pressedKeyIndexes)
+            pressedKeyIndexes = current
+            for keyIndex in newlyPressed.sorted() {
+                handleKeyPress(keyIndex: keyIndex)
+            }
         }
     }
 
@@ -1264,7 +1284,7 @@ final class StatusDaemon {
             // through the generic AgentSession abstraction, since they need
             // Codex-only fields (rollout paths, createdAt) that the unified
             // model does not carry.
-            let codexLayout = try CodexCatalog.layout()
+            let codexLayout = try CodexCatalog.layout(paths: codexPaths)
             let catalogSessions = codexLayout.placements.map(\.session)
             let nextCatalogSessionIDs = Set(catalogSessions.map(\.sessionID))
             catalogProjectBySession = Dictionary(
@@ -1521,7 +1541,7 @@ final class StatusDaemon {
             for entry in deferredDrain.promoted {
                 var promotedStatus = entry.status
                 if entry.hook.requestsPermission {
-                    switch CodexApprovalRouting.displayRoute(for: entry.hook) {
+                    switch CodexApprovalRouting.displayRoute(for: entry.hook, paths: codexPaths) {
                     case let .user(reason):
                         pendingApprovals.record(entry.hook)
                         logger.log(
@@ -1551,7 +1571,7 @@ final class StatusDaemon {
                 )
             }
             var interruptionChanged = false
-            let interruptedSessionIDs = turnMonitor.interruptedSessionIDs(in: sessions)
+            let interruptedSessionIDs = turnMonitor.interruptedSessionIDs(in: sessions, paths: codexPaths)
             let assignments = Dictionary(
                 uniqueKeysWithValues: try stateStore.assignments().map { ($0.sessionID, $0.slot) }
             )
@@ -1745,7 +1765,7 @@ final class StatusDaemon {
         guard hook.effectiveSource == .codex else { return hook.projectKey }
         return catalogProjectBySession[hook.sessionID]
             ?? catalogProjectByCWD[hook.projectKey]
-            ?? CodexCatalog.projectKey(sessionID: hook.sessionID)
+            ?? CodexCatalog.projectKey(sessionID: hook.sessionID, paths: codexPaths)
     }
 
     private func shortSession(_ sessionID: String) -> String {

@@ -18,14 +18,15 @@ final class CodexTurnMonitor {
 
     func interruptedSessionIDs(
         in sessions: [CatalogSession],
-        homeDirectory: String = NSHomeDirectory()
+        homeDirectory: String = NSHomeDirectory(),
+        paths: CodexPaths? = nil
     ) -> Set<String> {
         let activeSessionIDs = Set(sessions.map(\.sessionID))
         cursors = cursors.filter { activeSessionIDs.contains($0.key) }
 
         var interrupted: Set<String> = []
         for session in sessions {
-            guard let url = rolloutURL(for: session, homeDirectory: homeDirectory),
+            guard let url = rolloutURL(for: session, paths: paths ?? CodexPaths(homeDirectory: homeDirectory)),
                   let fileSize = fileSize(at: url) else { continue }
 
             var cursor: Cursor
@@ -93,7 +94,7 @@ final class CodexTurnMonitor {
         return signal
     }
 
-    private func rolloutURL(for session: CatalogSession, homeDirectory: String) -> URL? {
+    private func rolloutURL(for session: CatalogSession, paths: CodexPaths) -> URL? {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let components = calendar.dateComponents(
@@ -104,7 +105,7 @@ final class CodexTurnMonitor {
               let month = components.month,
               let day = components.day else { return nil }
 
-        let codexHome = URL(fileURLWithPath: homeDirectory).appendingPathComponent(".codex")
+        let codexHome = URL(fileURLWithPath: paths.home)
         let directory = codexHome
             .appendingPathComponent("sessions")
             .appendingPathComponent(String(format: "%04d", year))

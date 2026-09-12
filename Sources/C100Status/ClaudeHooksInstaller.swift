@@ -54,26 +54,9 @@ enum ClaudeHooksInstaller {
 
     // MARK: - Default config dirs
 
-    /// `~/.claude`, `~/.claude-config/max`, `~/.claude-config/enterprise`
-    /// (matching `ClaudeConfigDirs.defaults`) plus any other immediate
-    /// subdirectory of `~/.claude-config` (a "glob" over future profiles
-    /// beyond max/enterprise), deduplicated. Directories that don't exist
-    /// are still returned -- `run` reports them as `skipped` rather than
-    /// silently omitting them, so the summary always accounts for the full
-    /// default set.
+    /// Standard single-profile default; the CLI supplies configured profiles.
     static func defaultInstallConfigDirs(homeDirectory: String = NSHomeDirectory()) -> [String] {
-        var dirs = ClaudeConfigDirs.defaults(homeDirectory: homeDirectory)
-        let profilesRoot = homeDirectory + "/.claude-config"
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: profilesRoot) {
-            for entry in entries.sorted() {
-                let full = profilesRoot + "/" + entry
-                var isDirectory: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: full, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
-                dirs.append(full)
-            }
-        }
-        var seen = Set<String>()
-        return dirs.filter { seen.insert(URL(fileURLWithPath: $0).standardizedFileURL.path).inserted }
+        ClaudeConfigDirs.defaults(homeDirectory: homeDirectory)
     }
 
     // MARK: - Desired hook shape
@@ -98,8 +81,16 @@ enum ClaudeHooksInstaller {
     /// `binaryPath`, mirroring `hooks.claude.example.json` exactly (event
     /// list, matchers, timeouts, async flags -- including `SessionEnd`'s
     /// lack of an `async` key).
-    static func desiredHooks(binaryPath: String) -> [String: [[String: Any]]] {
-        let base = "\(binaryPath) hook --source claude"
+    static func shellQuote(_ value: String) -> String {
+        if value.range(of: "^[A-Za-z0-9_./:-]+$", options: .regularExpression) != nil { return value }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    static func desiredHooks(binaryPath: String, configPath: String? = nil, socketPath: String? = nil, profileDir: String? = nil) -> [String: [[String: Any]]] {
+        var base = "\(shellQuote(binaryPath)) hook --source claude"
+        if let configPath { base += " --config " + shellQuote(configPath) }
+        if let socketPath { base += " --socket " + shellQuote(socketPath) }
+        if let profileDir { base += " --hook-profile-dir " + shellQuote(profileDir) }
         let standard = hookCommand(base, timeout: 3, async: true)
         let sessionEnd = hookCommand(base, timeout: 1, async: nil)
         func notification(_ matcher: String) -> [String: Any] {
@@ -205,10 +196,10 @@ enum ClaudeHooksInstaller {
     /// across every directory in `configDirs`. `dryRun` computes and reports
     /// what would change without touching disk. Returns one `FileResult` per
     /// config dir, in the same order as `configDirs`.
-    static func run(configDirs: [String], binaryPath: String, dryRun: Bool, uninstall: Bool) -> [FileResult] {
-        let desired = desiredHooks(binaryPath: binaryPath)
+    static func run(configDirs: [String], binaryPath: String, dryRun: Bool, uninstall: Bool, configPath: String? = nil, socketPath: String? = nil) -> [FileResult] {
         var results: [FileResult] = []
         for configDir in configDirs {
+            let desired = desiredHooks(binaryPath: binaryPath, configPath: configPath, socketPath: socketPath, profileDir: configDir)
             let settingsPath = (configDir as NSString).appendingPathComponent("settings.json")
             guard FileManager.default.fileExists(atPath: settingsPath) else {
                 results.append(FileResult(configDir: configDir, settingsPath: settingsPath, status: .skipped, message: "settings.json not found (WARN: not created automatically)"))

@@ -17,7 +17,8 @@ enum CodexApprovalRouting {
 
     static func displayRoute(
         for hook: HookInput,
-        homeDirectory: String = NSHomeDirectory()
+        homeDirectory: String = NSHomeDirectory(),
+        paths: CodexPaths? = nil
     ) -> CodexPermissionDisplayRoute {
         if hook.directlyRequestsUserPermission {
             return .user(reason: "request_permissions")
@@ -25,7 +26,7 @@ enum CodexApprovalRouting {
 
         let reviewer = approvalsReviewer(
             sessionID: hook.sessionID,
-            homeDirectory: homeDirectory
+            paths: paths ?? CodexPaths(homeDirectory: homeDirectory)
         )
         if reviewer == .user {
             return .user(reason: "reviewer_user")
@@ -64,11 +65,9 @@ enum CodexApprovalRouting {
 
     private static func approvalsReviewer(
         sessionID: String,
-        homeDirectory: String
+        paths: CodexPaths
     ) -> CodexApprovalsReviewer? {
-        let databasePath = URL(fileURLWithPath: homeDirectory)
-            .appendingPathComponent(".codex/state_5.sqlite")
-            .path
+        let databasePath = paths.stateDatabase
         guard let rolloutPath = rolloutPath(
             sessionID: sessionID,
             databasePath: databasePath

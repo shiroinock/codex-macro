@@ -9,8 +9,7 @@ import Foundation
 /// complement**, not the source of truth for status: `Daemon` registers and
 /// updates a Desktop session's status from `c100-status hook --source
 /// claude` events (Desktop's Claude Code runs with `CLAUDE_CODE_ENTRYPOINT
-/// =claude-desktop`, no `CLAUDE_CONFIG_DIR` override, so it shares `~/.claude`
-/// with a plain-terminal `claude` -- see `HookEnvironment` in `main.swift`).
+/// =claude-desktop`; its transcript root is independently configurable).
 /// `snapshot()` exists purely to (a) seed already-open Desktop sessions the
 /// daemon missed (e.g. it was restarted mid-session) and (b) let `Daemon`
 /// detect a Desktop session that's gone away (archived, aged out, or the app
@@ -43,9 +42,7 @@ final class ClaudeDesktopCatalog: SessionSourceProvider {
     static let desktopBundleIdentifier = "com.anthropic.claudefordesktop"
 
     private let desktopSessionsDir: String
-    /// Fixed per the investigated environment facts: Desktop's Claude Code
-    /// never sets `CLAUDE_CONFIG_DIR`, so its transcripts always live under
-    /// the plain `~/.claude`, regardless of `--claude-config-dirs`.
+    /// Desktop's transcript root can be independent of terminal profiles.
     private let claudeConfigDir: String
     private let staleAfter: TimeInterval
     private let fileManager: FileManager
@@ -62,6 +59,7 @@ final class ClaudeDesktopCatalog: SessionSourceProvider {
     init(
         desktopSessionsDir: String,
         homeDirectory: String = NSHomeDirectory(),
+        configDir: String? = nil,
         staleAfter: TimeInterval = ClaudeDesktopCatalog.defaultStaleAfter,
         fileManager: FileManager = .default,
         isDesktopRunning: @escaping () -> Bool = ClaudeDesktopCatalog.defaultIsDesktopRunning,
@@ -70,7 +68,7 @@ final class ClaudeDesktopCatalog: SessionSourceProvider {
         log: @escaping (StatusLogger.Level, String) -> Void = { _, _ in }
     ) {
         self.desktopSessionsDir = desktopSessionsDir
-        claudeConfigDir = homeDirectory + "/.claude"
+        claudeConfigDir = configDir ?? homeDirectory + "/.claude"
         self.staleAfter = staleAfter
         self.fileManager = fileManager
         self.isDesktopRunning = isDesktopRunning

@@ -4,6 +4,18 @@ A small foreground daemon and CLI that map Codex lifecycle hook events to the Ke
 
 This is an unofficial, experimental personal project. It is not affiliated with or endorsed by OpenAI, Keychron, or QMK. It currently targets macOS 13 or later and has been tested only with the Keychron C100 8K identified as VID `0x3434`, PID `0x042c`. Its Codex integration depends on undocumented local Codex Desktop interfaces that can change between releases.
 
+## Configuration
+
+Machine-specific paths and device settings live in `~/.config/c100-status/config.json` (or `$XDG_CONFIG_HOME/c100-status/config.json`).
+
+```sh
+c100-status config init                 # create a portable starting point; never overwrite
+c100-status config show                 # show resolved settings
+c100-status install-agent --config ~/.config/c100-status/config.json
+```
+
+Edit the file before installing/restarting the agent. Set `backend` to `companion` for a C100 already running the companion firmware. Use `claudeConfigDirs` for your own profile directories; the list replaces defaults. See [the example](config.example.json) and [configuration reference](docs/configuration.md) for all keys, precedence, and migration.
+
 ## Safety properties
 
 - Matches only Keychron VID `0x3434`, PID `0x042c`, and the selected physical `locationID`.
@@ -18,6 +30,16 @@ This is an unofficial, experimental personal project. It is not affiliated with 
 - Codex hooks are best-effort: a stopped daemon never blocks the Codex agentic loop.
 - The Unix socket and runtime files are user-only and live under `/tmp` by default.
 - Close Keychron Launcher before writing, because both clients may compete for the same vendor HID interface.
+
+## Experimental companion firmware
+
+A new opt-in `run --companion` backend uses a dedicated C100 firmware: key
+changes arrive as Raw HID events, normal keyboard output is suppressed in the
+firmware, and each LED's HSV brightness/black is rendered directly. This backend
+uses no privileged grabber. The stock firmware workflow below remains the default.
+See [firmware build, protocol, and validation instructions](firmware/README.md).
+[Physical validation](firmware/VALIDATION.md) covers all 100 keys, LED brightness
+and blackout, watchdog expiry, layer switching, and task navigation on one Mac.
 
 ## Build
 
@@ -77,7 +99,7 @@ If the plist itself needs to change (moved the build to a new absolute path, cha
 
 The local daemon protocol is newline-framed. A client that connects but does not finish a request is disconnected after 500 ms, so it cannot block HID polling or helper lease renewal. If any other synchronous operation stalls the main loop for at least 750 ms, the daemon logs `daemon loop delayed duration_ms=...` after it recovers.
 
-At startup, the daemon turns all 100 LEDs off, then imports existing local Codex tasks from the read-only Codex task catalog. User-created Codex forks are supplemented from the local Codex state database because they are not exposed in that catalog; internal subagent sessions remain excluded. Imported tasks begin dim white. The catalog is refreshed periodically so a task can be assigned before its first lifecycle hook arrives. Catalog entries that disappear are released. `SessionEnd` only returns a still-cataloged task to dim white because Codex also emits it while unloading task history during app shutdown or restart.
+At startup, the daemon turns all 100 LEDs off, then imports existing local Codex tasks from the read-only Codex task catalog. User-created Codex forks are supplemented from the local Codex state database because they are not exposed in that catalog; internal subagent sessions remain excluded. Imported tasks begin white. The catalog is refreshed periodically so a task can be assigned before its first lifecycle hook arrives. Catalog entries that disappear are released. `SessionEnd` only returns a still-cataloged task to white because Codex also emits it while unloading task history during app shutdown or restart.
 
 The C100 firmware ignores the per-key HSV value component in its solid per-key renderer, so sending black does not turn off one key. The daemon therefore uses the volatile mixed-RGB mode: assigned keys belong to a region rendered by the per-key effect, while unassigned keys belong to a region with no effect. No firmware or EEPROM write is required.
 
@@ -128,12 +150,12 @@ The mapping is:
 
 | Codex event | LED state |
 | --- | --- |
-| `SessionStart` | dim white (`idle`) |
+| `SessionStart` | white (`idle`) |
 | `UserPromptSubmit`, `PostToolUse` | blue (`working`) |
 | `PermissionRequest` | amber (`approval`) after a 500 ms debounce only when routed to the user |
 | `PreToolUse` | blue (`working`); cancels a pending approval display |
 | `Stop` | green (`done`) |
-| `SessionEnd` | dim white (`idle`) while the task remains cataloged |
+| `SessionEnd` | white (`idle`) while the task remains cataloged |
 
 Each hook invocation is a short-lived sender. The foreground daemon maps projects to rows and tasks inside each project to columns. Thus `keyIndex = projectRow * 10 + sessionColumn`. Project rows follow Codex app's saved `project-order`, including empty project rows. Tasks follow the app's pinned/explicit sidebar order, then its recency order. Tasks without a saved project are grouped into one final `projectless` row instead of receiving one row per working directory. The 10 by 10 grid supports up to 10 rows and 10 tasks per row.
 
@@ -141,13 +163,13 @@ The daemon rereads the Codex catalog and sidebar state every two seconds. Adding
 
 Lifecycle hooks whose `session_id` is not yet present in the Codex app task catalog are held in memory for up to six seconds instead of receiving a key immediately. If the task appears during that window, its latest status is applied after catalog placement; otherwise the event is dropped as an internal or non-app execution session. This prevents executor-scoped `PostToolUse` events from repeatedly creating and releasing phantom keys. Hook diagnostic metadata (`turn_id`, `agent_id`, and `agent_type`) is included in the daemon log when Codex supplies it.
 
-An assigned session at rest is dim white (`idle`). Active status events temporarily replace that baseline with blue, amber, green, or red according to the table above. `SessionEnd` returns the task to dim white. Its key is turned off and released only after the task disappears from the Codex app task catalog.
+An assigned session at rest is white (`idle`, HSV value 96/255). Active status events temporarily replace that baseline with blue, amber, green, or red according to the table above. `SessionEnd` returns the task to white. Its key is turned off and released only after the task disappears from the Codex app task catalog.
 
 `PermissionRequest` runs before Codex chooses between automatic review and a user-facing approval, so the hook event alone is not an approval-wait signal. The daemon reads the hook's `tool_name` and the task rollout's current `approvals_reviewer`: explicit `request_permissions` calls and tasks using the `user` reviewer become amber after 500 ms, while `auto_review`/`guardian_subagent` requests remain blue. If the reviewer cannot be resolved, the daemon also remains blue to avoid a false user-wait indication. A later lifecycle event resolves any pending amber state.
 
-Pressing a green (`done`) session key acknowledges the completed state after Codex navigation succeeds and returns that key to dim white (`idle`). Other active status colors are left unchanged.
+Pressing a green (`done`) session key acknowledges the completed state after Codex navigation succeeds and returns that key to white (`idle`). Other active status colors are left unchanged.
 
-Codex does not emit the `Stop` hook when an active turn is interrupted with Esc. The daemon therefore tails the local Codex rollout for each assigned task during its two-second catalog refresh. A new `turn_aborted` event returns only that interrupted task from blue or amber to dim white.
+Codex does not emit the `Stop` hook when an active turn is interrupted with Esc. The daemon therefore tails the local Codex rollout for each assigned task during its two-second catalog refresh. A new `turn_aborted` event returns only that interrupted task from blue or amber to white.
 
 Project identity uses Codex's local task-to-project assignment, so each worktree shares a row with its saved Codex project without merging separately saved projects that happen to use the same Git origin. Tasks without a project assignment fall back to their exact normalized working-directory path. The 10 most recently active projects and up to 10 most recent tasks per project fit on the physical grid.
 
@@ -159,15 +181,11 @@ Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Cod
 
 The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). herdr, plain-terminal (Ghostty), and Claude Desktop Claude Code sessions are all implemented.
 
-A session with at least one subagent running stays blue (`working`) even while its main thread is idle waiting on that subagent -- e.g. the main agent has already handed a turn off to a subagent and gone quiet, which would otherwise `Stop`/`idle_prompt` the key to green/dim white while real work is still happening. This is driven by the `SubagentStart`/`SubagentStop` hooks: the daemon counts a session's currently-running subagents and, whenever that count is above zero, overrides whatever status the session's own hooks would otherwise show; the override is lifted, falling back to that underlying status, once the last tracked subagent stops. A subagent whose matching `SubagentStop` never arrives (crashed process, dropped async hook) doesn't pin the key at working forever: the count is force-cleared after 2 hours, or sooner if the session's on-disk `subagents/agent-*.jsonl` transcripts have all gone untouched for 30 minutes.
+A session with at least one subagent running stays blue (`working`) even while its main thread is idle waiting on that subagent -- e.g. the main agent has already handed a turn off to a subagent and gone quiet, which would otherwise `Stop`/`idle_prompt` the key to green/white while real work is still happening. This is driven by the `SubagentStart`/`SubagentStop` hooks: the daemon counts a session's currently-running subagents and, whenever that count is above zero, overrides whatever status the session's own hooks would otherwise show; the override is lifted, falling back to that underlying status, once the last tracked subagent stops. A subagent whose matching `SubagentStop` never arrives (crashed process, dropped async hook) doesn't pin the key at working forever: the count is force-cleared after 2 hours, or sooner if the session's on-disk `subagents/agent-*.jsonl` transcripts have all gone untouched for 30 minutes.
 
 ### Installing the Claude Code hooks
 
-Claude Code reads hooks from `settings.json` in one of three config directories, depending on how it's launched:
-
-- `~/.claude` (plain terminal and Claude Desktop)
-- `~/.claude-config/max`
-- `~/.claude-config/enterprise`
+Claude Code reads hooks from `settings.json` in each configured profile directory (`claudeConfigDirs`). The default is `$CLAUDE_CONFIG_DIR`, falling back to `~/.claude`.
 
 The easiest way to install them is `c100-status install-claude-hooks`:
 
@@ -176,7 +194,7 @@ c100-status install-claude-hooks --dry-run   # preview what would change
 c100-status install-claude-hooks             # write it for real
 ```
 
-By default this targets `~/.claude`, `~/.claude-config/max`, `~/.claude-config/enterprise`, and any other subdirectory of `~/.claude-config` that exists; pass one or more `--config-dir PATH` to install into a different set instead, and `--binary PATH` to point at a specific executable instead of auto-detecting this one's absolute path. It's idempotent -- re-running it after a rebuild (to pick up a new absolute path) or with no changes at all is always safe, and it only ever adds/replaces the `c100-status`-owned entries: any other hooks already in `settings.json` (see herdr below) are left completely alone. Before writing, the current `settings.json` is copied to `settings.json.c100-backup-<epoch-ms>` alongside it. Run with `--uninstall` to remove only the `c100-status` entries again. A config directory with no `settings.json` is skipped (a warning is printed, nothing is created); a `settings.json` that fails to parse is left untouched and reported as an error rather than risking data loss. Claude Code still requires reviewing and trusting non-managed hooks before they run.
+This targets exactly the configured `claudeConfigDirs`; pass one or more `--config-dir PATH` to install into a different set instead, and `--binary PATH` to point at a specific executable instead of auto-detecting this one's absolute path. It's idempotent -- re-running it after a rebuild (to pick up a new absolute path) or with no changes at all is always safe, and it only ever adds/replaces the `c100-status`-owned entries: any other hooks already in `settings.json` (see herdr below) are left completely alone. Before writing, the current `settings.json` is copied to `settings.json.c100-backup-<epoch-ms>` alongside it. Run with `--uninstall` to remove only the `c100-status` entries again. A config directory with no `settings.json` is skipped (a warning is printed, nothing is created); a `settings.json` that fails to parse is left untouched and reported as an error rather than risking data loss. Claude Code still requires reviewing and trusting non-managed hooks before they run.
 
 If you'd rather do it by hand, merge the contents of `hooks.claude.example.json` into a config directory's `settings.json` yourself, replacing `/ABSOLUTE/PATH/TO/c100-status` with the release executable's absolute path.
 
@@ -196,14 +214,14 @@ Pressing an assigned herdr session's key runs `herdr agent focus <pane_id>` (200
 
 ### Locating the herdr binary
 
-The daemon resolves `herdr` in this order: `--herdr-bin PATH` (on `run`) > `HERDR_BIN` environment variable > `/opt/homebrew/bin/herdr` > `/usr/local/bin/herdr` > `~/.cargo/bin/herdr`. If none resolve to an executable, herdr support is silently disabled (a single INFO log line at startup) and the daemon otherwise behaves exactly as it did before M2.
+The daemon resolves `herdr` in this order: `--herdr-bin PATH` > configuration `herdrBinary` > `HERDR_BIN` environment variable > absolute directories in `PATH` > `/opt/homebrew/bin/herdr` > `/usr/local/bin/herdr` > `~/.cargo/bin/herdr`. If none resolve to an executable, herdr support is silently disabled (a single INFO log line at startup) and the daemon otherwise behaves exactly as it did before M2.
 
 ### How plain-terminal (Ghostty) Claude Code sessions work
 
 A `claude` process launched directly in a terminal -- no herdr, no Claude Desktop -- is tracked two ways at once:
 
 - **Hooks are authoritative for status.** The same `c100-status hook --source claude` entries used for herdr (see "Installing the Claude Code hooks" above) register/update the session and drive its idle/working/approval/done state.
-- **`sessions/<pid>.json` is authoritative for placement.** Claude Code writes one small JSON file per running process under `<configDir>/sessions/<pid>.json` (fields used: `pid`, `sessionId`, `cwd`; other fields such as `version`, `peerFeatures`, `messagingSocketPath` are ignored). Every sync (2s cadence), the daemon scans this file across all three config directories (`~/.claude`, `~/.claude-config/max`, `~/.claude-config/enterprise`, plus anything passed via `--claude-config-dirs`), confirms the `pid` in the filename is still alive (`kill(pid, 0)`), and uses the file's `cwd` for row/column grouping. This lets a session already running when the daemon starts get seeded onto the grid immediately, without waiting for its next hook event.
+- **`sessions/<pid>.json` is authoritative for placement.** Claude Code writes one small JSON file per running process under `<configDir>/sessions/<pid>.json` (fields used: `pid`, `sessionId`, `cwd`; other fields such as `version`, `peerFeatures`, `messagingSocketPath` are ignored). Every sync (2s cadence), the daemon scans this file across the configured `claudeConfigDirs`, confirms the `pid` in the filename is still alive (`kill(pid, 0)`), and uses the file's `cwd` for row/column grouping. This lets a session already running when the daemon starts get seeded onto the grid immediately, without waiting for its next hook event.
 
 Each `sessions/<pid>.json` file is opened with `O_NOFOLLOW` (refusing symlinks) and capped at 64 KiB before being parsed; oversized or non-regular files are skipped rather than read.
 
@@ -217,7 +235,7 @@ Note: Ghostty's AppleScript dictionary only exposes `environment variables` as a
 
 ### How Claude Desktop sessions work
 
-Claude Desktop's Claude Code runs with `CLAUDE_CODE_ENTRYPOINT=claude-desktop` but no `CLAUDE_CONFIG_DIR` override, so it shares `~/.claude` (and therefore the same hooks) with a plain-terminal `claude`. As with terminal sessions, **hooks are authoritative for status**; the on-disk scan below exists only to seed already-open sessions on daemon startup and to garbage-collect sessions Desktop never sent a `SessionEnd` hook for.
+Claude Desktop is identified by `CLAUDE_CODE_ENTRYPOINT=claude-desktop`. Its transcript profile defaults to `~/.claude`; set `claudeDesktopConfigDir` when it differs, and include that profile in `claudeConfigDirs` when installing hooks. As with terminal sessions, **hooks are authoritative for status**; the on-disk scan below exists only to seed already-open sessions on daemon startup and to garbage-collect sessions Desktop never sent a `SessionEnd` hook for.
 
 Desktop writes one file per session under `~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<workspaceId>/local_<uuid>.json` (override the scanned root with `--claude-desktop-dir`). The file's own `sessionId` carries the `local_` prefix and is Desktop-internal; the field the daemon actually uses as the session id is `cliSessionId`, which matches the Claude Code hook `session_id` and the `<cliSessionId>.jsonl` transcript filename. `scheduled-tasks.json` in the same directory is unrelated and ignored.
 
@@ -243,7 +261,7 @@ The keyboard multiplexes four independent grids ("layers"), one per session sour
 | 92 | Claude CLI (terminal) | Anthropic "Claude orange" (~#D97757) | Claude Code's own brand coral/terracotta |
 | 93 | Claude Desktop | Same Claude family, rotated toward red/burgundy and dimmed | Keeps the two Claude-sourced layers visually distinct from each other at a glance |
 
-Pressing a layer key switches the active layer immediately and persists the choice to `/tmp/keychron-c100-status-<uid>-layer.json`, so a daemon restart resumes on the same layer. The default (first run, or if that file is missing/corrupt) is herdr.
+Pressing a layer key switches the active layer immediately and persists the choice to `/tmp/keychron-c100-status-<uid>-layer.json`, so a daemon restart resumes on the same layer. The default (first run, or if that file is missing/corrupt) is Codex; set `defaultLayer` to change it. A saved selection takes precedence.
 
 **Non-active layers still light up their key** so you know something needs attention without switching over: whenever a background layer has a session in `approval`, `error`, or `done` (checked in that priority order), its key blinks -- toggling roughly every 600ms between its normal base color and that status's real color -- instead of staying static. The active layer's own key is always shown at full brightness with no blink. Because a layer's brand hue can sit close to a status color (Codex's blue-violet is near `.working`'s blue; Claude's orange is near `.approval`'s amber and `.error`'s red), the blink -- not the static color alone -- is what makes "this layer needs attention" reliably distinguishable from "this is just the layer's resting color".
 
@@ -255,7 +273,7 @@ Hooks and catalog syncs for non-active layers keep updating that layer's interna
 - Grabber socket: `/var/run/keychron-c100-grabber-<uid>.sock`; override with `--grabber-socket PATH` for diagnostics.
 - Log: `/tmp/keychron-c100-status-<uid>.log`; override with `--log-file PATH` on `run`, `logs`, and `log-path`.
 - Device: pass `--location 0x110000` to `run` when selecting among multiple C100 devices.
-- Claude Code config directories: `~/.claude`, `~/.claude-config/max`, and `~/.claude-config/enterprise` are always scanned for `sessions/<pid>.json`; pass `--claude-config-dirs PATH1,PATH2` to scan additional directories on top of those three.
+- Claude Code config directories: set `claudeConfigDirs` or `--claude-config-dirs PATH1,PATH2` to replace the scanned profile list. No named personal profiles are added implicitly.
 - Claude Desktop sessions directory: `~/Library/Application Support/Claude/claude-code-sessions`; override with `--claude-desktop-dir PATH`.
 - Input ownership: startup fails rather than leaving normal C100 typing enabled when exclusive capture cannot be obtained.
 

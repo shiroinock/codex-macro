@@ -14,6 +14,16 @@ enum CLIError: Error, CustomStringConvertible {
 
 struct Options {
     var dryRun = false
+    var companion = false
+    var hookProfileDir: String?
+    var configPath: String?
+    var loadedConfigPath: String?
+    var configTargetPath: String?
+    var providedFlags: Set<String> = []
+    var codexHome: String?
+    var codexPaths = CodexPaths()
+    var claudeDesktopConfigDir = NSHomeDirectory() + "/.claude"
+    var defaultLayer: SessionSourceKind = .codex
     var locationID: Int?
     var socketPath = RuntimePaths.socket()
     var logPath = RuntimePaths.log()
@@ -37,8 +47,108 @@ enum C100StatusCLI {
             printHelp()
             return
         }
-        let (positionals, options) = try parseOptions(Array(arguments.dropFirst()))
+        let (positionals, parsedOptions) = try parseOptions(Array(arguments.dropFirst()))
+        var options = parsedOptions
+        // Privileged helpers never consume the user's mutable configuration.
+        if !["grabber-service", "install-helper", "uninstall-helper", "self-test", "help", "--help", "-h"].contains(command) {
+            do {
+                let (configuration, loadedPath, targetPath) = try Configuration.load(
+                    explicitPath: options.configPath, allowMissing: command == "config" && positionals.first == "init")
+                options.loadedConfigPath = loadedPath
+                options.configTargetPath = targetPath
+                try options.apply(configuration)
+            } catch {
+                if command == "hook" {
+                    writeDiagnostic("configuration invalid; hook ignored: \(error)")
+                    print("{}")
+                    return
+                }
+                throw error
+            }
+        } else if options.configPath != nil {
+            throw CLIError.usage("--config is not used by privileged helper, help, or self-test commands")
+        }
+        if (options.providedFlags.contains("--companion") || options.providedFlags.contains("--backend")) && !["run", "install-agent", "config"].contains(command) {
+            throw CLIError.usage("--companion is supported by run and install-agent only; use companion-info or companion-watch for diagnostics")
+        }
         switch command {
+        case "config":
+            switch positionals.first ?? "show" {
+            case "show":
+                FileHandle.standardOutput.write(try options.effectiveConfiguration().json())
+            case "init":
+                guard let target = options.configTargetPath else { throw CLIError.runtime("Missing configuration target") }
+                let data = try Configuration.example.json()
+                if options.dryRun { FileHandle.standardOutput.write(data); return }
+                guard !FileManager.default.fileExists(atPath: target) else { throw CLIError.usage("Configuration already exists: \(target)") }
+                try FileManager.default.createDirectory(at: URL(fileURLWithPath: target).deletingLastPathComponent(),
+                    withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                try data.write(to: URL(fileURLWithPath: target), options: .withoutOverwriting)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+                print("configuration created: \(target)")
+            default: throw CLIError.usage("config requires show or init")
+            }
+        case "companion-info":
+            let connection = try C100Connection.connect(locationID: options.locationID)
+            try connection.checkCompanion()
+            print("companion protocol=1 layout=10x10 input=suppressed events=enabled hsv=per_key watchdog=3s")
+        case "companion-test":
+            let seconds = positionals.first.flatMap(Double.init) ?? 45
+            guard seconds > 0 && seconds <= 300 else {
+                throw CLIError.usage("companion-test seconds must be between 1 and 300")
+            }
+            let connection = try C100Connection.connect(locationID: options.locationID, companion: true)
+            defer { connection.stopCompanion() }
+            var previous = try connection.drainCompanionStates().last ?? []
+            let pattern: [Int: HSVColor] = [
+                0: LEDColorName.red.color, 9: LEDColorName.green.color,
+                90: LEDColorName.blue.color, 99: LEDColorName.amber.color,
+                44: HSVColor(hue: 0, saturation: 0, value: 24),
+                45: HSVColor(hue: 0, saturation: 0, value: 112)
+            ]
+            let began = ProcessInfo.processInfo.systemUptime
+            try connection.apply(colorsByIndex: pattern, defaultColor: LEDColorName.off.color)
+            print("test pattern corners=red,green,blue,amber center44=dim_white center45=bright_white others=off frame_ms=\(Int((ProcessInfo.processInfo.systemUptime - began) * 1000))")
+            fflush(nil)
+            var presses = 0, releases = 0
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                for current in try connection.drainCompanionStates() {
+                    if current != previous {
+                        let down = current.subtracting(previous).sorted()
+                        let up = previous.subtracting(current).sorted()
+                        presses += down.count; releases += up.count
+                        print("pressed=\(down) released=\(up)")
+                        fflush(nil)
+                    }
+                    previous = current
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            print("input test presses=\(presses) releases=\(releases) held=\(previous.sorted())")
+            print("watchdog test: withholding traffic for 3.3 seconds; LEDs should go dark")
+            fflush(nil)
+            try connection.verifyCompanionWatchdog()
+            print("watchdog expired=verified; pattern cleared; physical observations require user confirmation")
+        case "companion-watch":
+            let seconds = positionals.first.flatMap(Double.init) ?? 20
+            guard seconds > 0 && seconds <= 300 else {
+                throw CLIError.usage("companion-watch seconds must be between 1 and 300")
+            }
+            let connection = try C100Connection.connect(locationID: options.locationID, companion: true)
+            defer { connection.stopCompanion() }
+            var previous = try connection.drainCompanionStates().last ?? []
+            print("companion watching for \(seconds)s; held=\(previous.sorted())")
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                for current in try connection.drainCompanionStates() {
+                    if current != previous {
+                        print("pressed=\(current.subtracting(previous).sorted()) released=\(previous.subtracting(current).sorted())")
+                    }
+                    previous = current
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
         case "run":
             let daemon = try StatusDaemon(
                 socketPath: options.socketPath,
@@ -46,9 +156,13 @@ enum C100StatusCLI {
                 locationID: options.locationID,
                 grabberSocketPath: options.grabberSocketPath,
                 dryRun: options.dryRun,
+                companion: options.companion,
                 herdrBinaryPath: options.herdrBinaryPath,
-                claudeConfigDirs: ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs),
-                claudeDesktopDir: options.claudeDesktopDir
+                claudeConfigDirs: options.claudeConfigDirs,
+                claudeDesktopDir: options.claudeDesktopDir,
+                claudeDesktopConfigDir: options.claudeDesktopConfigDir,
+                codexPaths: options.codexPaths,
+                defaultLayer: options.defaultLayer
             )
             try daemon.run()
         case "grabber-service":
@@ -98,7 +212,7 @@ enum C100StatusCLI {
                 print("\(descriptor.product) vid=0x\(hex(descriptor.vendorID, width: 4)) pid=0x\(hex(descriptor.productID, width: 4)) location=0x\(hex(descriptor.locationID, width: 6)) registry=0x\(String(descriptor.registryEntryID, radix: 16))")
             }
         case "catalog":
-            let layout = try CodexCatalog.layout()
+            let layout = try CodexCatalog.layout(paths: options.codexPaths)
             for (project, row) in layout.projectRows.sorted(by: { $0.value < $1.value }) {
                 print("row=\(row) project=\(project)")
                 for placement in layout.placements.filter({ $0.row == row }) {
@@ -124,7 +238,7 @@ enum C100StatusCLI {
             } else {
                 print("herdr sessions: herdr binary not found (--herdr-bin / HERDR_BIN / PATH)")
             }
-            let claudeConfigDirs = ClaudeConfigDirs.resolved(additional: options.claudeConfigDirs)
+            let claudeConfigDirs = options.claudeConfigDirs
             let claudeTerminalSessions = try ClaudeSessionsCatalog(configDirs: claudeConfigDirs).snapshot()
             print("claude-terminal sessions (config_dirs=\(claudeConfigDirs.joined(separator: ","))):")
             for session in claudeTerminalSessions.sorted(by: { $0.sessionID < $1.sessionID }) {
@@ -134,7 +248,7 @@ enum C100StatusCLI {
                 print("  (no live claude sessions/<pid>.json found)")
             }
             let claudeDesktopDir = options.claudeDesktopDir ?? ClaudeDesktopCatalog.defaultSessionsDir()
-            let claudeDesktopSessions = try ClaudeDesktopCatalog(desktopSessionsDir: claudeDesktopDir).snapshot()
+            let claudeDesktopSessions = try ClaudeDesktopCatalog(desktopSessionsDir: claudeDesktopDir, configDir: options.claudeDesktopConfigDir).snapshot()
             print("claude-desktop sessions (dir=\(claudeDesktopDir)):")
             for session in claudeDesktopSessions.sorted(by: { $0.sessionID < $1.sessionID }) {
                 print("  session=\(session.sessionID) cwd=\(session.cwd)")
@@ -201,14 +315,16 @@ enum C100StatusCLI {
             }
         case "install-claude-hooks":
             let configDirs = options.installClaudeHooksConfigDirs.isEmpty
-                ? ClaudeHooksInstaller.defaultInstallConfigDirs()
+                ? options.claudeConfigDirs
                 : options.installClaudeHooksConfigDirs
             let binaryPath = options.binaryPathOverride ?? HelperInstaller.currentExecutableURL().path
             let results = ClaudeHooksInstaller.run(
                 configDirs: configDirs,
                 binaryPath: binaryPath,
                 dryRun: options.dryRun,
-                uninstall: options.uninstall
+                uninstall: options.uninstall,
+                configPath: options.loadedConfigPath,
+                socketPath: options.providedFlags.contains("--socket") ? options.socketPath : nil
             )
             for result in results {
                 print("config_dir=\(result.configDir) settings=\(result.settingsPath) status=\(result.status.rawValue) \(result.message)")
@@ -220,9 +336,12 @@ enum C100StatusCLI {
             let result = try AgentInstaller.run(
                 label: label,
                 binaryPath: binaryPath,
-                locationID: options.locationID,
+                locationID: nil,
                 dryRun: options.dryRun,
-                uninstall: options.uninstall
+                uninstall: options.uninstall,
+                companion: false,
+                additionalArguments: options.launchArguments,
+                environment: ProcessInfo.processInfo.environment.filter { ["PATH", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERDR_BIN", "HERDR_SOCKET_PATH", "XDG_CONFIG_HOME"].contains($0.key) }
             )
             print("label=\(result.label) plist=\(result.plistPath) status=\(result.status.rawValue) \(result.message)")
             if let preview = result.dryRunPreview {
@@ -244,6 +363,8 @@ enum C100StatusCLI {
         case "log-path":
             print(options.logPath)
         case "self-test":
+            try ConfigurationTests.run()
+            try CompanionProtocol.selfTest()
             try selfTest()
         case "help", "--help", "-h":
             printHelp()
@@ -256,7 +377,9 @@ enum C100StatusCLI {
         let data = FileHandle.standardInput.readDataToEndOfFile()
         var input = try JSONDecoder().decode(HookInput.self, from: data)
         if options.hookSource == "claude" {
-            input = applyClaudeEnvironment(to: input, notificationMatcher: options.notificationMatcher)
+            let source = resolveClaudeSource(environment: ProcessInfo.processInfo.environment).kind
+            let fallback = options.hookProfileDir ?? (source == .claudeDesktop ? options.claudeDesktopConfigDir : options.claudeConfigDirs.first)
+            input = applyClaudeEnvironment(to: input, notificationMatcher: options.notificationMatcher, fallbackConfigDir: fallback)
         } else if let notificationMatcher = options.notificationMatcher {
             input = input.applyingNotificationMatcher(notificationMatcher)
         }
@@ -301,10 +424,11 @@ enum C100StatusCLI {
     static func applyClaudeEnvironment(
         to input: HookInput,
         notificationMatcher: String?,
+        fallbackConfigDir: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> HookInput {
         let (kind, herdrPaneID, herdrWorkspaceID) = resolveClaudeSource(environment: environment)
-        let configDir = environment["CLAUDE_CONFIG_DIR"] ?? (NSHomeDirectory() + "/.claude")
+        let configDir = environment["CLAUDE_CONFIG_DIR"] ?? fallbackConfigDir ?? (NSHomeDirectory() + "/.claude")
         return input.applyingSource(
             kind,
             herdrPaneID: herdrPaneID,
@@ -331,15 +455,33 @@ enum C100StatusCLI {
         var positionals: [String] = []
         var index = 0
         while index < arguments.count {
+            if arguments[index].hasPrefix("--") { options.providedFlags.insert(arguments[index]) }
             switch arguments[index] {
+            case "--hook-profile-dir", "--config", "--codex-home", "--claude-desktop-config-dir", "--default-layer", "--backend":
+                let flag = arguments[index]
+                index += 1
+                guard index < arguments.count, !arguments[index].isEmpty else { throw CLIError.usage("\(flag) requires a value") }
+                let value = arguments[index]
+                switch flag {
+                case "--hook-profile-dir": options.hookProfileDir = value
+                case "--config": options.configPath = value
+                case "--codex-home": options.codexHome = value
+                case "--claude-desktop-config-dir": options.claudeDesktopConfigDir = value
+                case "--default-layer":
+                    guard let layer = SessionSourceKind(rawValue: value) else { throw CLIError.usage("Unknown layer: \(value)") }
+                    options.defaultLayer = layer
+                default:
+                    guard ["stock", "companion"].contains(value) else { throw CLIError.usage("--backend requires stock or companion") }
+                    options.companion = value == "companion"
+                }
+            case "--companion":
+                options.companion = true
             case "--dry-run":
                 options.dryRun = true
             case "--location":
                 index += 1
-                guard index < arguments.count, let location = parseInteger(arguments[index]) else {
-                    throw CLIError.usage("--location requires a decimal or 0x-prefixed integer")
-                }
-                options.locationID = location
+                guard index < arguments.count else { throw CLIError.usage("--location requires a value") }
+                options.locationID = try Configuration.location(arguments[index])
             case "--socket":
                 index += 1
                 guard index < arguments.count else {
@@ -849,7 +991,8 @@ enum C100StatusCLI {
               HerdrBinaryResolver.resolve(
                   explicitPath: "/nonexistent/herdr",
                   environment: ["HERDR_BIN": envHerdrBinary.path]
-              ) == envHerdrBinary.path,
+              ) == nil,
+              HerdrBinaryResolver.resolve(explicitPath: nil, environment: ["HERDR_BIN": envHerdrBinary.path]) == envHerdrBinary.path,
               HerdrBinaryResolver.resolve(explicitPath: nil, environment: [:]) == nil
                   || HerdrBinaryResolver.pathCandidates.contains(
                       HerdrBinaryResolver.resolve(explicitPath: nil, environment: [:]) ?? ""
@@ -2191,13 +2334,10 @@ enum C100StatusCLI {
             throw CLIError.runtime("ClaudeSessionsCatalog.snapshot self-test failed")
         }
 
-        // M3: config-dir resolution merges the 3 defaults with
-        // `--claude-config-dirs` additions, de-duplicating.
+        // Generic Claude default and explicit profile replacement.
         let claudeConfigDirDefaults = ClaudeConfigDirs.defaults(homeDirectory: "/Users/example")
         guard claudeConfigDirDefaults == [
             "/Users/example/.claude",
-            "/Users/example/.claude-config/max",
-            "/Users/example/.claude-config/enterprise",
         ] else {
             throw CLIError.runtime("ClaudeConfigDirs.defaults self-test failed")
         }
@@ -2206,10 +2346,8 @@ enum C100StatusCLI {
             homeDirectory: "/Users/example"
         )
         guard claudeConfigDirResolved == [
-            "/Users/example/.claude",
-            "/Users/example/.claude-config/max",
-            "/Users/example/.claude-config/enterprise",
             "/extra/claude-config",
+            "/Users/example/.claude",
         ] else {
             throw CLIError.runtime("ClaudeConfigDirs.resolved self-test failed")
         }
@@ -2921,8 +3059,10 @@ enum C100StatusCLI {
 
     private static func printHelp() {
         print("""
-        Usage:
-          c100-status run [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
+        Usage (user commands accept --config PATH; CLI overrides JSON settings):
+          c100-status config show [--config PATH]
+          c100-status config init [--config PATH] [--dry-run]
+          c100-status run [--companion] [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
           sudo c100-status install-helper --location 0x110000
           sudo c100-status uninstall-helper
           c100-status grabber-status [--grabber-socket PATH]
@@ -2941,14 +3081,17 @@ enum C100StatusCLI {
           c100-status watch-matrix [SECONDS] [--location 0x110000]
           c100-status apply <status> [--location 0x110000] [--dry-run]
           c100-status install-claude-hooks [--config-dir PATH]... [--binary PATH] [--dry-run] [--uninstall]
-          c100-status install-agent [--location 0x110000] [--binary PATH] [--label LABEL] [--dry-run] [--uninstall]
+          c100-status install-agent [--companion] [--location 0x110000] [--binary PATH] [--label LABEL] [--dry-run] [--uninstall]
+          c100-status companion-info [--location HEX]
+          c100-status companion-watch [SECONDS] [--location HEX]
+          c100-status companion-test [SECONDS] [--location HEX]
           c100-status self-test
 
-        `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (default config dirs: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise, plus any other ~/.claude-config/* subdirectory), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
+        `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (profile directories from configuration, falling back to CLAUDE_CONFIG_DIR or ~/.claude), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
         `install-agent` installs `c100-status run` as a per-user LaunchAgent (~/Library/LaunchAgents/<label>.plist, default label com.kotainaba.c100-status.run), loaded via `launchctl bootstrap gui/<uid>` and kept alive by launchd (RunAtLoad+KeepAlive, ProcessType Interactive). `--location` is forwarded to `run` if given. `--binary` overrides the auto-detected absolute path to this executable; `--label` overrides the plist label (must match an existing manual `run` invocation's expectations if you rely on the default). `--dry-run` prints the plist and the launchctl commands that would run without touching disk or launchd. Re-running is idempotent: an unchanged plist is just restarted (bootout+bootstrap); a changed one is rewritten and reloaded. `--uninstall` runs `launchctl bootout` and deletes the plist. Refuses to run as root -- it manages your per-user (gui/<uid>) launchd domain, not the root helper. If a manually started `c100-status run` (e.g. via `nohup ... &`) is already holding the grabber lease/socket when the LaunchAgent starts, the two will race for the same resources; stop the manual process (or use a different --socket/--location for one of them) before installing.
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
-        `--claude-config-dirs` adds extra Claude profile directories (scanned for sessions/<pid>.json) on top of the defaults: ~/.claude, ~/.claude-config/max, ~/.claude-config/enterprise.
+        `--claude-config-dirs` replaces the configured Claude profile list. Set any number of profiles in config.json; no named profiles are added implicitly.
         `--claude-desktop-dir` overrides where Claude Desktop's session files are scanned from (default: ~/Library/Application Support/Claude/claude-code-sessions).
         `install-helper` performs the one-time root-owned LaunchDaemon installation.
         `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.

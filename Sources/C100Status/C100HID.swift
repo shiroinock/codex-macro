@@ -51,6 +51,13 @@ final class C100Connection {
     private var isOpen = false
     private var reportObserver: (([UInt8]) -> Void)?
     private var cachedLedCount: Int?
+    private(set) var isCompanion = false
+    private var companionSequence: UInt8 = 0
+    private var companionLock: DaemonInstanceLock?
+    private var companionStates: [Set<Int>] = []
+    private var companionOverflow = false
+    private var nextCompanionHeartbeat = Date.distantPast
+    private var companionFrame = [HSVColor](repeating: LEDColorName.off.color, count: 100)
 
     var locationID: Int {
         Self.propertyInt(device, key: kIOHIDLocationIDKey)
@@ -79,7 +86,7 @@ final class C100Connection {
         return devices.map(descriptor).sorted { $0.locationID < $1.locationID }
     }
 
-    static func connect(locationID: Int? = nil) throws -> C100Connection {
+    static func connect(locationID: Int? = nil, companion: Bool = false) throws -> C100Connection {
         let (manager, devices) = try matchingDevices()
         let candidates = locationID.map { wanted in
             devices.filter { propertyInt($0, key: kIOHIDLocationIDKey) == wanted }
@@ -92,6 +99,7 @@ final class C100Connection {
         }
         let connection = C100Connection(manager: manager, device: device)
         try connection.open()
+        if companion { try connection.startCompanion() }
         return connection
     }
 
@@ -100,6 +108,10 @@ final class C100Connection {
     }
 
     func apply(color: HSVColor) throws {
+        if isCompanion {
+            try paintCompanion([HSVColor](repeating: color, count: 100))
+            return
+        }
         if color == LEDColorName.off.color {
             try turnOff()
             return
@@ -111,6 +123,13 @@ final class C100Connection {
     }
 
     func apply(color: HSVColor, at index: Int) throws {
+        if isCompanion {
+            guard (0..<100).contains(index) else { throw CLIError.runtime("Invalid companion key index") }
+            var frame = companionFrame
+            frame[index] = color
+            try paintCompanion(frame)
+            return
+        }
         let ledCount = try ledCount()
         guard index >= 0 && index < ledCount else {
             throw CLIError.runtime("Key index \(index) is outside the device LED range 0...\(ledCount - 1)")
@@ -119,6 +138,15 @@ final class C100Connection {
     }
 
     func apply(colorsByIndex: [Int: HSVColor], defaultColor: HSVColor) throws {
+        if isCompanion {
+            var frame = [HSVColor](repeating: defaultColor, count: 100)
+            for (index, color) in colorsByIndex {
+                guard (0..<100).contains(index) else { throw CLIError.runtime("Invalid companion key index") }
+                frame[index] = color
+            }
+            try paintCompanion(frame)
+            return
+        }
         // Keychron's PER_KEY_RGB solid renderer deliberately overwrites each
         // stored HSV value with the global brightness, so V=0 cannot turn an
         // individual LED off. MIXED_RGB solves that without firmware changes:
@@ -175,6 +203,12 @@ final class C100Connection {
         defaultColor: HSVColor,
         previousColorsByIndex: [Int: HSVColor]
     ) throws {
+        if isCompanion {
+            if colorsByIndex != previousColorsByIndex {
+                try apply(colorsByIndex: colorsByIndex, defaultColor: defaultColor)
+            }
+            return
+        }
         let ledCount = try ledCount()
         for index in colorsByIndex.keys {
             guard index >= 0 && index < ledCount else {
@@ -292,8 +326,86 @@ final class C100Connection {
     }
 
     func receive(_ report: [UInt8]) {
-        responses.append(report)
+        let isState = CompanionProtocol.isPacket(report) && report[5] == CompanionProtocol.state
+        let isSnapshot = CompanionProtocol.isPacket(report) && report[5] == (CompanionProtocol.heartbeat | 0x80)
+            && report[6] == companionSequence && report[7] == 0
+        if isCompanion && (isState || isSnapshot) {
+            if let keys = try? CompanionProtocol.pressedKeys(report[8..<21]) {
+                if companionStates.count < 256 { companionStates.append(keys) }
+                else { companionOverflow = true }
+            } else { companionOverflow = true }
+        }
+        if !isState {
+            // Unsolicited stock reports must not grow memory without bound.
+            if responses.count >= 256 { responses.removeFirst() }
+            responses.append(report)
+        }
         reportObserver?(report)
+    }
+
+    private func companionRequest(_ command: UInt8, payload: [UInt8] = []) throws -> [UInt8] {
+        companionSequence &+= 1
+        let sequence = companionSequence
+        let response = try transact(CompanionProtocol.report(command, sequence: sequence, payload: payload), matching: {
+            CompanionProtocol.isPacket($0) && $0[5] == (command | 0x80) && $0[6] == sequence
+        }, timeout: 0.5)
+        guard response[7] == 0 else {
+            throw CLIError.runtime("Companion rejected command \(command), status=\(response[7])")
+        }
+        return response
+    }
+
+    func checkCompanion() throws {
+        let reply = try companionRequest(CompanionProtocol.hello)
+        guard Array(reply[8..<12]) == [10, 10, 7, 3] else {
+            throw CLIError.runtime("Incompatible companion capabilities; expected 10x10, input suppression, events, HSV and 3s watchdog")
+        }
+    }
+
+    private func startCompanion() throws {
+        companionLock = try DaemonInstanceLock(socketPath: "/tmp/c100-companion-\(getuid())-\(locationID)")
+        try checkCompanion()
+        isCompanion = true
+        // Seed held keys without navigating them at startup.
+        let snapshot = try companionRequest(CompanionProtocol.heartbeat)
+        companionStates = [try CompanionProtocol.pressedKeys(snapshot[8..<21])]
+        nextCompanionHeartbeat = Date().addingTimeInterval(0.75)
+    }
+
+    func drainCompanionStates() throws -> [Set<Int>] {
+        CFRunLoopRunInMode(.defaultMode, 0.001, false)
+        if Date() >= nextCompanionHeartbeat {
+            let reply = try companionRequest(CompanionProtocol.heartbeat)
+            guard reply[21] == 1 else {
+                throw CLIError.runtime("Companion watchdog expired; restart to restore the full display")
+            }
+            nextCompanionHeartbeat = Date().addingTimeInterval(0.75)
+        }
+        guard !companionOverflow else { throw CLIError.runtime("Companion input queue overflow or malformed state; restart required") }
+        let result = companionStates
+        companionStates.removeAll(keepingCapacity: true)
+        return result
+    }
+
+    func verifyCompanionWatchdog() throws {
+        Thread.sleep(forTimeInterval: 3.3)
+        let reply = try companionRequest(CompanionProtocol.heartbeat)
+        guard reply[21] == 0 else {
+            throw CLIError.runtime("Companion watchdog did not expire after 3.3s without traffic")
+        }
+        nextCompanionHeartbeat = Date().addingTimeInterval(0.75)
+    }
+
+    func stopCompanion() {
+        if isCompanion { _ = try? companionRequest(CompanionProtocol.release) }
+    }
+
+    private func paintCompanion(_ frame: [HSVColor]) throws {
+        for payload in CompanionProtocol.colorPayloads(frame) {
+            _ = try companionRequest(CompanionProtocol.colors, payload: payload)
+        }
+        _ = try companionRequest(CompanionProtocol.commit)
+        companionFrame = frame
     }
 
     func watchReports(seconds: TimeInterval) {

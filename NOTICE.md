@@ -1,6 +1,6 @@
 # Notices and protocol references
 
-This repository contains an independent Swift implementation for interoperating with a Keychron C100 8K and local Codex Desktop state. It does not bundle firmware, source code, or binary artifacts from Keychron, QMK, or OpenAI.
+This repository contains an independent Swift implementation for interoperating with a Keychron C100 8K and local Codex Desktop state. It does not bundle third-party source code or binary artifacts from Keychron, QMK, or OpenAI. The optional `firmware/companion` keymap is separately licensed GPL-2.0-or-later and is built against a pinned external QMK checkout; see `firmware/README.md`.
 
 The HID protocol behavior used here was derived from observation of the author's own device and publicly available interoperability references, including:
 

@@ -52,30 +52,29 @@ private struct ForkCatalogSession {
 enum CodexCatalog {
     static let projectlessKey = "projectless"
 
-    static func sessions(homeDirectory: String = NSHomeDirectory()) throws -> [CatalogSession] {
-        try layout(homeDirectory: homeDirectory).placements.map(\.session)
+    static func sessions(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) throws -> [CatalogSession] {
+        try layout(homeDirectory: homeDirectory, paths: paths).placements.map(\.session)
     }
 
-    static func layout(homeDirectory: String = NSHomeDirectory()) throws -> CatalogLayout {
-        let sidebar = sidebarOrdering(homeDirectory: homeDirectory)
-        let databasePath = URL(fileURLWithPath: homeDirectory)
-            .appendingPathComponent(".codex/sqlite/codex-dev.db")
-            .path
+    static func layout(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) throws -> CatalogLayout {
+        let paths = paths ?? CodexPaths(homeDirectory: homeDirectory)
+        let sidebar = sidebarOrdering(paths: paths)
+        let databasePath = paths.catalogDatabase
         var result = try catalogSessions(
             databasePath: databasePath,
             sidebar: sidebar
         )
         let existingSessionIDs = Set(result.map(\.sessionID))
         result.append(contentsOf: forkSessions(
-            homeDirectory: homeDirectory,
+            paths: paths,
             catalogSessions: result,
             sidebar: sidebar
         ).filter { !existingSessionIDs.contains($0.sessionID) })
         return orderedLayout(result, sidebar: sidebar)
     }
 
-    static func projectKey(sessionID: String, homeDirectory: String = NSHomeDirectory()) -> String {
-        sidebarOrdering(homeDirectory: homeDirectory).projectAssignments[sessionID]
+    static func projectKey(sessionID: String, homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) -> String {
+        sidebarOrdering(paths: paths ?? CodexPaths(homeDirectory: homeDirectory)).projectAssignments[sessionID]
             .map { "project:\($0)" }
             ?? projectlessKey
     }
@@ -222,13 +221,11 @@ enum CodexCatalog {
     }
 
     private static func forkSessions(
-        homeDirectory: String,
+        paths: CodexPaths,
         catalogSessions: [CatalogSession],
         sidebar: CodexSidebarOrdering
     ) -> [CatalogSession] {
-        let databasePath = URL(fileURLWithPath: homeDirectory)
-            .appendingPathComponent(".codex/state_5.sqlite")
-            .path
+        let databasePath = paths.stateDatabase
         guard FileManager.default.fileExists(atPath: databasePath) else { return [] }
 
         var database: OpaquePointer?
@@ -350,9 +347,8 @@ enum CodexCatalog {
         }
     }
 
-    private static func sidebarOrdering(homeDirectory: String) -> CodexSidebarOrdering {
-        let stateURL = URL(fileURLWithPath: homeDirectory)
-            .appendingPathComponent(".codex/.codex-global-state.json")
+    private static func sidebarOrdering(paths: CodexPaths) -> CodexSidebarOrdering {
+        let stateURL = URL(fileURLWithPath: paths.sidebarState)
         guard let data = try? Data(contentsOf: stateURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .empty

@@ -131,14 +131,14 @@ enum SessionSourceDedup {
 /// `UnifiedLayout` reproduces the same placements.
 struct CodexSourceProvider: SessionSourceProvider {
     let kind: SessionSourceKind = .codex
-    private let homeDirectory: String
+    private let paths: CodexPaths
 
-    init(homeDirectory: String = NSHomeDirectory()) {
-        self.homeDirectory = homeDirectory
+    init(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) {
+        self.paths = paths ?? CodexPaths(homeDirectory: homeDirectory)
     }
 
     func snapshot() throws -> [AgentSession] {
-        let layout = try CodexCatalog.layout(homeDirectory: homeDirectory)
+        let layout = try CodexCatalog.layout(paths: paths)
         return layout.placements.map { placement in
             let session = placement.session
             let normalizedCWD = URL(fileURLWithPath: session.cwd).standardizedFileURL.path

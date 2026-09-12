@@ -122,7 +122,7 @@ enum LayerKeyColorLogic {
 /// value from a future/older build) just falls back to the default layer
 /// rather than failing the daemon's startup.
 final class LayerSelectionStore {
-    static let defaultLayer: SessionSourceKind = .claudeHerdr
+    static let defaultLayer: SessionSourceKind = .codex
 
     private let fileURL: URL
 
@@ -137,10 +137,10 @@ final class LayerSelectionStore {
         var activeLayer: SessionSourceKind
     }
 
-    func load() -> SessionSourceKind {
+    func load(defaultLayer: SessionSourceKind = LayerSelectionStore.defaultLayer) -> SessionSourceKind {
         guard let data = try? Data(contentsOf: fileURL),
               let payload = try? JSONDecoder().decode(Payload.self, from: data) else {
-            return Self.defaultLayer
+            return defaultLayer
         }
         return payload.activeLayer
     }

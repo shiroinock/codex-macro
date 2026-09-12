@@ -18,13 +18,14 @@ enum HerdrBinaryResolver {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> String? {
-        if let explicitPath, fileManager.isExecutableFile(atPath: explicitPath) {
-            return explicitPath
+        if let explicitPath {
+            return fileManager.isExecutableFile(atPath: explicitPath) ? explicitPath : nil
         }
         if let envPath = environment["HERDR_BIN"], fileManager.isExecutableFile(atPath: envPath) {
             return envPath
         }
-        return pathCandidates.first { fileManager.isExecutableFile(atPath: $0) }
+        let searchPath = (environment["PATH"] ?? "").split(separator: ":").filter { $0.hasPrefix("/") }.map { String($0) + "/herdr" }
+        return (searchPath + pathCandidates).first { fileManager.isExecutableFile(atPath: $0) }
     }
 }
 

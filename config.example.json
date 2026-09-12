@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "backend": "stock",
+  "locationID": "auto",
+  "claudeConfigDirs": ["~/.claude"],
+  "codexHome": "~/.codex",
+  "defaultLayer": "codex"
+}

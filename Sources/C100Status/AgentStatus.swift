@@ -19,7 +19,7 @@ enum AgentStatus: String, Codable, CaseIterable {
 
     var color: HSVColor {
         switch self {
-        case .idle: HSVColor(hue: 0, saturation: 0, value: 24)
+        case .idle: HSVColor(hue: 0, saturation: 0, value: 96)
         case .working: HSVColor(hue: 168, saturation: 255, value: 112)
         case .approval: HSVColor(hue: 21, saturation: 255, value: 160)
         case .done: HSVColor(hue: 85, saturation: 255, value: 112)
