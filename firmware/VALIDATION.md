@@ -1,94 +1,39 @@
-# Physical validation — 2026-09-12 (Asia/Tokyo)
+# Current validation status
 
-C100 8K `3434:042c`, this Mac's location `0x02110000`; DFU `2e3c:df11`
-at USB path `2-1.1`. The main README's other-machine location was preserved.
+Target: Keychron C100 8K (`3434:042c`), AT32 DFU (`2e3c:df11`), on the tested Mac. Last updated 2026-09-13.
 
-- Read and saved the original **262,144-byte flash** before modification.
-- Flashed companion firmware, then read back **60,488 bytes**, exactly matching
-  the binary's firmware payload (excluding its 16-byte DFU suffix).
-- Normal USB enumeration and companion protocol v1 negotiation succeeded.
-- The initial 90-second test recorded **650 presses and 650 releases**, no
-  held keys remaining, across 97 distinct keys. A follow-up recorded keys
-  85, 94 and 95, covering **all 100 physical positions** in total.
-- The user confirmed all four corner colors, adjacent dim/bright white LEDs,
-  all other LEDs off, and no normal text input from any of the 100 keys.
-- One complete 100-key staged frame + commit round trip took **10 ms**.
-  This is a host-side sample, not a worst-case input or optical LED latency.
-- After **3.3 seconds without host traffic**, the device reported that its
-  watchdog had expired. No synthetic watchdog state was injected.
-- The real daemon ran as **uid 501**, with firmware input capture and matrix
-  polling disabled. No root grabber was installed or leased.
-- Physical presses switched all four source layers. Task navigation from keys
-  0, 10 and 20 returned `opened=true`; the user completed the navigation check.
-- The foreground test daemon shut down normally. The per-user LaunchAgent was
-  installed with `run --companion --location 0x02110000`, started successfully,
-  and answered `ping` using the normal daemon socket. A concurrent
-  `companion-watch` was rejected by the per-device lock before taking control.
+## Verified
 
-Builds of both the dedicated and standard-keymap firmware succeeded. Swift
-Release build, existing self-tests, firmware command-handler tests and the
-LaunchAgent dry-run check passed. The standard-keymap binary is a separate
-source build; the original-device backup is the exact readout of this device.
+- Dedicated firmware and host release builds, firmware handler tests, and host self-tests pass.
+- All 100 physical positions were exercised. The user confirmed corner colors, adjacent dim/bright white keys, black on unassigned keys, and suppression of ordinary text input.
+- Press/release, quick taps, simultaneous holds, source switching, and task navigation were checked on the device.
+- Watchdog expiry was confirmed after 3.3 seconds without host traffic. The firmware clears LEDs and continues suppressing ordinary input.
+- The per-user daemon connects with `backend=companion` and `actionTransport=keyboard-hid`; Accessibility is not required for this transport.
+- The device lock rejects a competing companion watcher.
+- Stopping the LaunchAgent leaves its configuration intact and prevents immediate automatic restart. Resuming reconnects the C100.
 
-Local evidence is under ignored `firmware/build/`: `manifest.json`,
-`physical-test.log`, `daemon-test.log`, `flash.log`, `readback.log`,
-`original-device-flash.bin`, and both built firmware images. The backup and
-logs are user-readable only. These artifacts are not committed to the repo.
+## Web Flasher
 
-The standalone DFU leave request returned a final get-status error as the
-device disconnected; successful USB re-enumeration and the new protocol
-handshake confirmed the firmware booted. The flash download and readback had
-already completed successfully.
+The user confirmed backup saving, writing, readback comparison, restart, and Companion operation through the published site.
 
-Not tested in this run: physical unplug/replug while the daemon is active,
-sleep/wake, other Macs/OS versions, and a fresh macOS privacy-permission profile.
-No new lifecycle hooks were installed as part of this firmware validation.
+Restoration was also tested using this device's original 262,144-byte stock backup. Before the test, the agent verified its SHA-256 against the saved manifest:
 
-## Keyboard-output extension — 2026-09-13
+```
+453bed79c89de0622cdd9821efba28eec8c0eb6fca84d38ab1b11740f1e2a1c6
+```
 
-- Firmware and host release builds succeeded; firmware handler tests and the
-  full host self-test suite passed.
-- Saved the pre-update 262,144-byte flash separately. Original-device backup
-  remains untouched.
-- Flashed `keyboard-output-v1.bin` and read back 61,036 payload bytes; exact
-  equality was verified against the binary excluding its 16-byte DFU suffix.
-- Device returned to normal USB mode and reported keyboard-output extension v1.
-- Updated daemon reports `actionTransport=keyboard-hid`, `connected=true`, and
-  `accessibilityTrusted=false`.
-- Physical archive execution without Accessibility is pending user validation.
-  Queue/release/revoke/suspend/ticket expiry behavior is covered by firmware
-  tests; real unplug/suspend during an active output pulse remains untested.
+The user confirmed restoration, readback comparison, restart, and ordinary text input. The user then reinstalled companion firmware through the site and confirmed comparison and restart. The agent checked the running daemon reported `connected=true`, `backend=companion`, `actionTransport=keyboard-hid`, and an empty `actionError`.
 
-Evidence: ignored `firmware/build/keyboard-output-*` files and
-`pre-keyboard-output-flash.bin`. The manifest records image/readback/backup hashes.
+Physical browser steps are user-reported. The agent directly checked the backup hash and final daemon state; no browser USB trace was collected. Automated tests also exercise backup selection, rejection of mismatched files, write/readback failure handling, restoration, and restart state using a simulated device.
 
-## Web Flasher — 2026-09-13 (user-reported)
+## Not verified
 
-The user tested the published GitHub Pages installer and confirmed backup
-saving, firmware writing, the readback-match result, and Companion operation
-after restarting the C100. These are user-observed results; no browser USB
-trace or new device readback artifact was collected by the agent in this run.
+- Recovery from interruption during erase or writing.
+- Restoration using the separately source-built standard-keymap image.
+- Other machines, browser/OS versions, and sleep/wake behavior.
+- Physical unplug or suspend during a keyboard output pulse.
+- Execution of every context-dependent action in each supported application.
 
-The device already contained codex-macro companion firmware before the test.
-Its new backup therefore preserves that custom firmware, not the original
-stock firmware. The initial report alone did not validate stock restoration;
-the follow-up below covers that path.
-Disconnect recovery during erase/write and other browser/OS versions also
-remain unverified. The website retains its experimental label.
+## Local evidence
 
-### Stock restoration and return to companion — same-day follow-up
-
-- Before restoration, the agent verified that the initial 262,144-byte
-  `original-device-flash.bin` still matched its recorded SHA-256:
-  `453bed79c89de0622cdd9821efba28eec8c0eb6fca84d38ab1b11740f1e2a1c6`.
-- The user confirmed the Web Flasher restoration procedure, including
-  readback comparison, restart, and ordinary text input with stock firmware.
-- The user then confirmed reinstallation of companion firmware, comparison,
-  and restart using the Web Flasher.
-- The agent checked the per-user LaunchAgent was running and `inspect`
-  reported `connected=true`, `backend=companion`,
-  `actionTransport=keyboard-hid`, and an empty `actionError`.
-
-The physical steps are user-reported; the daemon state was checked directly.
-This validates restoration from this device's original backup, not the
-separately source-built standard-keymap image or interruption recovery.
+Device backups, manifests, and physical-test logs are kept under ignored `firmware/build/`; they are not published. The original-device backup is the exact device readout. A backup made while companion firmware is installed preserves that state, not stock firmware.

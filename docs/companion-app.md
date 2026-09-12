@@ -6,7 +6,7 @@ The menu shows the daemon's connection state and selected firmware backend, offe
 
 **Stop daemon** unloads the default per-user LaunchAgent without deleting its plist or settings. The app stays open and shows a stopped status; **Resume daemon** starts it again. Saving service settings while paused stores them for the next resume. The retained LaunchAgent starts at the next login. Manually launched daemons and custom labels remain CLI-managed.
 
-**Restart daemon** installs/reloads the per-user default LaunchAgent using the app's bundled executable and the selected configuration. This also starts an uninstalled daemon. Keep the installed app in place once its executable is registered. The first revision manages the default `com.kotainaba.c100-status.run` label; custom LaunchAgent labels remain CLI-managed.
+**Restart daemon** installs/reloads the per-user default LaunchAgent using the app's bundled executable and the selected configuration. This also starts an uninstalled daemon. Keep the installed app in place once its executable is registered. The menu manages the default `com.kotainaba.c100-status.run` label; custom LaunchAgent labels remain CLI-managed.
 
 The default configuration is shared with the CLI. **Choose configuration file** selects another validated JSON file for this app; restarting the daemon applies it to the service too. **Open configuration file** opens it in the default editor (or creates a default starting file when none exists). Logs open in the default viewer. The menu app's configuration selection is remembered in its preferences.
 
@@ -28,8 +28,10 @@ Use `scroll up|down|left|right` to operate the scroll window from the CLI. The p
 
 All commands accept `--config PATH` and use the configured daemon socket. The app is a local build, not a notarized distribution.
 
-## Validation (2026-09-13)
+## Settings window
 
-Release build and all existing self-tests passed. The report fixture was updated to the current idle-white value of 96. The local app bundle passed code-signature verification. On the connected C100, the installed executable switched all four layers, changed brightness to 50/150/100%, rejected 201%, and retained 75% through LaunchAgent restart. Tests restored Codex and 100%. The menu process and bundled daemon were both running. Automated native-menu inspection was unavailable because the computer-use service timed out; menu clicks still require a visual smoke check.
+The menu opens **設定（レイアウト・サービス）…**. See [Layout editor](layout-editor.md) for key assignments, task areas, action mappings, and service settings.
 
-The menu now includes **レイアウトを編集…**. See [Layout editor](layout-editor.md) for movable parts, task-area sizing, source switches, and imported Codex command assignments.
+## Verification
+
+The release build and self-tests pass. The stop command unloads the LaunchAgent without changing its plist, and resuming restores the device connection. Menu updates preserve saved settings. Hardware validation is summarized in [firmware validation](../firmware/VALIDATION.md).

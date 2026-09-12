@@ -23,7 +23,6 @@ Setting precedence: explicit CLI flag > JSON field > supported environment varia
 | `defaultLayer` | `codex`; alternatives: `claude-herdr`, `claude-terminal`, `claude-desktop`; saved layer selection wins |
 | `socketPath` | `/tmp/keychron-c100-status-<uid>.sock` |
 | `logPath` | `/tmp/keychron-c100-status-<uid>.log` |
-| `grabberSocketPath` | Legacy setting; ignored now that the privileged grabber has been removed |
 
 Use `HERDR_SOCKET_PATH` to override the herdr service socket.
 
@@ -33,13 +32,13 @@ An explicitly configured missing herdr executable disables that adapter rather t
 
 `c100-status install-agent --config PATH` retains the absolute file reference in the LaunchAgent. Explicit CLI overrides are also retained. The installer forwards only `PATH`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `HERDR_BIN`, `HERDR_SOCKET_PATH` and `XDG_CONFIG_HOME` from its environment. Edit the file and rerun the same install command to restart and apply changes; configuration is not hot-reloaded. `--dry-run` previews the generated plist.
 
-`c100-status install-claude-hooks --config PATH --dry-run` previews hooks for exactly `claudeConfigDirs`. Remove `--dry-run` to install. Each command retains the configuration reference and its profile directory, plus an explicit `--socket` override if supplied. Runtime `CLAUDE_CONFIG_DIR` still identifies the invoking profile. A malformed configuration in a hook is diagnosed on stderr and the hook exits successfully so the agent is not blocked. Privileged helper commands intentionally do not read this user configuration.
+`c100-status install-claude-hooks --config PATH --dry-run` previews hooks for exactly `claudeConfigDirs`. Remove `--dry-run` to install. Each command retains the configuration reference and its profile directory, plus an explicit `--socket` override if supplied. Runtime `CLAUDE_CONFIG_DIR` still identifies the invoking profile. A malformed configuration in a hook is diagnosed on stderr and the hook exits successfully so the agent is not blocked.
 
 Manually installed hook commands, including Codex hooks, should pass the same `--config PATH` when it is outside the default location. Configuration changes do not rewrite existing hooks; rerun the Claude hook installer when needed. A separate Desktop profile must also be listed in `claudeConfigDirs` to install its hooks.
 
-## Migrating existing installations
+## Profile configuration
 
-Earlier versions implicitly scanned personal profiles under `~/.claude-config`. Add each desired profile explicitly to `claudeConfigDirs`; these directories are no longer auto-discovered. Preserve your firmware backend and USB location when creating the file. Remove old explicit LaunchAgent overrides by reinstalling with only `--config PATH`. An example using two arbitrary profiles is:
+Register each desired profile explicitly in `claudeConfigDirs`. For example:
 
 ```json
 {

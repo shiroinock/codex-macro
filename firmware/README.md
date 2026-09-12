@@ -4,8 +4,7 @@ A dedicated task controller for the **Keychron C100 8K, VID 3434 / PID 042c**.
 Physical switches do not emit ordinary keyboard input automatically. With the
 keyboard-output extension, the daemon can authorize a mapped shortcut after a
 physical press; without the daemon the switches remain silent. The host receives debounced physical matrix snapshots over Raw HID.
-Companion firmware is now required by the daemon. The stock-firmware/root-grabber
-backend has been removed; `--companion` remains an optional compatibility flag.
+Companion firmware is required by the daemon.
 For backup, flashing, readback verification, and recovery, follow the
 [step-by-step installation guide (Japanese)](FLASHING.ja.md).
 
@@ -76,9 +75,8 @@ host to exit so a restart can repaint the entire display; it does not silently
 keep a stale frame cache. A per-user, per-location lock prevents this backend's
 watcher and daemon from controlling the same device simultaneously.
 
-The optional keyboard-output extension advertises version `1` in capability
-reply byte 12; older firmware returns zero and the host retains its software
-shortcut path. Slot configuration is lazy on the first press or a changed
+The keyboard-output extension advertises version `1` in capability
+reply byte 12. Slot configuration is lazy on the first press or a changed
 shortcut, and cached until a revoke/reconnect. The host resolves the action binding for the enabled foreground service
 (Codex or Claude Desktop), configures the slot, rechecks foreground,
 and authorizes that slot. Physical presses alone never send ordinary keys.

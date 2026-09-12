@@ -39,14 +39,4 @@ source archive including libraries and licenses. Device backups under
 as the build source. Workflow dispatch can republish; relevant main pushes also
 trigger it.
 
-Automated tests and simulated browser flow pass. On 2026-09-13, the user
-confirmed physical backup saving, flashing, readback comparison, and Companion
-operation after restart through the published site. Their C100 already had
-custom firmware. A follow-up test confirmed restoration from the original stock
-backup, ordinary keyboard input, and reinstallation of companion firmware. The
-daemon subsequently reported connected=true and actionTransport=keyboard-hid
-with no action error. A backup
-preserves the firmware currently on the device, not necessarily its factory state.
-See `firmware/VALIDATION.md` for the evidence boundary. Disconnect recovery during
-erase/write and other browser/OS versions remain unverified;
-keep the experimental label.
+Automated tests and simulated browser flow pass. The user confirmed physical backup saving, flashing, readback comparison, stock restoration with ordinary text input, and reinstallation of companion firmware. The daemon reports connected=true and actionTransport=keyboard-hid with no action error. A backup preserves the firmware currently on the device, not necessarily its factory state. See `firmware/VALIDATION.md` for the verification boundary. Disconnect recovery during erase/write and other browser/OS versions remain unverified; the site is labeled experimental.

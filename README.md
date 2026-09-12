@@ -4,7 +4,7 @@ English | [日本語](README.ja.md)
 
 A small foreground daemon and CLI that map Codex lifecycle hook events to the Keychron C100 8K's per-key RGB LEDs. Each Codex task owns one key. The daemon also suppresses the C100's normal keystrokes, reads its physical 10 by 10 switch matrix, and turns assigned key presses into Codex task navigation.
 
-This is an unofficial, experimental personal project. It is not affiliated with or endorsed by OpenAI, Keychron, or QMK. It currently targets macOS 13 or later and has been tested only with the Keychron C100 8K identified as VID `0x3434`, PID `0x042c`. Its Codex integration depends on undocumented local Codex Desktop interfaces that can change between releases.
+This is an unofficial, experimental personal project. It is not affiliated with or endorsed by OpenAI, Keychron, or QMK. It currently targets macOS 13 or later and has been tested only with the Keychron C100 8K identified as VID `0x3434`, PID `0x042c`. Codex status comes from hooks and local task data; actions are sent as USB keyboard input from the C100.
 
 ## Menu bar app
 
@@ -20,13 +20,13 @@ c100-status config show                 # show resolved settings
 c100-status install-agent --config ~/.config/c100-status/config.json
 ```
 
-Edit the file before installing/restarting the agent. Set `backend` to `companion` for a C100 already running the companion firmware. Use `claudeConfigDirs` for your own profile directories; the list replaces defaults. See [the example](config.example.json) and [configuration reference](docs/configuration.md) for all keys, precedence, and migration.
+Edit the file before installing/restarting the agent. Set `backend` to `companion` for a C100 already running the companion firmware. Use `claudeConfigDirs` for your own profile directories; the list replaces defaults. See [the example](config.example.json) and [configuration reference](docs/configuration.md) for all keys and precedence.
 
 ## Required firmware and setup
 
-**Companion firmware is required. The stock-firmware/root-grabber backend has been removed.** Start with the [step-by-step flashing and recovery guide (Japanese)](firmware/FLASHING.ja.md) and the [English build/protocol reference](firmware/README.md). The guide covers the exact supported model, pinned source build, K00 DFU entry, original-flash backup, download, readback comparison, normal USB verification, and recovery. Building alone never flashes the keyboard.
+**Companion firmware is required.** Start with the [step-by-step flashing and recovery guide (Japanese)](firmware/FLASHING.ja.md) and the [English build/protocol reference](firmware/README.md). The guide covers the exact supported model, pinned source build, K00 DFU entry, original-flash backup, download, readback comparison, normal USB verification, and recovery. Building alone never flashes the keyboard.
 
-Once flashed, the C100 is a dedicated controller and remains silent without the daemon. Restoring ordinary keyboard use requires restoring firmware, not just unplugging it. `run` rejects firmware that fails the companion handshake; there is no root-grabber fallback.
+Once flashed, the C100 is a dedicated controller and remains silent without the daemon. Restoring ordinary keyboard use requires restoring firmware, not just unplugging it. `run` rejects firmware that fails the companion handshake; only a compatible device is controlled.
 
 After flashing, build and install the app as the logged-in user:
 
@@ -39,7 +39,7 @@ ditto '.build/C100 Companion.app' "$HOME/Applications/C100 Companion.app"
 "$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" config init
 ```
 
-`config init` does not overwrite existing settings. Review your config before starting. Old `backend: stock` configurations must be changed to `companion` after flashing; omitted backends and new examples now default to companion. Device locations are machine/port-specific: use `list`, not another machine's example value.
+`config init` does not overwrite existing settings. Review your config before starting. Set `backend` to `companion`; omitting it also selects companion. Device locations are machine/port-specific: use `list`, not another machine's example value.
 
 ```sh
 "$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" install-agent
@@ -55,7 +55,7 @@ Before replacing the app, save pending edits and stop the app/daemon. Re-run `in
 
 ### Input, permissions, and LEDs
 
-- No root helper or Input Monitoring setup is needed. Firmware USB keyboard output also requires no Accessibility permission. Older companion firmware without keyboard output uses the software sender, which needs Accessibility.
+- No root helper or Input Monitoring setup is needed. Firmware USB keyboard output also requires no Accessibility permission.
 - Ghostty tab navigation uses separate macOS Automation permission.
 - Firmware suppresses ordinary keystrokes. The daemon verifies a physical press, the foreground app, and enabled services before authorizing a mapped USB shortcut.
 - Other keyboards are untouched. Device selection is restricted to VID `3434`, PID `042c`, and the selected physical `locationID`.
@@ -72,7 +72,6 @@ c100-status logs
 tail -f "$(c100-status log-path)"
 ```
 
-For a previous grabber installation only, `sudo c100-status uninstall-helper` removes the old root LaunchDaemon, helper bundle/binary and helper log. It preserves user settings and Codex data. New helper installation and the privileged service are no longer supported. See the migration section in the flashing guide.
 
 ## Safe daemon dry-run
 
@@ -122,7 +121,7 @@ Pressing a green (`done`) session key acknowledges the completed state after Cod
 
 Codex does not emit the `Stop` hook when an active turn is interrupted with Esc. The daemon therefore tails the local Codex rollout for each assigned task during its two-second catalog refresh. A new `turn_aborted` event returns only that interrupted task from blue or amber to white.
 
-Project identity honors explicit projectless selection and Codex task-to-project assignments first. Legacy tasks without an assignment or catalog project ID are matched against saved local project roots (longest directory match, including multiple roots and workspace-root hints). Ambiguous roots remain projectless. The grid groups Codex tasks by resolved project ID, so separate saved projects never merge just because they share a working directory. The top eight rows are a scrollable window into the complete catalog. Projectless chats follow the named projects and scroll normally; they are not pinned to a physical row. Offscreen task status is retained. See [scroll controls](docs/scrolling.md).
+Project identity honors explicit projectless selection and Codex task-to-project assignments first. Tasks without an assignment or catalog project ID are matched against saved local project roots (longest directory match, including multiple roots and workspace-root hints). Ambiguous roots remain projectless. The grid groups Codex tasks by resolved project ID, so separate saved projects never merge just because they share a working directory. The top eight rows are a scrollable window into the complete catalog. Projectless chats follow the named projects and scroll normally; they are not pinned to a physical row. Offscreen task status is retained. See [scroll controls](docs/scrolling.md).
 
 Codex forks inherit their source task's project by following the recorded fork and subagent ancestry. This keeps both same-directory session forks and separate-worktree forks on the source project's row while assigning each fork its own column and key.
 
@@ -237,19 +236,13 @@ If `run` was installed as a LaunchAgent, remove it first:
 .build/release/c100-status install-agent --uninstall
 ```
 
-Otherwise stop the foreground daemon (Ctrl-C). Only if an old root helper remains, remove it and its LaunchDaemon/log:
-
-```sh
-sudo .build/release/c100-status uninstall-helper
-```
-
-The user-owned runtime socket, status log, and local Codex data are not removed. You can delete the repository separately after uninstalling the helper.
+Otherwise stop the foreground daemon (Ctrl-C). The user-owned runtime socket, status log, and local Codex data are not removed.
 
 ## Current limitation
 
 `clear` clears volatile status display. It does not restore the original keyboard firmware or saved RGB configuration. To restore ordinary keyboard use, follow the firmware recovery guide.
 
-Existing-task bootstrap reads Codex's local SQLite task catalog, which is an internal on-disk interface rather than a documented public API. Failure is non-fatal and is reported in the daemon log; lifecycle hooks continue to work independently.
+Existing-task bootstrap reads Codex's local SQLite task catalog. Failure is non-fatal and is reported in the daemon log; lifecycle hooks continue to work independently.
 
 ## License and protocol references
 
