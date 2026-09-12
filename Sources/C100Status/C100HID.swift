@@ -57,6 +57,7 @@ final class C100Connection {
     private var companionStates: [Set<Int>] = []
     private var companionOverflow = false
     private var nextCompanionHeartbeat = Date.distantPast
+    var brightnessPercent = 100
     private var companionFrame = [HSVColor](repeating: LEDColorName.off.color, count: 100)
 
     var locationID: Int {
@@ -401,7 +402,7 @@ final class C100Connection {
     }
 
     private func paintCompanion(_ frame: [HSVColor]) throws {
-        for payload in CompanionProtocol.colorPayloads(frame) {
+        for payload in CompanionProtocol.colorPayloads(frame.map { HSVColor(hue: $0.hue, saturation: $0.saturation, value: UInt8(min(255, Int($0.value) * brightnessPercent / 100))) }) {
             _ = try companionRequest(CompanionProtocol.colors, payload: payload)
         }
         _ = try companionRequest(CompanionProtocol.commit)

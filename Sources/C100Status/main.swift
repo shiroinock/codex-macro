@@ -72,6 +72,18 @@ enum C100StatusCLI {
             throw CLIError.usage("--companion is supported by run and install-agent only; use companion-info or companion-watch for diagnostics")
         }
         switch command {
+        case "inspect", "layer", "brightness":
+            var request = DaemonRequest(kind: .inspect, hook: nil, status: nil, keyIndex: nil, color: nil)
+            if command == "layer" {
+                guard let value = positionals.first, let layer = SessionSourceKind(rawValue: value) else { throw CLIError.usage("layer requires codex, claude-herdr, claude-terminal or claude-desktop") }
+                request = DaemonRequest(kind: .layer, hook: nil, status: nil, keyIndex: nil, color: nil, layer: layer)
+            } else if command == "brightness" {
+                guard let value = positionals.first.flatMap(Int.init), (10...200).contains(value) else { throw CLIError.usage("brightness requires 10...200") }
+                request = DaemonRequest(kind: .brightness, hook: nil, status: nil, keyIndex: nil, color: nil, brightness: value)
+            }
+            let response = try send(request, options: options)
+            try requireSuccess(response)
+            print(response.message)
         case "config":
             switch positionals.first ?? "show" {
             case "show":
@@ -2194,7 +2206,7 @@ enum C100StatusCLI {
               reports.first?[3] == 9,
               reports.last?[2] == 99,
               reports.last?[3] == 1,
-              Array(frameReports.first!.prefix(10)) == [0xA8, 10, 0, 9, 0, 0, 24, 0, 0, 0],
+              Array(frameReports.first!.prefix(10)) == [0xA8, 10, 0, 9, 0, 0, 96, 0, 0, 0],
               Array(frameReports.last!.prefix(7)) == [0xA8, 10, 99, 1, 85, 255, 112],
               Array(regionReports.first!.prefix(8)) == [0xA8, 13, 0, 28, 0, 1, 1, 1],
               Array(regionReports.last!.prefix(8)) == [0xA8, 13, 84, 16, 1, 1, 1, 1],
@@ -3060,6 +3072,10 @@ enum C100StatusCLI {
     private static func printHelp() {
         print("""
         Usage (user commands accept --config PATH; CLI overrides JSON settings):
+          c100-status app
+          c100-status inspect [--config PATH]
+          c100-status layer <codex|claude-herdr|claude-terminal|claude-desktop>
+          c100-status brightness <10...200>
           c100-status config show [--config PATH]
           c100-status config init [--config PATH] [--dry-run]
           c100-status run [--companion] [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
@@ -3102,7 +3118,11 @@ enum C100StatusCLI {
 }
 
 do {
-    try C100StatusCLI.run(Array(CommandLine.arguments.dropFirst()))
+    if CommandLine.arguments.dropFirst().first == "app" || (CommandLine.arguments.count == 1 && Bundle.main.bundleIdentifier == "com.c100.companion") {
+        MainActor.assumeIsolated { MenuBarCompanion.run() }
+    } else {
+        try C100StatusCLI.run(Array(CommandLine.arguments.dropFirst()))
+    }
 } catch {
     FileHandle.standardError.write(Data("c100-status: \(error)\n".utf8))
     Darwin.exit(1)

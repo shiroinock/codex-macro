@@ -18,6 +18,7 @@ final class StatusDaemon {
     private let claudeDesktopConfigDir: String
     private let logger: StatusLogger
     private let stateStore = StateStore()
+    private var brightnessPercent = 100
     private var connection: C100Connection?
     private var grabberLease: GrabberLeaseClient?
     private var nextGrabberHeartbeat = Date.distantFuture
@@ -276,6 +277,9 @@ final class StatusDaemon {
         }
         try stateStore.clear()
         try stateStore.discardLegacyEndedSessions()
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: socketPath + ".display.json")),
+           let value = try? JSONDecoder().decode(Int.self, from: data), (10...200).contains(value) { brightnessPercent = value }
+        connection?.brightnessPercent = brightnessPercent
         activeLayer = layerStore.load(defaultLayer: defaultLayer)
         logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
@@ -345,6 +349,23 @@ final class StatusDaemon {
     private func handle(_ request: DaemonRequest) -> DaemonResponse {
         do {
             switch request.kind {
+            case .inspect:
+                let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent]
+                let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
+                return DaemonResponse(ok: true, message: String(decoding: data, as: UTF8.self), status: nil)
+            case .layer:
+                guard let layer = request.layer else { throw CLIError.usage("Missing layer") }
+                switchLayer(to: layer)
+                return DaemonResponse(ok: true, message: "layer=\(activeLayer.rawValue)", status: nil)
+            case .brightness:
+                guard companion else { throw CLIError.usage("Brightness control requires companion firmware") }
+                guard let value = request.brightness, (10...200).contains(value) else { throw CLIError.usage("Brightness must be 10...200 percent") }
+                try JSONEncoder().encode(value).write(to: URL(fileURLWithPath: socketPath + ".display.json"), options: .atomic)
+                brightnessPercent = value
+                connection?.brightnessPercent = value
+                lastPaintedFrame = nil
+                try reconcileLEDs()
+                return DaemonResponse(ok: true, message: "brightness=\(value)", status: nil)
             case .ping:
                 return DaemonResponse(ok: true, message: "daemon is running", status: nil)
             case .clear:
@@ -765,6 +786,7 @@ final class StatusDaemon {
         }
         if connection == nil {
             connection = try C100Connection.connect(locationID: locationID, companion: companion)
+            connection?.brightnessPercent = brightnessPercent
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             lastPaintedFrame = nil
         }
@@ -957,6 +979,7 @@ final class StatusDaemon {
         }
         if connection == nil {
             connection = try C100Connection.connect(locationID: locationID, companion: companion)
+            connection?.brightnessPercent = brightnessPercent
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             // Freshly (re)connected: the board's real state is unknown, so
             // the next `reconcileLEDs()` must fall back to a full frame
@@ -1042,6 +1065,7 @@ final class StatusDaemon {
             return false
         }
         self.connection = connection
+        connection.brightnessPercent = brightnessPercent
         // A fresh connection's board state is unknown (could be a first
         // boot, or a reconnect after this daemon or another process left it
         // in some other effect/frame), so the next `reconcileLEDs` must do a

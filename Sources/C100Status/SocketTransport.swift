@@ -36,6 +36,9 @@ struct DaemonRequest: Codable {
         case key
         case clear
         case ping
+        case inspect
+        case layer
+        case brightness
     }
 
     let kind: Kind
@@ -43,6 +46,8 @@ struct DaemonRequest: Codable {
     let status: AgentStatus?
     let keyIndex: Int?
     let color: HSVColor?
+    var layer: SessionSourceKind? = nil
+    var brightness: Int? = nil
 
     static func hook(_ input: HookInput) -> Self {
         Self(kind: .hook, hook: input, status: nil, keyIndex: nil, color: nil)

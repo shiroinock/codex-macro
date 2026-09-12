@@ -4,6 +4,10 @@ A small foreground daemon and CLI that map Codex lifecycle hook events to the Ke
 
 This is an unofficial, experimental personal project. It is not affiliated with or endorsed by OpenAI, Keychron, or QMK. It currently targets macOS 13 or later and has been tested only with the Keychron C100 8K identified as VID `0x3434`, PID `0x042c`. Its Codex integration depends on undocumented local Codex Desktop interfaces that can change between releases.
 
+## Menu bar app
+
+Build with `scripts/build-app.sh`, copy `.build/C100 Companion.app` to `~/Applications`, and open it. The menu shows connection status and offers layer selection, companion LED brightness, daemon restart, and links to configuration/logs. See [the app guide](docs/companion-app.md).
+
 ## Configuration
 
 Machine-specific paths and device settings live in `~/.config/c100-status/config.json` (or `$XDG_CONFIG_HOME/c100-status/config.json`).

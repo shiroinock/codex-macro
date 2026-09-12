@@ -238,7 +238,17 @@ enum AgentInstaller {
         )
         try Data(newContents.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
         _ = try? launchctl(["bootout", serviceTarget])
-        _ = try launchctl(["bootstrap", domainTarget, path])
+        // launchd may return EIO while the previous process is still exiting.
+        // Retry only this transition; persistent failures remain visible.
+        for attempt in 0..<5 {
+            do {
+                _ = try launchctl(["bootstrap", domainTarget, path])
+                break
+            } catch {
+                guard attempt < 4, String(describing: error).contains("Bootstrap failed: 5") else { throw error }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
 
         let message: String
         switch status {
