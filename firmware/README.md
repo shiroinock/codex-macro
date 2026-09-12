@@ -4,10 +4,10 @@ A dedicated task controller for the **Keychron C100 8K, VID 3434 / PID 042c**.
 Physical switches do not emit ordinary keyboard input automatically. With the
 keyboard-output extension, the daemon can authorize a mapped shortcut after a
 physical press; without the daemon the switches remain silent. The host receives debounced physical matrix snapshots over Raw HID.
-The existing stock-firmware daemon remains the default; select this backend
-explicitly with `run --companion` after flashing. When moving this flashed
-keyboard to another machine, update that machine's daemon and enable
-`--companion` there too; its old stock-backend setup is not the companion mode.
+Companion firmware is now required by the daemon. The stock-firmware/root-grabber
+backend has been removed; `--companion` remains an optional compatibility flag.
+For backup, flashing, readback verification, and recovery, follow the
+[step-by-step installation guide (Japanese)](FLASHING.ja.md).
 
 See [physical validation results](VALIDATION.md) for the completed device test.
 
@@ -79,13 +79,13 @@ watcher and daemon from controlling the same device simultaneously.
 The optional keyboard-output extension advertises version `1` in capability
 reply byte 12; older firmware returns zero and the host retains its software
 shortcut path. Slot configuration is lazy on the first press or a changed
-shortcut, and cached until a revoke/reconnect. The host resolves current Codex
-bindings, verifies Codex is foreground, configures the slot, rechecks foreground,
+shortcut, and cached until a revoke/reconnect. The host resolves the action binding for the enabled foreground service
+(Codex or Claude Desktop), configures the slot, rechecks foreground,
 and authorizes that slot. Physical presses alone never send ordinary keys.
 Each authorization consumes one physical press ticket no older than 500 ms;
 replayed commands cannot mint new tickets. The queue is bounded to eight taps,
 with 20 ms down and at least 5 ms release between taps. Overflow is reported.
-Leaving Codex's foreground cancels output at the next daemon input poll; as with
+Leaving the supported foreground app cancels output at the next daemon input poll; as with
 ordinary keyboards, focus changes at the instant of delivery can race input.
 Release, watchdog expiry and USB suspend cancel held output and queued taps,
 forget mappings and invalidate tickets. No EEPROM writes are used. New mappings
@@ -102,11 +102,11 @@ interfere with the dedicated renderer. This is not a general keyboard mode.
 Flashing replaces the device firmware. Enter its ROM DFU mode by disconnecting
 USB, holding the top-left K00 key, and reconnecting. Verify the device before
 using a compatible AT32 DFU tool; no flashing is performed by the build script.
-To recover, enter the same bootloader and flash the standard-keymap image.
+To recover, enter the same bootloader and restore your original-flash backup;
+the standard-keymap build is an alternative without your original saved settings.
 Do not use the C100 images on any other model.
 
-After flashing, use `list` to get **this machine's** location (the location in
-the main README is from a different machine):
+After flashing, use `list` to get **this machine's** location (replace the example below):
 
 ```sh
 .build/release/c100-status list
@@ -122,15 +122,13 @@ watcher or diagnostic against the same device.
 
 `companion-info` is a read-only protocol check. `companion-watch` temporarily
 activates the controller, prints presses/releases, and clears LEDs on exit.
-`run --companion` requires successful capability negotiation and does not acquire
-the root grabber lease. All other task collection, hooks, layout, and navigation
+`run` requires successful capability negotiation. All other task collection, hooks, layout, and navigation
 continue in the logged-in user's daemon. Missing or stock firmware fails the
 handshake instead of falling back to input without suppression.
 
 After foreground validation, login startup can be configured using
-`install-agent --companion --location ...` (preview with `--dry-run`). Reinstall
-without `--companion` when returning to stock firmware. This Mac successfully ran the vendor HID path as a per-user LaunchAgent without
-a root grabber. A fresh macOS privacy-permission profile has not been tested.
+`install-agent --location ...` (preview with `--dry-run`). Keep the daemon stopped
+if restoring stock firmware: the current daemon cannot operate with it.
 
 Check corners, center keys, quick taps, simultaneous holds, release, per-key
 brightness and black, source-layer switching, task navigation, unplug/replug,

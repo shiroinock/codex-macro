@@ -22,112 +22,57 @@ c100-status install-agent --config ~/.config/c100-status/config.json
 
 Edit the file before installing/restarting the agent. Set `backend` to `companion` for a C100 already running the companion firmware. Use `claudeConfigDirs` for your own profile directories; the list replaces defaults. See [the example](config.example.json) and [configuration reference](docs/configuration.md) for all keys, precedence, and migration.
 
-## Safety properties
+## Required firmware and setup
 
-- Matches only Keychron VID `0x3434`, PID `0x042c`, and the selected physical `locationID`.
-- Does not use Karabiner, event taps, or Accessibility. The C100 must be excluded from Karabiner so this process can exclusively capture its keyboard HID interface.
-- The installed root helper only leases exclusive keyboard capture. It does not read Codex data, control LEDs, or open app URLs; those stay in the user process.
-- The helper is assembled in a private root-owned staging directory, ad-hoc signed, and then moved into place as a root-owned App Bundle. launchd never executes the build artifact from the user-writable project directory.
-- The helper accepts capture requests only for the device `locationID` fixed at installation time.
-- A three-second renewable lease releases the C100 automatically if the foreground user daemon exits or crashes.
-- Physical position comes from the C100 vendor protocol's 10 by 10 matrix state, not from the emitted keycode. Duplicate key assignments are therefore safe.
-- Does not send Keychron's `SaveLedConf` command; status colors are volatile.
-- `list` and `--dry-run` do not write to the keyboard.
-- Codex hooks are best-effort: a stopped daemon never blocks the Codex agentic loop.
-- The Unix socket and runtime files are user-only and live under `/tmp` by default.
-- Close Keychron Launcher before writing, because both clients may compete for the same vendor HID interface.
+**Companion firmware is required. The stock-firmware/root-grabber backend has been removed.** Start with the [step-by-step flashing and recovery guide (Japanese)](firmware/FLASHING.ja.md) and the [English build/protocol reference](firmware/README.md). The guide covers the exact supported model, pinned source build, K00 DFU entry, original-flash backup, download, readback comparison, normal USB verification, and recovery. Building alone never flashes the keyboard.
 
-## Experimental companion firmware
+Once flashed, the C100 is a dedicated controller and remains silent without the daemon. Restoring ordinary keyboard use requires restoring firmware, not just unplugging it. `run` rejects firmware that fails the companion handshake; there is no root-grabber fallback.
 
-A new opt-in `run --companion` backend uses a dedicated C100 firmware: key
-changes arrive as Raw HID events, normal keyboard output is suppressed in the
-firmware, and each LED's HSV brightness/black is rendered directly. This backend
-uses no privileged grabber. The stock firmware workflow below remains the default.
-See [firmware build, protocol, and validation instructions](firmware/README.md).
-[Physical validation](firmware/VALIDATION.md) covers all 100 keys, LED brightness
-and blackout, watchdog expiry, layer switching, and task navigation on one Mac.
-
-## Build
+After flashing, build and install the app as the logged-in user:
 
 ```sh
 swift build -c release
 .build/release/c100-status self-test
-.build/release/c100-status list
+scripts/build-app.sh --skip-build
+mkdir -p "$HOME/Applications"
+ditto '.build/C100 Companion.app' "$HOME/Applications/C100 Companion.app"
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" config init
 ```
 
-The currently observed device location is `0x110000`. Install the privileged grabber once:
+`config init` does not overwrite existing settings. Review your config before starting. Old `backend: stock` configurations must be changed to `companion` after flashing; omitted backends and new examples now default to companion. Device locations are machine/port-specific: use `list`, not another machine's example value.
 
 ```sh
-sudo .build/release/c100-status install-helper --location 0x110000
-.build/release/c100-status grabber-status
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" install-agent
+open "$HOME/Applications/C100 Companion.app" --args app --layout
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" inspect
 ```
 
-The installer creates the root-owned, background-only `/Applications/C100 Status Grabber.app` and registers a root-owned LaunchDaemon under `/Library/LaunchDaemons`. The app bundle exists so it can be selected in macOS's Input Monitoring privacy pane; it has no Dock icon or user interface. The helper starts automatically but does not seize the keyboard until the user daemon requests a lease.
+Expect `connected: true`, `backend: companion`, and `actionTransport: keyboard-hid` with the keyboard-output extension. If the executable is not on PATH, use the installed absolute path wherever this README says `c100-status`.
 
-After installation, open **System Settings > Privacy & Security > Input Monitoring**, add **C100 Status Grabber** from `/Applications`, and enable it. Then restart the helper once:
+The per-user LaunchAgent is `~/Library/LaunchAgents/com.kotainaba.c100-status.run.plist`. It starts at login and is kept alive by launchd. `--label` changes its label; `--binary` changes its executable. `install-agent --dry-run` previews registration, and `install-agent --uninstall` stops/removes it. Neither `run` nor `install-agent` runs as root. Stop manual daemons/watchers before installing to avoid competing over the device/socket.
+
+Before replacing the app, save pending edits and stop the app/daemon. Re-run `install-agent` after copying the rebuilt app to restart the installed process.
+
+### Input, permissions, and LEDs
+
+- No root helper or Input Monitoring setup is needed. Firmware USB keyboard output also requires no Accessibility permission. Older companion firmware without keyboard output uses the software sender, which needs Accessibility.
+- Ghostty tab navigation uses separate macOS Automation permission.
+- Firmware suppresses ordinary keystrokes. The daemon verifies a physical press, the foreground app, and enabled services before authorizing a mapped USB shortcut.
+- Other keyboards are untouched. Device selection is restricted to VID `3434`, PID `042c`, and the selected physical `locationID`.
+- LED state and shortcut assignments are volatile; no `SaveLedConf` or EEPROM writes are used. Loss of host traffic blacks out the device and revokes output after about three seconds.
+- Close Keychron Launcher, and do not run diagnostic watchers alongside the daemon.
+- Hooks are best-effort; a stopped daemon does not block Codex. Socket/runtime files are user-only.
+
+LED indexes are row-major `row * 10 + column`, with zero-based rows/columns and indexes `0...99`. Named colors are `off`, `white`, `red`, `green`, `blue`, and `amber`.
 
 ```sh
-sudo launchctl kickstart -k system/com.kotainaba.c100-status.grabber
+c100-status ping
+c100-status inspect
+c100-status logs
+tail -f "$(c100-status log-path)"
 ```
 
-After that, install `run` itself as a per-user LaunchAgent so it starts at login and restarts if it crashes, instead of running it by hand in a terminal:
-
-```sh
-c100-status install-agent --location 0x110000
-```
-
-`run` deliberately refuses to start as root. Administrative privileges are used only by `install-helper` and `uninstall-helper`; `install-agent` also refuses to run as root, since it manages your per-user (`gui/<uid>`) launchd domain, not the root helper.
-
-Re-run `install-helper` after rebuilding or updating the executable. Because the locally built App Bundle is ad-hoc signed, macOS may ask you to enable Input Monitoring again after replacement. `install-agent` also picks up a rebuilt executable's new absolute path on re-run (see "Development loop" below).
-
-`install-agent` writes `~/Library/LaunchAgents/com.kotainaba.c100-status.run.plist` (override the label with `--label`) with `ProgramArguments` set to `[binary, "run"]` plus `--location <hex>` when given, `RunAtLoad`/`KeepAlive` true, and `ProcessType` `Interactive` (`run` needs an interactive-class process to receive HID/AppKit events). It then loads it with `launchctl bootstrap gui/<uid>`; re-running is idempotent -- an unchanged plist is just restarted (`bootout`+`bootstrap`), a changed one (e.g. a new `--location` or a rebuilt binary path) is rewritten and reloaded, both distinguished in the printed `status=`. `--dry-run` prints the plist and the `launchctl` commands that would run without writing anything or touching launchd. `--uninstall` runs `launchctl bootout` and deletes the plist:
-
-```sh
-c100-status install-agent --dry-run     # preview only, zero side effects
-c100-status install-agent --uninstall   # stop and remove the LaunchAgent
-```
-
-Once installed, stdout/stderr are discarded (the daemon logs to `/tmp/keychron-c100-status-<uid>.log` regardless); use `c100-status logs` / `log-path` rather than the LaunchAgent's own output.
-
-**If you were previously starting `run` by hand** (e.g. `nohup .build/release/c100-status run --location 0x110000 &`), stop that process first. Two `run` instances fight over the same grabber lease/socket and both lose it, so starting the LaunchAgent while a manual instance still holds the lease is a known way to make both stop working; if you need both running at once (e.g. one manual `--dry-run` instance for testing alongside the installed one), give the manual instance a different `--socket`/`--grabber-socket`, or use a different `--location` if you have more than one C100 connected.
-
-`run` stays in the foreground as the logged-in user (or, once installed, as the LaunchAgent's child process). While it renews the helper lease, normal keystrokes from the C100 are suppressed; other keyboards are unaffected. Press Ctrl-C (or `launchctl bootout` the LaunchAgent) to release the lease and stop the daemon. A crash releases the lease within three seconds. It logs to both the terminal (when run manually) and `/tmp/keychron-c100-status-<uid>.log`.
-
-### Development loop
-
-After changing and rebuilding the daemon, restart the installed LaunchAgent to pick up the new binary without re-running `install-agent` (which is also safe to re-run, but `kickstart -k` is faster when the plist itself -- the binary's absolute path, `--location`, or `--label` -- hasn't changed):
-
-```sh
-swift build -c release && launchctl kickstart -k gui/$(id -u)/com.kotainaba.c100-status.run
-```
-
-If the plist itself needs to change (moved the build to a new absolute path, changed `--location`), re-run `install-agent` instead -- it rewrites the plist and reloads it in one step.
-
-The local daemon protocol is newline-framed. A client that connects but does not finish a request is disconnected after 500 ms, so it cannot block HID polling or helper lease renewal. If any other synchronous operation stalls the main loop for at least 750 ms, the daemon logs `daemon loop delayed duration_ms=...` after it recovers.
-
-At startup, the daemon turns all 100 LEDs off, then imports existing local Codex tasks from the read-only Codex task catalog. User-created Codex forks are supplemented from the local Codex state database because they are not exposed in that catalog; internal subagent sessions remain excluded. Imported tasks begin white. The catalog is refreshed periodically so a task can be assigned before its first lifecycle hook arrives. Catalog entries that disappear are released. `SessionEnd` only returns a still-cataloged task to white because Codex also emits it while unloading task history during app shutdown or restart.
-
-The C100 firmware ignores the per-key HSV value component in its solid per-key renderer, so sending black does not turn off one key. The daemon therefore uses the volatile mixed-RGB mode: assigned keys belong to a region rendered by the per-key effect, while unassigned keys belong to a region with no effect. No firmware or EEPROM write is required.
-
-From another terminal:
-
-```sh
-.build/release/c100-status ping
-.build/release/c100-status status working
-.build/release/c100-status status approval
-.build/release/c100-status status done
-.build/release/c100-status key 42 red
-.build/release/c100-status key 42 off
-.build/release/c100-status clear
-.build/release/c100-status logs
-tail -f "$(.build/release/c100-status log-path)"
-```
-
-Individual LEDs use zero-based indexes `0...99`. On a logical 10 by 10 grid,
-the index is `row * 10 + column`, with both row and column starting at zero.
-Available named colors are `off`, `white`, `red`, `green`, `blue`, and `amber`.
-The LED order and the physical matrix order have both been verified as this same
-row-major `0...99` index.
+For a previous grabber installation only, `sudo c100-status uninstall-helper` removes the old root LaunchDaemon, helper bundle/binary and helper log. It preserves user settings and Codex data. New helper installation and the privileged service are no longer supported. See the migration section in the flashing guide.
 
 ## Safe daemon dry-run
 
@@ -185,9 +130,9 @@ Pressing an assigned key navigates to `codex://threads/<session_id>`. If the Cod
 
 ## Claude Code (herdr / terminal / Claude Desktop)
 
-The daemon also tracks Claude Code sessions alongside Codex, on the same 10 by 10 grid (rows merge by shared cwd/project, so a herdr pane and a Codex task in the same working directory can share a row). herdr, plain-terminal (Ghostty), and Claude Desktop Claude Code sessions are all implemented.
+The daemon tracks herdr, plain-terminal (Ghostty), and Claude Desktop Claude Code sessions on independent source layers. Different services do not merge rows even when they share a working directory.
 
-A session with at least one subagent running stays blue (`working`) even while its main thread is idle waiting on that subagent -- e.g. the main agent has already handed a turn off to a subagent and gone quiet, which would otherwise `Stop`/`idle_prompt` the key to green/white while real work is still happening. This is driven by the `SubagentStart`/`SubagentStop` hooks: the daemon counts a session's currently-running subagents and, whenever that count is above zero, overrides whatever status the session's own hooks would otherwise show; the override is lifted, falling back to that underlying status, once the last tracked subagent stops. A subagent whose matching `SubagentStop` never arrives (crashed process, dropped async hook) doesn't pin the key at working forever: the count is force-cleared after 2 hours, or sooner if the session's on-disk `subagents/agent-*.jsonl` transcripts have all gone untouched for 30 minutes.
+A session with tracked subagents remains blue even while its parent is idle. `SubagentStart`/`SubagentStop` track each agent; the last stop restores the parent's own status. Tracking expires after two hours. After a 30-minute grace period, each individual subagent is also removed if its own transcript cannot be confirmed fresh; one active sibling does not keep a stale agent alive.
 
 ### Installing the Claude Code hooks
 
@@ -210,8 +155,8 @@ If you also use herdr, it manages its own `hooks/herdr-agent-state.sh` entries i
 
 While `run` is active, a dedicated background thread polls `herdr agent list` and `herdr workspace list` every two seconds (independent of the daemon's 10 ms HID poll loop, so a slow or hung herdr call never affects key-press responsiveness). Only `"agent":"claude"` entries are tracked. Each herdr-reported session is placed using:
 
-- **Row**: herdr's `workspace_id`/`number` (ascending), merged onto an existing Codex row if their cwds are the same directory.
-- **Column**: the pane's number in its `pane_id` (e.g. `w9:p1` -> column 0).
+- **Row**: herdr's `workspace_id`/`number` (ascending), within the herdr layer.
+- **Column**: dense position after sorting panes by tab, vertical position, horizontal position, and pane number.
 - **Initial status**: herdr's `agent_status` (`idle`/`working`/`blocked`/`done`/`unknown` -> `idle`/`working`/`approval`/`done`/`idle`), used only until the session's first Claude Code hook arrives -- after that, hook events are authoritative. If herdr keeps reporting `idle`/`done` for two consecutive polls while no hook has been seen since, the daemon treats the hook as missed and applies herdr's status directly (recovery path).
 
 If `herdr agent list`/`workspace list` fails, the daemon keeps showing the last successful snapshot for 15 seconds before treating herdr as empty (so a brief hiccup doesn't blank the grid). When a pane closes (or herdr stops reporting a session it previously reported), that session's key is released immediately, the same as a Codex session leaving the catalog.
@@ -247,7 +192,7 @@ Desktop writes one file per session under `~/Library/Application Support/Claude/
 
 A session counts as alive if it isn't archived (`isArchived: false`) and at least one of the following holds: its `lastActivityAt` is within 6 hours, its transcript `.jsonl` mtime is within 6 hours, or the daemon has already hook-registered it as a `claude-desktop` session (hooks are authoritative once they've fired, so a session the daemon has heard from directly is never dropped just because this scan's timestamps look old). If Claude Desktop (`com.anthropic.claudefordesktop`) isn't currently running, the scan reports no sessions at all -- there would be nothing to navigate to, and a quit app can't send `SessionEnd` for whatever it had open.
 
-**Claude Desktop's `claude://` URL scheme cannot target a specific session** -- this was confirmed while implementing this integration, not merely assumed. Pressing an assigned Desktop session's key therefore does one of two things:
+**The current navigation adapter does not target a specific Claude Desktop session.** This describes the implemented fallback, not a claim about every capability of current or future Claude URL schemes. Pressing its key does one of two things:
 
 - If that session's current status is `approval`, it opens `claude://code/needs-input`, which shows Desktop's cross-session "needs your input" list (not the specific session, but a real navigational improvement over nothing).
 - For any other status, it just activates Claude Desktop via `NSWorkspace` (bringing the app forward, without selecting a particular conversation), the same "best available fallback" herdr and Ghostty navigation use when they can't pinpoint a window.
@@ -258,7 +203,7 @@ A session counts as alive if it isn't archived (`isArchived: false`) and at leas
 
 The keyboard multiplexes four independent grids ("layers"), one per session source: Codex Desktop, herdr, plain-terminal Claude Code, and Claude Desktop. Only one layer's sessions are shown on the main 0-79 key grid at a time; switching layers is instant and every layer keeps its own row/project bookkeeping, so a herdr session and a Codex session that happen to share a cwd never merge into (or fight over) the same row.
 
-**The bottom two physical rows (keys 80–99) are utility rows.** Key 88 is up, and 97/98/99 are left/down/right. Horizontal scrolling moves all project rows together; keys 80–87 are inactive. Keys 90–93 retain the layer switches; 89 and 94–96 stay off.
+**In the default layout, the bottom two physical rows (keys 80–99) are utility rows.** The editor can resize/reposition the task area and controls. Key 88 is up, and 97/98/99 are left/down/right. Horizontal scrolling moves all project rows together; keys 80–87 are inactive. Keys 90–93 retain the layer switches; 89 and 94–96 stay off.
 
 | Key | Layer | Base color | Why |
 | --- | --- | --- | --- |
@@ -269,19 +214,18 @@ The keyboard multiplexes four independent grids ("layers"), one per session sour
 
 Pressing a layer key switches the active layer immediately and persists the choice to `/tmp/keychron-c100-status-<uid>-layer.json`, so a daemon restart resumes on the same layer. The default (first run, or if that file is missing/corrupt) is Codex; set `defaultLayer` to change it. A saved selection takes precedence.
 
-**Non-active layers still light up their key** so you know something needs attention without switching over: whenever a background layer has a session in `approval`, `error`, or `done` (checked in that priority order), its key blinks -- toggling roughly every 600ms between its normal base color and that status's real color -- instead of staying static. The active layer's own key is always shown at full brightness with no blink. Because a layer's brand hue can sit close to a status color (Codex's blue-violet is near `.working`'s blue; Claude's orange is near `.approval`'s amber and `.error`'s red), the blink -- not the static color alone -- is what makes "this layer needs attention" reliably distinguishable from "this is just the layer's resting color".
+**Non-active layers still light up their key** so you know something needs attention without switching over: whenever a background layer has a session in `approval`, `error`, or `done` (checked in that priority order), its key blinks -- toggling roughly every 600ms between its normal base color and that status's real color -- instead of staying static. The active layer's key uses its active-state brightness without blinking; overall brightness still applies. Because a layer's brand hue can sit close to a status color (Codex's blue-violet is near `.working`'s blue; Claude's orange is near `.approval`'s amber and `.error`'s red), the blink -- not the static color alone -- is what makes "this layer needs attention" reliably distinguishable from "this is just the layer's resting color".
 
 Hooks and catalog syncs for non-active layers keep updating that layer's internal state (and therefore its key's blink) in the background; they just don't repaint the main grid until you switch to that layer. Navigating a key (0-79) and the "press a done session to mark it read" acknowledgement only ever apply to the currently active layer's sessions.
 
 ## Runtime paths and options
 
 - Socket: `/tmp/keychron-c100-status-<uid>.sock`; override with `--socket PATH` on both daemon and clients.
-- Grabber socket: `/var/run/keychron-c100-grabber-<uid>.sock`; override with `--grabber-socket PATH` for diagnostics.
 - Log: `/tmp/keychron-c100-status-<uid>.log`; override with `--log-file PATH` on `run`, `logs`, and `log-path`.
-- Device: pass `--location 0x110000` to `run` when selecting among multiple C100 devices.
+- Device: pass the location reported by `list` to `run --location` when selecting among multiple C100 devices.
 - Claude Code config directories: set `claudeConfigDirs` or `--claude-config-dirs PATH1,PATH2` to replace the scanned profile list. No named personal profiles are added implicitly.
 - Claude Desktop sessions directory: `~/Library/Application Support/Claude/claude-code-sessions`; override with `--claude-desktop-dir PATH`.
-- Input ownership: startup fails rather than leaving normal C100 typing enabled when exclusive capture cannot be obtained.
+- Device compatibility: the daemon requires a successful companion firmware handshake.
 
 `apply <status>` bypasses the daemon and writes directly to HID. Use it only for troubleshooting while the daemon and Keychron Launcher are stopped.
 
@@ -293,7 +237,7 @@ If `run` was installed as a LaunchAgent, remove it first:
 .build/release/c100-status install-agent --uninstall
 ```
 
-Otherwise stop the foreground daemon (Ctrl-C), then remove the root helper, LaunchDaemon, and helper log:
+Otherwise stop the foreground daemon (Ctrl-C). Only if an old root helper remains, remove it and its LaunchDaemon/log:
 
 ```sh
 sudo .build/release/c100-status uninstall-helper
@@ -303,7 +247,7 @@ The user-owned runtime socket, status log, and local Codex data are not removed.
 
 ## Current limitation
 
-`clear` turns all volatile per-key colors off. The daemon does not yet snapshot and restore the user's previous RGB mode. Unplugging/reconnecting the keyboard restores its saved configuration because this tool never sends `SaveLedConf`.
+`clear` clears volatile status display. It does not restore the original keyboard firmware or saved RGB configuration. To restore ordinary keyboard use, follow the firmware recovery guide.
 
 Existing-task bootstrap reads Codex's local SQLite task catalog, which is an internal on-disk interface rather than a documented public API. Failure is non-fatal and is reported in the daemon log; lifecycle hooks continue to work independently.
 
@@ -311,6 +255,8 @@ Existing-task bootstrap reads Codex's local SQLite task catalog, which is an int
 
 The original Swift source in this repository is licensed under the MIT License. See [LICENSE](LICENSE). Interoperability notes and third-party acknowledgements are in [NOTICE.md](NOTICE.md).
 
-### レイアウト編集と Codex アクション
+## Layout, actions, and services
 
-メニューバーの **C100 → レイアウトを編集…** から、タスクエリアの移動・サイズ変更・縦横入れ替え、矢印とサービス切り替えの再配置、サービスの ON/OFF、Codex の操作ボタン追加ができます。Codex 本体の設定可能なアプリ内コマンドを読み込み、操作名／ID で検索します。詳しくは [レイアウトエディタ](docs/layout-editor.md) を参照してください。
+The settings window has three tabs. **Layout** uses an inline right panel for clicked keys, with function selection, action search, position/size controls and drag-to-move. There is no placed-parts list or assignment modal. **Actions** shows outgoing shortcuts for selected services and distinguishes imported Codex settings, bundled Claude Code-tab defaults and unsupported routes. **Services** configures enabled providers, initial display and profile/data paths.
+
+Assign one semantic action per key. Enabled services and the foreground app determine the outgoing shortcut; disabled services never receive it. Multiple keys may share an action. Claude Desktop settings import and Claude archive delivery remain unsupported. Claude CLI/herdr task tracking/navigation works, but their keyboard action routes are not implemented. See [the layout editor](docs/layout-editor.md).

@@ -14,9 +14,7 @@ final class StatusDaemon {
     private var actionError: String?
     private let socketPath: String
     private let locationID: Int?
-    private let grabberSocketPath: String
     private let dryRun: Bool
-    private let companion: Bool
     private let codexPaths: CodexPaths
     private let configuredServices: [SessionSourceKind]?
     private var enabledSources: Set<SessionSourceKind> {
@@ -32,13 +30,6 @@ final class StatusDaemon {
     private var virtualProjects: [SessionSourceKind: [String: Int]] = [:]
     private var brightnessPercent = 100
     private var connection: C100Connection?
-    private var grabberLease: GrabberLeaseClient?
-    private var nextGrabberHeartbeat = Date.distantFuture
-    /// Set on the first failed heartbeat since the last success; cleared on
-    /// recovery. Used to bound how long we tolerate a flaky grabber link
-    /// before giving up and letting `run()` exit (KeepAlive restarts us).
-    private var grabberHeartbeatFailureSince: Date?
-    private var protocolVersion = 0
     private var pressedKeyIndexes: Set<Int> = []
     private var arrowKeyRepeat = ArrowKeyRepeat()
     private var nextCatalogSync = Date.distantPast
@@ -224,9 +215,7 @@ final class StatusDaemon {
         socketPath: String,
         logURL: URL,
         locationID: Int?,
-        grabberSocketPath: String,
         dryRun: Bool,
-        companion: Bool = false,
         herdrBinaryPath: String? = nil,
         claudeConfigDirs: [String]? = nil,
         claudeDesktopDir: String? = nil,
@@ -245,9 +234,7 @@ final class StatusDaemon {
         self.keyboardLayout = try self.layoutStore.load()
         self.socketPath = socketPath
         self.locationID = locationID
-        self.grabberSocketPath = grabberSocketPath
         self.dryRun = dryRun
-        self.companion = companion
         self.codexPaths = codexPaths
         self.defaultLayer = defaultLayer
         self.configuredServices = enabledServices
@@ -276,7 +263,7 @@ final class StatusDaemon {
     }
 
     private func runLoop() throws {
-        defer { connection?.stopCompanion(); grabberLease?.release() }
+        defer { connection?.stopCompanion() }
         daemonStopRequested = 0
         Darwin.signal(SIGINT, requestDaemonStop)
         Darwin.signal(SIGTERM, requestDaemonStop)
@@ -333,9 +320,6 @@ final class StatusDaemon {
             }
             previousLoopStartedAt = loopStartedAt
 
-            if grabberLease != nil, Date() >= nextGrabberHeartbeat {
-                try renewGrabberLease()
-            }
             if !dryRun {
                 try pollMatrix()
             }
@@ -398,7 +382,7 @@ final class StatusDaemon {
             case .inspect:
                 let visible = try visibleAssignments()
                 let viewport = configuredViewport()
-                let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
+                let info: [String: Any] = ["connected": connection != nil, "backend": "companion", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
                     "topRow": viewport.topRow, "leftColumn": viewport.leftColumn, "viewportRows": viewport.rowCount, "viewportColumns": viewport.columnCount,
                     "enabledSources": enabledSources.map(\.rawValue).sorted(), "actionError": actionError ?? "",
                     "actionTransport": connection?.supportsKeyboardOutput == true ? "keyboard-hid" : "accessibility",
@@ -412,7 +396,6 @@ final class StatusDaemon {
                 switchLayer(to: layer)
                 return DaemonResponse(ok: true, message: "layer=\(activeLayer.rawValue)", status: nil)
             case .brightness:
-                guard companion else { throw CLIError.usage("Brightness control requires companion firmware") }
                 guard let value = request.brightness, (10...200).contains(value) else { throw CLIError.usage("Brightness must be 10...200 percent") }
                 try JSONEncoder().encode(value).write(to: URL(fileURLWithPath: socketPath + ".display.json"), options: .atomic)
                 brightnessPercent = value
@@ -840,7 +823,7 @@ final class StatusDaemon {
             return
         }
         if connection == nil {
-            connection = try C100Connection.connect(locationID: locationID, companion: companion)
+            connection = try C100Connection.connect(locationID: locationID, companion: true)
             connection?.brightnessPercent = brightnessPercent
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             lastPaintedFrame = nil
@@ -1064,7 +1047,7 @@ final class StatusDaemon {
             return
         }
         if connection == nil {
-            connection = try C100Connection.connect(locationID: locationID, companion: companion)
+            connection = try C100Connection.connect(locationID: locationID, companion: true)
             connection?.brightnessPercent = brightnessPercent
             logger.log(.info, "HID connected location=\(locationID.map { String(format: "0x%X", $0) } ?? "auto")")
             // Freshly (re)connected: the board's real state is unknown, so
@@ -1127,7 +1110,7 @@ final class StatusDaemon {
         var lastWaitLogAt: Date?
         while daemonStopRequested == 0 {
             do {
-                return try C100Connection.connect(locationID: locationID, companion: companion)
+                return try C100Connection.connect(locationID: locationID, companion: true)
             } catch C100ConnectionError.notFound {
                 let now = Date()
                 if lastWaitLogAt == nil || now.timeIntervalSince(lastWaitLogAt!) >= Self.hidWaitLogInterval {
@@ -1160,96 +1143,9 @@ final class StatusDaemon {
         let actualLocation = connection.locationID
         logger.log(.info, "HID connected location=\(String(format: "0x%X", actualLocation))")
 
-        if companion {
-            pressedKeyIndexes = try connection.drainCompanionStates().last ?? []
-            logger.log(.info, "input capture=firmware transport=companion normal_keystrokes=suppressed matrix_polling=disabled")
-            return true
-        }
-        protocolVersion = try connection.protocolVersion()
-        pressedKeyIndexes = try connection.pressedKeyIndexes(protocolVersion: protocolVersion)
-        logger.log(.info, "matrix polling=enabled protocol=\(protocolVersion) layout=10x10 interval_ms=10")
-
-        let lease = GrabberLeaseClient(socketPath: grabberSocketPath, locationID: actualLocation)
-        do {
-            try lease.acquire()
-            grabberLease = lease
-            nextGrabberHeartbeat = Date().addingTimeInterval(1)
-            logger.log(.info, "input capture=privileged_helper lease=active normal_keystrokes=suppressed")
-        } catch {
-            self.connection = nil
-            throw CLIError.runtime(
-                "Privileged C100 grabber is unavailable at \(grabberSocketPath). "
-                    + "Install it once with `sudo c100-status install-helper --location \(String(format: "0x%X", actualLocation))`; error: \(error)"
-            )
-        }
+        pressedKeyIndexes = try connection.drainCompanionStates().last ?? []
+        logger.log(.info, "input capture=firmware transport=companion normal_keystrokes=suppressed")
         return true
-    }
-
-    /// Retry interval after a single failed heartbeat: fast enough that a
-    /// transient socket hiccup (e.g. the 500ms `SocketTransport` read
-    /// timeout) is retried well within the helper's lease window.
-    private static let grabberHeartbeatRetryInterval: TimeInterval = 0.25
-    /// If heartbeats keep failing for longer than this, proactively try a
-    /// fresh `acquire()` rather than keep heartbeating a lease the helper
-    /// may already consider expired (helper `leaseDuration` is 3s -- see
-    /// GrabberService.swift:66).
-    private static let grabberReacquireGraceInterval: TimeInterval = 2.5
-    /// Total time we tolerate a lost/unreachable grabber before giving up
-    /// and throwing (which exits the daemon; launchd KeepAlive restarts it).
-    private static let grabberFailureTimeout: TimeInterval = 10
-
-    private func renewGrabberLease() throws {
-        guard let grabberLease else { return }
-        do {
-            try grabberLease.heartbeat()
-            nextGrabberHeartbeat = Date().addingTimeInterval(1)
-            if let failureSince = grabberHeartbeatFailureSince {
-                logger.log(
-                    .info,
-                    "privileged grabber lease recovered downtime_ms="
-                        + "\(Int(Date().timeIntervalSince(failureSince) * 1_000))"
-                )
-                grabberHeartbeatFailureSince = nil
-            }
-        } catch {
-            let now = Date()
-            let failureSince = grabberHeartbeatFailureSince ?? now
-            grabberHeartbeatFailureSince = failureSince
-            let failureDurationMs = Int(now.timeIntervalSince(failureSince) * 1_000)
-            logger.log(.warning, "privileged grabber heartbeat failed duration_ms=\(failureDurationMs) error=\(error)")
-
-            let leaseLost: Bool
-            if case GrabberLeaseError.leaseLost = error {
-                leaseLost = true
-            } else {
-                leaseLost = false
-            }
-            if leaseLost || now.timeIntervalSince(failureSince) >= Self.grabberReacquireGraceInterval {
-                do {
-                    try grabberLease.acquire()
-                    nextGrabberHeartbeat = Date().addingTimeInterval(1)
-                    logger.log(
-                        .info,
-                        "privileged grabber lease recovered via reacquire downtime_ms="
-                            + "\(Int(Date().timeIntervalSince(failureSince) * 1_000))"
-                    )
-                    grabberHeartbeatFailureSince = nil
-                    return
-                } catch let reacquireError {
-                    logger.log(
-                        .warning,
-                        "privileged grabber lease reacquire failed duration_ms="
-                            + "\(Int(Date().timeIntervalSince(failureSince) * 1_000)) error=\(reacquireError)"
-                    )
-                }
-            }
-
-            if now.timeIntervalSince(failureSince) >= Self.grabberFailureTimeout {
-                logger.log(.error, "privileged grabber lease lost error=\(error)")
-                throw error
-            }
-            nextGrabberHeartbeat = Date().addingTimeInterval(Self.grabberHeartbeatRetryInterval)
-        }
     }
 
     private func pollMatrix() throws {
@@ -1260,7 +1156,7 @@ final class StatusDaemon {
             try connection.cancelKeyboardOutput()
             hardwareActionProcess = nil
         }
-        let states = companion ? try connection.drainCompanionStates() : [try connection.pressedKeyIndexes(protocolVersion: protocolVersion)]
+        let states = try connection.drainCompanionStates()
         for current in states {
             let newlyPressed = current.subtracting(pressedKeyIndexes)
             pressedKeyIndexes = current

@@ -15,6 +15,13 @@ enum ConfigurationTests {
             try Data(text.utf8).write(to: config)
             return try Configuration.load(explicitPath: config.path, home: "/fixture/home", environment: [:]).0
         }
+        var defaults = Options(); try defaults.apply(Configuration(), environment: [:])
+        try check(defaults.companion && Configuration.example.backend == "companion", "firmware backend is the only default")
+        for args in [["run", "--backend", "stock"], ["install-helper"], ["grabber-service"], ["grabber-status"]] {
+            var rejected = false
+            do { try C100StatusCLI.run(args) } catch { rejected = true }
+            try check(rejected, "retired privileged entry point rejects execution")
+        }
         let document = try load(#"{"schemaVersion":1,"backend":"companion","locationID":"0x2110000","claudeConfigDirs":["profiles/team a","profiles/team a","~/custom"],"codexHome":"data","codexCatalogDatabase":"catalog.db","codexStateDatabase":"state.db","codexSidebarState":"sidebar.json","claudeDesktopConfigDir":"desktop-profile","socketPath":"daemon.sock","defaultLayer":"claude-terminal"}"#)
         let standalone = try load(#"{"enabledServices":["claude-terminal"],"defaultLayer":"claude-terminal","claudeConfigDirs":["~/work","~/personal"]}"#)
         var standaloneOptions = Options()
@@ -33,16 +40,16 @@ enum ConfigurationTests {
         try check(options.companion && options.locationID == 0x2110000 && options.defaultLayer == .claudeTerminal, "device/default layer")
         try check(options.codexPaths.home == root.path + "/data" && options.socketPath == root.path + "/daemon.sock", "config-relative paths")
         options.providedFlags = ["--backend", "--claude-config-dirs", "--codex-home"]
-        options.companion = false; options.claudeConfigDirs = ["cli-profile"]
+        options.companion = true; options.claudeConfigDirs = ["cli-profile"]
         options.codexHome = "/cli-codex"
         try options.apply(document, environment: [:], home: "/fixture/home", cwd: root.path)
-        try check(!options.companion && options.claudeConfigDirs == [root.path + "/cli-profile"] && options.codexPaths.home == "/cli-codex", "CLI precedence")
+        try check(options.companion && options.claudeConfigDirs == [root.path + "/cli-profile"] && options.codexPaths.home == "/cli-codex", "CLI precedence")
         var empty = Options(); try empty.apply(try load(#"{"claudeConfigDirs":[]}"#), environment: [:])
         try check(empty.claudeConfigDirs.isEmpty, "explicit empty profile list")
         var environmentOptions = Options()
         try environmentOptions.apply(Configuration(), environment: ["CLAUDE_CONFIG_DIR": "/env/claude", "CODEX_HOME": "/env/codex", "HERDR_BIN": "/env/herdr"], home: "/fixture/home")
         try check(environmentOptions.claudeConfigDirs == ["/env/claude"] && environmentOptions.codexPaths.home == "/env/codex" && environmentOptions.herdrBinaryPath == "/env/herdr", "environment fallback")
-        for bad in [#"{"claudeConfigDir":[]}"#, #"{"schemaVersion":2}"#, #"{"backend":"typo"}"#, #"{"locationID":"-1"}"#, #"{"locationID":"0x100000000"}"#, #"{"defaultLayer":"typo"}"#, #"{"claudeConfigDirs":[""]}"#, #"{"claudeConfigDirs":null}"#, #"{"claudeConfigDirs":"x"}"#] {
+        for bad in [#"{"backend":"stock"}"#,#"{"claudeConfigDir":[]}"#, #"{"schemaVersion":2}"#, #"{"backend":"typo"}"#, #"{"locationID":"-1"}"#, #"{"locationID":"0x100000000"}"#, #"{"defaultLayer":"typo"}"#, #"{"claudeConfigDirs":[""]}"#, #"{"claudeConfigDirs":null}"#, #"{"claudeConfigDirs":"x"}"#] {
             var rejected = false
             do { _ = try load(bad) } catch { rejected = true }
             try check(rejected, "reject invalid schema/value: " + bad)
@@ -61,7 +68,7 @@ enum ConfigurationTests {
         let plist = try PropertyListSerialization.propertyList(from: Data(plistData.utf8), format: nil) as! [String: Any]
         try check(plist["EnvironmentVariables"] as? [String: String] == ["PATH": "/fixture/a&b", "CODEX_HOME": "/fixture/codex"], "launchd environment escaping")
         try check(plist["ProgramArguments"] as? [String] == ["/tmp/c100-status", "run"] + args, "launchd argv propagation")
-        try check(args.contains(config.path) && !args.contains("--location") && args.suffix(2) == ["--backend", "stock"], "file reference plus CLI override")
+        try check(args.contains(config.path) && !args.contains("--location") && args.suffix(2) == ["--backend", "companion"], "file reference plus CLI override")
 
         // Custom paths used by both the catalog and sidebar adapter.
         let paths = CodexPaths(home: root.path + "/data", catalogDatabase: root.path + "/catalog.db", stateDatabase: root.path + "/state.db", sidebarState: root.path + "/sidebar.json")

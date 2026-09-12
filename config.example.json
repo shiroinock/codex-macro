@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "backend": "stock",
+  "backend": "companion",
   "locationID": "auto",
   "claudeConfigDirs": ["~/.claude"],
   "codexHome": "~/.codex",

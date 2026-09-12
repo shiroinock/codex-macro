@@ -10,7 +10,7 @@ Setting precedence: explicit CLI flag > JSON field > supported environment varia
 | --- | --- |
 | `schemaVersion` | `1` |
 | `layoutPath` | `layout.json` next to the selected config; editable from the companion app |
-| `backend` | `stock`; use `companion` after installing companion firmware |
+| `backend` | `companion` (the only supported backend); custom firmware is required |
 | `locationID` | `"auto"`; optionally a quoted decimal or `0x` USB location ID |
 | `claudeConfigDirs` | `[CLAUDE_CONFIG_DIR]`, otherwise `["~/.claude"]`; replaces the entire profile list; `[]` disables terminal catalog scanning and default Claude hook installation |
 | `claudeDesktopSessionsDir` | `~/Library/Application Support/Claude/claude-code-sessions` |
@@ -23,7 +23,7 @@ Setting precedence: explicit CLI flag > JSON field > supported environment varia
 | `defaultLayer` | `codex`; alternatives: `claude-herdr`, `claude-terminal`, `claude-desktop`; saved layer selection wins |
 | `socketPath` | `/tmp/keychron-c100-status-<uid>.sock` |
 | `logPath` | `/tmp/keychron-c100-status-<uid>.log` |
-| `grabberSocketPath` | `/var/run/keychron-c100-grabber-<uid>.sock`; stock backend helper must use the same path |
+| `grabberSocketPath` | Legacy setting; ignored now that the privileged grabber has been removed |
 
 Use `HERDR_SOCKET_PATH` to override the herdr service socket.
 

@@ -34,113 +34,57 @@ c100-status install-agent --config ~/.config/c100-status/config.json
 
 設定項目、優先順位、移行方法は[設定例](config.example.json)と[設定リファレンス](docs/configuration.md)を参照してください。
 
-## 入力・権限・デバイス保護
+## 導入：専用ファームウェアが必要です
 
-- 対象は Keychron の VID `0x3434`、PID `0x042c` と、選択した物理デバイスの `locationID` に限定します。
-- 標準ファームウェアの入力抑制には、専用の root ヘルパーによるキーボード HID の排他的取得を使います。Karabiner 側では C100 を対象から除外してください。
-- root ヘルパーが行うのは入力の排他的取得と、その期限付きリースの管理だけです。Codex データの読み取り、LED 制御、アプリの URL を開く処理はユーザープロセスで行います。
-- ヘルパーは root 所有の非公開ステージングディレクトリで組み立て、アドホック署名してから root 所有の App Bundle として配置します。launchd がユーザー書き込み可能なプロジェクト内のビルド成果物を直接実行することはありません。
-- ヘルパーは、インストール時に指定した `locationID` の取得要求だけを受け付けます。ユーザーデーモンが終了・クラッシュした場合、更新が必要な 3 秒のリースが失効して C100 を解放します。
-- 専用ファームウェアの `companion` バックエンドでは、ファームウェア側で通常入力を抑制するため、root ヘルパーは不要です。
-- USB キーボード出力対応の専用ファームウェアでは、アクションのキーを C100 自体から送ります。古いファームウェアでソフトウェアからキーを送る場合は、macOS のアクセシビリティ権限が必要です。
-- 物理位置は送信されたキーコードではなく、10 × 10 のキーマトリクスから取得します。同じ操作を複数キーに割り当てても位置を区別できます。
-- Keychron の `SaveLedConf` は送信しません。状態表示用の LED 設定は揮発性です。
-- `list` と `--dry-run` はキーボードに書き込みません。
-- Codex フックはベストエフォートです。デーモンが停止していても Codex の処理を妨げません。
-- Unix ソケットと実行時ファイルはユーザー専用で、既定では `/tmp` に置きます。
-- デバイスへの書き込み前に Keychron Launcher を閉じてください。同じ vendor HID インターフェースを取り合う可能性があります。
+**[専用ファームウェアの導入・復元ガイド](firmware/FLASHING.ja.md)から始めてください。** 対象機種の確認、ビルド、K00 での DFU 起動、元のフラッシュのバックアップ、書き込み、読み戻し照合、復元まで順に説明しています。ビルドコマンドだけでは本体を書き換えません。
 
-## 実験的な専用ファームウェア
+標準ファームウェアを特権付き grabber で使う方式は廃止しました。`run` は専用ファームウェアを要求し、未対応の本体では handshake に失敗します。通常入力を抑えられないまま動き続けることはありません。書き込み後の C100 は専用コントローラーとなり、デーモンが動いていない間は文字入力しません。
 
-`run --companion` は、C100 向け専用ファームウェアを使う任意選択のバックエンドです。キーの変化を Raw HID イベントとして受け取り、通常の文字入力はファームウェア内で抑制します。各 LED の HSV の明るさや消灯を直接反映でき、特権付き grabber は使いません。
+### アプリとログイン時の起動
 
-ビルド・プロトコル・書き込み手順は[ファームウェアの説明](firmware/README.md)を参照してください。[実機検証記録](firmware/VALIDATION.md)には、100 キーの入力、LED の明るさと消灯、ウォッチドッグ失効、レイヤー切り替え、タスク移動などの結果を記載しています。検証済みの項目と確認待ちの項目は、この記録で確認してください。
-
-以下の grabber 導入手順は、**標準ファームウェア用**です。専用ファームウェアを使う場合は、上記の手順と `backend: companion` の設定を使ってください。
-
-## ビルド
+ファームウェアを導入した後、このリポジトリで実行します。
 
 ```sh
 swift build -c release
 .build/release/c100-status self-test
-.build/release/c100-status list
+scripts/build-app.sh --skip-build
+mkdir -p "$HOME/Applications"
+ditto '.build/C100 Companion.app' "$HOME/Applications/C100 Companion.app"
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" config init
 ```
 
-### 標準ファームウェア用 grabber の導入
-
-`list` で自分の C100 の接続位置を確認します。以下の `0x110000` は説明用の値で、このリポジトリを使うマシンの接続位置を表すものではありません。実際の `locationID` に置き換えてください。
+`config init` は既存設定を上書きしません。設定ファイルを確認してから起動します。旧 `backend: stock` は使えません。専用ファームウェアへ移行して `companion` に変更してください。新規設定や `backend` を省略した場合は `companion` が既定です。
 
 ```sh
-sudo .build/release/c100-status install-helper --location 0x110000
-.build/release/c100-status grabber-status
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" install-agent
+open "$HOME/Applications/C100 Companion.app" --args app --layout
+"$HOME/Applications/C100 Companion.app/Contents/MacOS/c100-status" inspect
 ```
 
-インストーラーは、バックグラウンド専用の `/Applications/C100 Status Grabber.app` と、`/Library/LaunchDaemons` 配下の LaunchDaemon を root 所有で作成します。App Bundle は macOS の「入力監視」で選択できるようにするためのもので、Dock アイコンや操作画面はありません。ヘルパーは自動起動しますが、ユーザーデーモンがリースを要求するまではキーボードを取得しません。
+`connected: true`、`backend: companion`、USB 出力対応の新しいファームウェアなら `actionTransport: keyboard-hid` を確認します。実行ファイルを PATH に入れていない場合、この README の `c100-status` は上記の絶対パスに読み替えてください。
 
-インストール後、**システム設定 → プライバシーとセキュリティ → 入力監視**で、`/Applications` の **C100 Status Grabber** を追加して有効にし、ヘルパーを再起動します。
+LaunchAgent は `~/Library/LaunchAgents/com.kotainaba.c100-status.run.plist` に登録され、ログイン時に起動し、終了すると launchd が再起動します。`--label` でラベル、`--binary` で実行ファイルを変更できます。`install-agent --dry-run` は登録内容の確認だけ、`install-agent --uninstall` は停止・登録解除です。`run` と `install-agent` は root で実行しません。
+
+アプリ更新時は未保存の編集を保存し、デーモンとアプリを停止してからコピーし直します。`install-agent` を再実行すると登録済みプロセスも再起動します。手動の `run` や watcher と二重起動しないでください。
+
+### 入力・権限・LED
+
+- root ヘルパーと入力監視の登録は不要です。USB キーボード出力対応ファームウェアでは、アクション送信のアクセシビリティ権限も不要です。古い拡張なしファームウェアのソフトウェア送信にはアクセシビリティが必要です。
+- Ghostty のタブ移動に使う Apple Events の Automation 権限は別です。
+- 通常の文字入力はファームウェアで抑制します。デーモンが物理押下を確認し、前面アプリと有効サービスを検査してから、登録したキーの送信を許可します。
+- 他のキーボードは変更しません。対象は VID `3434` / PID `042c` と選択した `locationID` に限定します。
+- LED とキー割り当ては揮発性で、`SaveLedConf` や EEPROM 保存は使いません。通信が途絶えると約 3 秒で消灯し、保留中の出力を解除します。通常キーボードに戻すにはファームウェアの復元が必要です。
+- 物理位置をマトリクスから取得するので、同じ操作を複数キーに割り当てられます。
+- Keychron Launcher を閉じ、デーモンと診断用 watcher を同時に使わないでください。
+
+LED は 0 始まりの `row * 10 + column`、範囲 `0...99` です。色名は `off`、`white`、`red`、`green`、`blue`、`amber` を使えます。
 
 ```sh
-sudo launchctl kickstart -k system/com.kotainaba.c100-status.grabber
+c100-status ping
+c100-status inspect
+c100-status logs
+tail -f "$(c100-status log-path)"
 ```
-
-次に、ログイン時に起動し、クラッシュ時に再起動するユーザー用 LaunchAgent として `run` を登録します。
-
-```sh
-c100-status install-agent --location 0x110000
-```
-
-`run` は root での起動を拒否します。管理者権限を使うのは `install-helper` と `uninstall-helper` だけです。`install-agent` も、root ヘルパーではなくユーザーの `gui/<uid>` ドメインを管理するため、root では実行できません。
-
-実行ファイルの再ビルド・更新後は `install-helper` を再実行してください。ローカルの App Bundle はアドホック署名なので、置き換え後に macOS の入力監視を再設定する必要が生じる場合があります。`install-agent` の再実行では、実行ファイルの新しい絶対パスも反映できます。
-
-### LaunchAgent の管理
-
-`install-agent` は `~/Library/LaunchAgents/com.kotainaba.c100-status.run.plist` を作成します。ラベルは `--label` で変更できます。基本の `ProgramArguments` は `[binary, "run"]` で、指定した `--location <hex>` などの引数も含まれます。`RunAtLoad` と `KeepAlive` は有効、`ProcessType` は HID / AppKit イベントを受け取るために `Interactive` です。
-
-`launchctl bootstrap gui/<uid>` で登録します。再実行時、plist に変更がなければ `bootout` と `bootstrap` で再起動し、パスや接続位置などが変わっていれば plist を書き換えて再登録します。結果は `status=` に表示します。
-
-```sh
-c100-status install-agent --dry-run     # plist と実行予定コマンドを表示するだけ
-c100-status install-agent --uninstall   # LaunchAgent を停止して削除
-```
-
-登録後の標準出力・標準エラー出力は破棄します。ログは `/tmp/keychron-c100-status-<uid>.log` に出るため、`c100-status logs` または `log-path` を使ってください。
-
-**以前に `run` を手動起動していた場合は、そのプロセスを先に停止してください。** 例として `nohup .build/release/c100-status run --location 0x110000 &` で起動したものが残っていると、二つの `run` がリースやソケットを取り合い、両方が動かなくなる場合があります。検証用の `--dry-run` と同時に動かすなど、複数インスタンスが必要な場合は、手動側に別の `--socket` / `--grabber-socket` を指定します。C100 が複数台ある場合は `--location` で対象を分けられます。
-
-`run` はログインユーザーのフォアグラウンドプロセス、または LaunchAgent の子プロセスとして動きます。標準ファームウェアでは、ヘルパーのリースを更新している間だけ C100 の通常入力を抑制し、他のキーボードには影響しません。Ctrl-C、または LaunchAgent の `bootout` で停止・解放できます。クラッシュ時も 3 秒以内にリースが失効します。手動起動中はターミナルとログファイルの両方に記録します。
-
-### 開発時の更新
-
-LaunchAgent が実行するバイナリの絶対パス、接続位置、ラベルが変わっていなければ、ビルド後に再起動するだけで反映できます。
-
-```sh
-swift build -c release && launchctl kickstart -k gui/$(id -u)/com.kotainaba.c100-status.run
-```
-
-plist の内容を変える必要がある場合は、`install-agent` を再実行してください。インストール済みの `C100 Companion.app` を使っている場合は、アプリ内の実行ファイルも更新する必要があります。
-
-ローカルのデーモンプロトコルは改行区切りです。接続してから 500 ms 以内に要求を完了しないクライアントは切断し、HID ポーリングやリース更新を妨げないようにしています。他の同期処理でメインループが 750 ms 以上停止した場合は、復帰後に `daemon loop delayed duration_ms=...` を記録します。
-
-起動時に全 100 LED を消灯し、読み取り専用のローカル Codex カタログから既存タスクを取り込みます。ユーザーが作ったフォークのうちカタログに現れないものはローカル状態 DB から補完し、内部サブエージェントは除外します。取り込んだタスクは白で表示し、カタログを定期更新します。カタログから消えたタスクのキーは解放します。Codex は終了・再起動時の履歴アンロードでも `SessionEnd` を送るため、カタログに残るタスクの `SessionEnd` は白に戻すだけです。
-
-標準ファームウェアの単色・キー別レンダラーは HSV の V 成分を無視するため、黒を送るだけでは個別キーを消灯できません。この経路では揮発性の混合 RGB モードを使い、割り当て済みキーをキー別エフェクトの領域、未割り当てキーをエフェクトなしの領域に分けます。ファームウェアや EEPROM への書き込みは不要です。専用ファームウェアでは明るさ・消灯を直接扱います。
-
-別のターミナルから状態表示を試せます。
-
-```sh
-.build/release/c100-status ping
-.build/release/c100-status status working
-.build/release/c100-status status approval
-.build/release/c100-status status done
-.build/release/c100-status key 42 red
-.build/release/c100-status key 42 off
-.build/release/c100-status clear
-.build/release/c100-status logs
-tail -f "$(.build/release/c100-status log-path)"
-```
-
-LED のインデックスは `0...99` です。行・列とも 0 始まりで `row * 10 + column` と計算します。名前で指定できる色は `off`、`white`、`red`、`green`、`blue`、`amber` です。LED 順と物理マトリクス順は、どちらもこの行優先の順序であることを確認しています。
 
 ## デーモンの dry-run
 
@@ -202,7 +146,7 @@ Esc によるターン中断では Codex は `Stop` を送らないため、2 �
 
 herdr、通常のターミナル（Ghostty）、Claude Desktop 内の Claude Code セッションに対応しています。それぞれ独立したレイヤーで表示し、状態は主に Claude Code フックから取得します。
 
-サブエージェントが 1 個以上動いているセッションは、親が待機状態になっても青（`working`）を保ちます。`SubagentStart` / `SubagentStop` で実行数を数え、最後のサブエージェントが終了すると、親セッション自身の状態に戻します。終了フックが届かない場合も青のまま固定されないよう、2 時間経過、または `subagents/agent-*.jsonl` がすべて 30 分間更新されていない場合に実行数をクリアします。
+サブエージェントが 1 個以上動いているセッションは、親が待機状態になっても青（`working`）を保ちます。`SubagentStart` / `SubagentStop` で追跡し、最後のサブエージェントが終了すると親自身の状態に戻します。終了フックの取りこぼしに備え、開始から 2 時間で追跡を失効させます。また、開始から 30 分を超えた個々のサブエージェントについて、自身の transcript が新しいと確認できない場合も追跡から除きます。
 
 ### Claude Code フックの導入
 
@@ -226,7 +170,7 @@ herdr も使う場合、同じ `settings.json` にある `hooks/herdr-agent-stat
 `run` の動作中、専用バックグラウンドスレッドが `herdr agent list` と `herdr workspace list` を 2 秒ごとに取得します。10 ms 間隔の HID ポーリングとは独立しているため、herdr の応答が遅くてもキー入力を待たせません。`"agent":"claude"` の項目だけが対象です。
 
 - **行**：workspace の `workspace_id` / `number` を使い、番号順に配置します。
-- **列**：`pane_id` 内のペイン番号を使います。例：`w9:p1` は列 0。
+- **列**：workspace 内でタブ番号、ペインの上→下・左→右、ペイン番号の順に並べ、0 から隙間なく割り当てます。ペイン番号そのものを列番号にはしません。
 - **初期状態**：`agent_status` の `idle` / `working` / `blocked` / `done` / `unknown` を、それぞれ `idle` / `working` / `approval` / `done` / `idle` として扱います。最初のフック以降はフックを優先します。その後フックが届かず、herdr が 2 回連続で `idle` / `done` を返した場合は、取りこぼしからの復旧として herdr の状態を反映します。
 
 herdr の一覧取得が失敗した場合は、最後の正常な結果を 15 秒間保持します。短い障害で画面全体が消えないようにするためです。ペインが閉じるなどして正常な一覧からセッションが消えた場合は、そのキーを直ちに解放します。
@@ -297,19 +241,18 @@ Codex Desktop、herdr、通常のターミナルの Claude Code、Claude Desktop
 
 切り替えキーを押すと即座にレイヤーを変更し、`/tmp/keychron-c100-status-<uid>-layer.json` に保存します。初回、または保存ファイルがない・壊れている場合の既定は Codex で、`defaultLayer` で変更できます。有効な保存済み選択があればそちらを優先します。
 
-非表示のレイヤーに `approval`、`error`、`done` のセッションがあると、この優先順で切り替えキーを点滅させます。約 600 ms ごとに基本色と状態色を交互に表示します。表示中レイヤーの切り替えキーは常に最大の明るさで点灯します。基本色と状態色が近い場合でも、点滅で注意が必要なことを見分けられます。
+非表示のレイヤーに `approval`、`error`、`done` のセッションがあると、この優先順で切り替えキーを点滅させます。約 600 ms ごとに基本色と状態色を交互に表示します。表示中レイヤーの切り替えキーは点滅せず、選択状態の明るさで表示します。最終的な明るさには全体の明るさ設定も反映します。基本色と状態色が近い場合でも、点滅で注意が必要なことを見分けられます。
 
 非表示レイヤーのフックやカタログ更新も継続しますが、切り替えるまではタスクエリアを再描画しません。タスクキーでの移動と、完了キーを押して白に戻す操作は、表示中のレイヤーだけに適用します。
 
 ## 実行時のパスとオプション
 
 - ソケット：`/tmp/keychron-c100-status-<uid>.sock`。デーモン・クライアント双方の `--socket PATH` で変更できます。
-- grabber ソケット：`/var/run/keychron-c100-grabber-<uid>.sock`。診断用に `--grabber-socket PATH` で変更できます。
 - ログ：`/tmp/keychron-c100-status-<uid>.log`。`run`、`logs`、`log-path` の `--log-file PATH` で変更できます。
 - デバイス：複数の C100 から選ぶ場合、`run` に `--location` と対象の接続位置を指定します。
 - Claude Code のプロファイル：`claudeConfigDirs` または `--claude-config-dirs PATH1,PATH2` で走査対象を置き換えます。個人用の名前付きプロファイルを暗黙には追加しません。
 - Claude Desktop のセッション：既定は `~/Library/Application Support/Claude/claude-code-sessions`、変更は `--claude-desktop-dir PATH` です。
-- 標準ファームウェアで入力の排他的取得に失敗した場合は、通常入力が有効なまま処理を続けず、起動を失敗させます。
+- 専用ファームウェアとの handshake が成立しなければデバイスを制御しません。
 
 `apply <status>` はデーモンを介さず HID に直接書き込みます。デーモンと Keychron Launcher を停止した状態でのトラブルシューティングに限って使ってください。
 
@@ -321,7 +264,7 @@ LaunchAgent として登録している場合は先に解除します。
 .build/release/c100-status install-agent --uninstall
 ```
 
-手動起動の場合は Ctrl-C で停止します。root ヘルパーを導入している場合は、次のコマンドでヘルパー・LaunchDaemon・ヘルパーログを削除します。
+手動起動の場合は Ctrl-C で停止します。旧版の root ヘルパーが残っている場合だけ、次のコマンドでヘルパー・LaunchDaemon・ヘルパーログを削除します。
 
 ```sh
 sudo .build/release/c100-status uninstall-helper
@@ -331,7 +274,7 @@ sudo .build/release/c100-status uninstall-helper
 
 ## 現在の制限
 
-`clear` は揮発性のキー別表示を消灯しますが、ユーザーの元の RGB モードを保存・復元する機能はありません。標準ファームウェアでは、このツールが `SaveLedConf` を送らないため、USB の抜き差しで保存済み設定に戻ります。専用ファームウェアの動作は[ファームウェアの説明](firmware/README.md)を参照してください。
+`clear` は揮発性の状態表示をクリアします。元の通常キーボード用ファームウェアや RGB 設定を復元する機能ではありません。復元は[導入・復元ガイド](firmware/FLASHING.ja.md)に従ってください。
 
 既存タスクの初期取り込みには、公開 API ではなく Codex のローカル SQLite カタログを使います。失敗してもデーモン全体を停止せず、ログに記録します。フック受信自体は独立して続きますが、Codex のタスク配置には前述のカタログとの照合があります。
 

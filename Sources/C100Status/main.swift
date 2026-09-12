@@ -16,7 +16,7 @@ struct Options {
     var enabledServices: [SessionSourceKind]?
     var layoutPath = Configuration.defaultPath().replacingOccurrences(of: "config.json", with: "layout.json")
     var dryRun = false
-    var companion = false
+    var companion = true
     var hookProfileDir: String?
     var configPath: String?
     var loadedConfigPath: String?
@@ -207,9 +207,7 @@ enum C100StatusCLI {
                 socketPath: options.socketPath,
                 logURL: URL(fileURLWithPath: options.logPath),
                 locationID: options.locationID,
-                grabberSocketPath: options.grabberSocketPath,
                 dryRun: options.dryRun,
-                companion: options.companion,
                 herdrBinaryPath: options.herdrBinaryPath,
                 claudeConfigDirs: options.claudeConfigDirs,
                 claudeDesktopDir: options.claudeDesktopDir,
@@ -220,44 +218,11 @@ enum C100StatusCLI {
                 layoutPath: options.layoutPath
             )
             try daemon.run()
-        case "grabber-service":
-            guard let ownerUID = options.ownerUID,
-                  let ownerGID = options.ownerGID,
-                  let locationID = options.locationID else {
-                throw CLIError.usage("grabber-service requires --owner-uid, --owner-gid, and --location")
-            }
-            let service = PrivilegedGrabberService(
-                socketPath: options.grabberSocketPath,
-                ownerUID: ownerUID,
-                ownerGID: ownerGID,
-                allowedLocationID: locationID
-            )
-            try service.run()
-        case "install-helper":
-            guard let locationID = options.locationID else {
-                throw CLIError.usage("install-helper requires --location")
-            }
-            let ownerUID = options.ownerUID ?? RuntimePaths.ownerUID
-            let ownerGID = options.ownerGID ?? RuntimePaths.ownerGID
-            try HelperInstaller.install(
-                sourceExecutable: HelperInstaller.currentExecutableURL(),
-                ownerUID: ownerUID,
-                ownerGID: ownerGID,
-                locationID: locationID
-            )
-            print("helper=installed label=\(HelperInstaller.label) owner_uid=\(ownerUID) location=0x\(hex(locationID, width: 6))")
-            print("c100-status run can now start without sudo")
+        case "grabber-service", "install-helper", "grabber-status":
+            throw CLIError.usage("The privileged grabber backend has been removed. Install companion firmware; see firmware/FLASHING.ja.md. Use uninstall-helper only to remove an old installation.")
         case "uninstall-helper":
             try HelperInstaller.uninstall()
             print("helper=uninstalled label=\(HelperInstaller.label)")
-        case "grabber-status":
-            let response = try UnixSocketServer.send(
-                GrabberRequest.ping,
-                path: options.grabberSocketPath,
-                response: GrabberResponse.self
-            )
-            try requireGrabberSuccess(response)
-            print("\(response.message) capturing=\(response.capturing)")
         case "list":
             let descriptors = try C100Connection.descriptors()
             guard !descriptors.isEmpty else {
@@ -505,10 +470,6 @@ enum C100StatusCLI {
         guard response.ok else { throw CLIError.runtime(response.message) }
     }
 
-    private static func requireGrabberSuccess(_ response: GrabberResponse) throws {
-        guard response.ok else { throw CLIError.runtime(response.message) }
-    }
-
     private static func parseOptions(_ arguments: [String]) throws -> ([String], Options) {
         var options = Options()
         var positionals: [String] = []
@@ -530,7 +491,7 @@ enum C100StatusCLI {
                     guard let layer = SessionSourceKind(rawValue: value) else { throw CLIError.usage("Unknown layer: \(value)") }
                     options.defaultLayer = layer
                 default:
-                    guard ["stock", "companion"].contains(value) else { throw CLIError.usage("--backend requires stock or companion") }
+                    guard value == "companion" else { throw CLIError.usage("Only companion firmware is supported. The stock/grabber backend has been removed; see firmware/FLASHING.ja.md") }
                     options.companion = value == "companion"
                 }
             case "--companion":
@@ -2169,34 +2130,6 @@ enum C100StatusCLI {
             throw CLIError.runtime("Codex interrupted-turn monitor missed an appended abort")
         }
 
-        let grabberRequest = GrabberRequest.acquire(locationID: 0x110000)
-        let grabberRoundTrip = try decoder.decode(
-            GrabberRequest.self,
-            from: JSONEncoder().encode(grabberRequest)
-        )
-        let helperPlistData = Data(
-            HelperInstaller.plist(
-                ownerUID: 502,
-                ownerGID: 20,
-                locationID: 0x110000,
-                socketPath: "/var/run/keychron-c100-grabber-502.sock"
-            ).utf8
-        )
-        let helperPlist = try PropertyListSerialization.propertyList(from: helperPlistData, format: nil) as? [String: Any]
-        let helperArguments = helperPlist?["ProgramArguments"] as? [String]
-        let helperAppInfoData = Data(HelperInstaller.appInfoPlist().utf8)
-        let helperAppInfo = try PropertyListSerialization.propertyList(from: helperAppInfoData, format: nil) as? [String: Any]
-        let allowedGrabberLocation = try PrivilegedGrabberService.validateRequestedLocation(
-            grabberRoundTrip.locationID,
-            allowedLocationID: 0x110000
-        )
-        let rejectedGrabberLocation: Bool
-        do {
-            _ = try PrivilegedGrabberService.validateRequestedLocation(0x220000, allowedLocationID: 0x110000)
-            rejectedGrabberLocation = false
-        } catch {
-            rejectedGrabberLocation = true
-        }
         let loggerSafetyDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("c100-status-logger-safety-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: loggerSafetyDirectory) }
@@ -2212,20 +2145,7 @@ enum C100StatusCLI {
         } catch {
             rejectedLoggerSymlink = true
         }
-        guard grabberRoundTrip.kind == .acquire,
-              grabberRoundTrip.locationID == 0x110000,
-              allowedGrabberLocation == 0x110000,
-              rejectedGrabberLocation,
-              rejectedLoggerSymlink,
-              helperPlist?["Label"] as? String == HelperInstaller.label,
-              helperArguments?.first == HelperInstaller.executablePath,
-              helperArguments?.contains("grabber-service") == true,
-              helperArguments?.contains("1114112") == true,
-              helperAppInfo?["CFBundleIdentifier"] as? String == HelperInstaller.label,
-              helperAppInfo?["CFBundleExecutable"] as? String == "c100-status-grabber",
-              helperAppInfo?["LSBackgroundOnly"] as? Bool == true else {
-            throw CLIError.runtime("Privileged grabber protocol/LaunchDaemon plist self-test failed")
-        }
+        guard rejectedLoggerSymlink else { throw CLIError.runtime("Logger accepted a symlink") }
 
         let reports = KeychronProtocol.setColorReports(
             ledCount: 100,
@@ -2820,7 +2740,7 @@ enum C100StatusCLI {
         try selfTestClaudeHooksInstaller()
         try selfTestAgentInstaller()
 
-        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), privileged grabber, daemon messages, RGB reports, keymap reports, FrameDiff incremental repaint, physical-key resolution, install-claude-hooks, install-agent, and fd-leak regressions for HerdrProcessRunner/OsascriptRunner")
+        print("self-test passed: hooks, Codex catalog, herdr catalog, Claude sessions catalog, Claude Desktop catalog, Ghostty AppleScript navigation, project/session grid, layers (per-layer compute/isolation, layer key color+blink, layer selection persistence, display filter), daemon messages, RGB reports, keymap reports, FrameDiff incremental repaint, physical-key resolution, install-claude-hooks, install-agent, and fd-leak regressions for HerdrProcessRunner/OsascriptRunner")
     }
 
     /// M-install-claude-hooks: exercises `ClaudeHooksInstaller` end to end
@@ -3127,10 +3047,8 @@ enum C100StatusCLI {
           c100-status brightness <10...200>
           c100-status config show [--config PATH]
           c100-status config init [--config PATH] [--dry-run]
-          c100-status run [--companion] [--location 0x110000] [--socket PATH] [--log-file PATH] [--grabber-socket PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
-          sudo c100-status install-helper --location 0x110000
+          c100-status run [--companion] [--location 0x110000] [--socket PATH] [--log-file PATH] [--dry-run] [--herdr-bin PATH] [--claude-config-dirs DIR1,DIR2,...] [--claude-desktop-dir PATH]
           sudo c100-status uninstall-helper
-          c100-status grabber-status [--grabber-socket PATH]
           c100-status status <idle|working|approval|done|error> [--socket PATH]
           c100-status key <0...99> <off|white|red|green|blue|amber> [--socket PATH]
           c100-status hook [--socket PATH] [--dry-run] [--source <codex|claude>] [--notification-matcher <permission_prompt|idle_prompt|agent_needs_input|agent_completed>]
@@ -3153,12 +3071,12 @@ enum C100StatusCLI {
           c100-status self-test
 
         `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (profile directories from configuration, falling back to CLAUDE_CONFIG_DIR or ~/.claude), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
-        `install-agent` installs `c100-status run` as a per-user LaunchAgent (~/Library/LaunchAgents/<label>.plist, default label com.kotainaba.c100-status.run), loaded via `launchctl bootstrap gui/<uid>` and kept alive by launchd (RunAtLoad+KeepAlive, ProcessType Interactive). `--location` is forwarded to `run` if given. `--binary` overrides the auto-detected absolute path to this executable; `--label` overrides the plist label (must match an existing manual `run` invocation's expectations if you rely on the default). `--dry-run` prints the plist and the launchctl commands that would run without touching disk or launchd. Re-running is idempotent: an unchanged plist is just restarted (bootout+bootstrap); a changed one is rewritten and reloaded. `--uninstall` runs `launchctl bootout` and deletes the plist. Refuses to run as root -- it manages your per-user (gui/<uid>) launchd domain, not the root helper. If a manually started `c100-status run` (e.g. via `nohup ... &`) is already holding the grabber lease/socket when the LaunchAgent starts, the two will race for the same resources; stop the manual process (or use a different --socket/--location for one of them) before installing.
+        `install-agent` installs `c100-status run` as a per-user LaunchAgent (~/Library/LaunchAgents/<label>.plist, default label com.kotainaba.c100-status.run), loaded via `launchctl bootstrap gui/<uid>` and kept alive by launchd (RunAtLoad+KeepAlive, ProcessType Interactive). `--location` is forwarded to `run` if given. `--binary` overrides the auto-detected absolute path to this executable; `--label` overrides the plist label (must match an existing manual `run` invocation's expectations if you rely on the default). `--dry-run` prints the plist and the launchctl commands that would run without touching disk or launchd. Re-running is idempotent: an unchanged plist is just restarted (bootout+bootstrap); a changed one is rewritten and reloaded. `--uninstall` runs `launchctl bootout` and deletes the plist. Refuses to run as root -- it manages your per-user (gui/<uid>) launchd domain, not the root helper. If a manually started `c100-status run` (e.g. via `nohup ... &`) is already using the device/socket when the LaunchAgent starts, the two will race for the same resources; stop the manual process (or use a different --socket/--location for one of them) before installing.
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).
         `--claude-config-dirs` replaces the configured Claude profile list. Set any number of profiles in config.json; no named profiles are added implicitly.
         `--claude-desktop-dir` overrides where Claude Desktop's session files are scanned from (default: ~/Library/Application Support/Claude/claude-code-sessions).
-        `install-helper` performs the one-time root-owned LaunchDaemon installation.
+        Companion firmware is required. `uninstall-helper` only removes a legacy root helper.
         `run` then stays in the foreground as the user, leases exclusive C100 capture from the helper, and logs to stdout plus the log file.
         While `run` is active, normal C100 keystrokes are suppressed and assigned keys navigate Codex tasks.
         HID writes are volatile; SaveLedConf is never sent.

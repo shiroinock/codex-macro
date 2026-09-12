@@ -1,13 +1,13 @@
 # Layout editor and Codex actions
 
-Open **C100 → レイアウトを編集…** in the menu bar. Click a keyboard key to choose its function type, then choose an action, direction, service set, or task area. Existing buttons can be reassigned in place. The Codex action chooser has an autofocus search field and a scrolling result list with Japanese names and command IDs; words narrow results together. Select a part in the list to inspect its position and dimensions, or drag it on the keyboard to move it. **保存して反映** validates, saves, and applies the layout without restarting the daemon. Closing a dirty editor asks whether to discard the draft.
+Open **C100 → レイアウトを編集…** in the menu bar. Click a keyboard key to choose its function type, then choose an action, direction, service set, or task area. Existing buttons can be reassigned in place. The Codex action chooser has an autofocus search field and a scrolling result list with Japanese names and command IDs; words narrow results together. The right-hand panel edits the selected key or part, including position and dimensions; drag parts on the keyboard to move them. No assignment modal or placed-parts list is used. **保存して反映** validates, saves, and applies the layout without restarting the daemon. Closing a dirty editor asks whether to discard the draft.
 
 Parts share the same 10 × 10 physical grid:
 
 - **Task area:** one rectangle, 1–10 keys wide/high. Move, resize, or transpose projects and tasks. Offscreen sessions retain status, and key presses resolve through the same projection used for LEDs.
 - **Scroll:** one key per arrow, placed anywhere. Moves the whole task viewport in physical directions, including when transposed. Holds repeat after 350 ms at 80 ms intervals.
-- **Service switch:** one rectangular part containing checkboxes for Codex, herdr, Claude CLI, and Claude Desktop. Selected services occupy keys from the top left in row order. Turning a service off stops task discovery and hooks for that source; the group keeps its rectangle until resized. herdr background polling also pauses (an already-running request may finish). Action buttons are independent of task-source discovery.
-- **Codex action:** choose an operation by name or command ID. The picker searches the installed desktop application's app-scoped, shortcut-configurable commands and Japanese titles. Existing keyboard shortcuts are retained; a separate unused F13–F20/modifier combination is added for each chosen command.
+- **Service switch:** one rectangular part containing checkboxes for Codex, herdr, Claude CLI, and Claude Desktop. Selected services occupy keys from the top left in row order. The Services tab controls which providers are enabled for discovery and action dispatch; the switch part controls their key placement.
+- **Desktop action:** choose an operation by name or command ID. The picker searches the installed desktop application's app-scoped, shortcut-configurable commands and Japanese titles. Existing keyboard shortcuts are retained; a separate unused F13–F20/modifier combination is added for each chosen command.
 
 The same Codex operation can be assigned to multiple buttons; they share one command alias.
 
@@ -19,7 +19,7 @@ The adapter reads command metadata from the installed app bundle located by `com
 
 The daemon appends aliases to `<codexHome>/keybindings.json` and keeps the first original file as `keybindings.json.c100-backup`. It preserves custom shortcuts, disabled defaults (without restoring them when adding an alias), and normal defaults for commands without overrides. Aliases are identified by command ID and shortcut, not by the catalog order, so reordering the imported catalog cannot redirect a button to a different operation. Existing conflicting shortcuts are skipped. Removed buttons leave their Codex aliases in place; nothing silently resets the user's keymap.
 
-Actions are sent only while Codex / ChatGPT is frontmost, and require **C100 Companion** in macOS **Privacy & Security → Accessibility**. Failures appear in the C100 menu and daemon log. Commands operate on the current Codex context; Codex decides whether the command is available there. Approval and submit have separate dedicated command bindings, avoiding ambiguous Enter/Escape emulation. No action is executed just by editing or saving its part.
+Actions are sent only to a supported, enabled foreground app. Current keyboard-output firmware sends USB keyboard reports without Accessibility permission. The older software sender requires **C100 Companion** in macOS **Privacy & Security → Accessibility**. Failures appear in the C100 menu and daemon log. Commands operate on the current Codex context; Codex decides whether the command is available there. Approval and submit have separate dedicated command bindings, avoiding ambiguous Enter/Escape emulation. No action is executed just by editing or saving its part.
 
 OS-global shortcuts and non-configurable commands are excluded because their separate controllers cannot preserve the user's existing global binding by adding an app alias. Micro-only gestures (push-to-talk/double-tap latch, analog stick, encoder) and arbitrary skill invocation are not emulated; the app's configurable voice-input and voice-chat commands are available as ordinary buttons.
 
@@ -37,7 +37,7 @@ c100-status layout preview /tmp/c100-layout.png
 
 `--config PATH` selects the configuration as for other commands. `layout show/apply/reset` talks to the daemon; `actions` reads app metadata and `preview` renders the saved layout without executing actions. The daemon must be running to edit/apply a live layout.
 
-## Validation
+## Validation history
 
 Self-tests cover resized/offset/transposed projection, physical arrow directions, remapped key-repeat isolation, disabled sources, overlaps and bounds, persistence, preservation of user/default shortcuts, backup/idempotence, collision avoidance, and command metadata parsing. Full suite and installed-device checks are recorded in the implementation task; a successful key-event dispatch alone does not prove that Codex executed a context-dependent action.
 
@@ -46,7 +46,7 @@ On this machine (2026-09-13), 118 app-scoped commands were imported with Japanes
 After adding a new action alias, Codex may need to refresh its cached shortcut settings. If it does not respond yet, return focus to Codex after about a minute or restart Codex. This adapter does not restart Codex while a task is running.
 
 
-### Action delivery validation (2026-09-13)
+### Historical software-sender validation (2026-09-13)
 
 Action buttons prefer an existing configured shortcut that can be represented
 as a single modified keystroke, skipping explicit conflicts. Bare Enter/Escape
@@ -85,7 +85,7 @@ With keyboard-output firmware, the inspector labels the sender `C100（USB
 `actionTransport: keyboard-hid`. Older firmware retains the software sender and
 its permission requirement. Shortcut resolution and displayed key are shared
 between the transports; the hardware path additionally converts the virtual key
-to a USB HID usage and modifiers. It authorizes physical presses only while Codex
+to a USB HID usage and modifiers. It authorizes physical presses only while a supported, enabled app
 is foreground and revokes pending output when it observes another foreground app.
 
 
@@ -93,8 +93,8 @@ is foreground and revokes pending output when it observes another foreground app
 
 Assign one semantic action, such as **タスクをアーカイブ** or **モデル選択**,
 to a button. The foreground app selects the internal binding. There is no
-per-button app selector or second action to configure. The inspector shows the
-resolved keys and support status for both apps. Model selection, for example,
+per-button app selector or second action to configure. The Actions tab shows the
+resolved keys and support status for enabled services. Model selection, for example,
 uses Codex's configured binding (normally Control+Shift+M) and Command+Shift+I
 in Claude Desktop's Code tab. The selected service layer is independent.
 

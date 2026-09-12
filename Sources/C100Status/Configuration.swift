@@ -111,7 +111,7 @@ struct Configuration: Codable {
             guard !enabledServices.isEmpty, Set(enabledServices).count == enabledServices.count else { throw CLIError.usage("使用サービスを1つ以上、重複なしで選んでください") }
             if let defaultLayer, let source = SessionSourceKind(rawValue: defaultLayer), !enabledServices.contains(source) { throw CLIError.usage("初期表示は使用サービスから選んでください") }
         }
-        if let backend, !["stock", "companion"].contains(backend) { throw CLIError.usage("backend must be stock or companion") }
+        if let backend, backend != "companion" { throw CLIError.usage("The stock/grabber backend has been removed. Flash companion firmware, then set backend to companion; see firmware/FLASHING.ja.md") }
         if let defaultLayer, SessionSourceKind(rawValue: defaultLayer) == nil { throw CLIError.usage("Unknown defaultLayer: \(defaultLayer)") }
         if let locationID { _ = try Self.location(locationID) }
     }
@@ -130,7 +130,7 @@ struct Configuration: Codable {
 
     static var example: Configuration {
         var example = Configuration()
-        example.backend = "stock"; example.locationID = "auto"
+        example.backend = "companion"; example.locationID = "auto"
         example.claudeConfigDirs = ["~/.claude"]
         example.codexHome = "~/.codex"; example.defaultLayer = "codex"
         return example
@@ -141,7 +141,7 @@ extension Options {
     mutating func apply(_ configuration: Configuration, environment: [String: String] = ProcessInfo.processInfo.environment,
                         home: String = NSHomeDirectory(), cwd: String = FileManager.default.currentDirectoryPath) throws {
         enabledServices = configuration.enabledServices
-        if !providedFlags.contains("--companion") && !providedFlags.contains("--backend") { companion = configuration.backend == "companion" }
+        if !providedFlags.contains("--companion") && !providedFlags.contains("--backend") { companion = true }
         if !providedFlags.contains("--location"), let location = configuration.locationID { locationID = try Configuration.location(location) }
         if !providedFlags.contains("--claude-config-dirs") {
             claudeConfigDirs = configuration.claudeConfigDirs ?? [environment["CLAUDE_CONFIG_DIR"] ?? home + "/.claude"]
