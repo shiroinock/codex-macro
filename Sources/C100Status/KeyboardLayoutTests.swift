@@ -20,6 +20,15 @@ enum KeyboardLayoutTests {
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: conflictBindings, characterCode: { _ in 0 })?.keyCode == 105, "conflicting primary shortcut falls back to isolated alias")
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings + [["command": "archiveThread", "key": NSNull()]]) == nil, "disabled command is never dispatched")
         try check(CodexKeyboardShortcut.parse("Enter") == nil && CodexKeyboardShortcut.parse("Escape") == nil && CodexKeyboardShortcut.parse("Cmd+K Cmd+C") == nil, "bare keys and chords are not dispatched as another action")
+        try check(ClaudeDesktopAction.equivalent(to: "newTask")?.accelerator == "Command+N", "built-in equivalent for new task")
+        try check(ClaudeDesktopAction.equivalent(to: "composer.openModelPicker")?.accelerator == "Command+Shift+I", "Claude model picker differs from Codex")
+        try check(ClaudeDesktopAction.equivalent(to: "archiveThread") == nil && ClaudeDesktopAction.equivalent(to: nil) == nil, "no invented archive or missing-action equivalent")
+        for preset in ClaudeDesktopAction.catalog {
+            let part = LayoutPart(kind: .action, x: 0, y: 0, action: "newTask", claudeShortcut: preset.accelerator)
+            try KeyboardLayout(parts: [part]).validate()
+            let resolved = try ForegroundAction.resolve(part, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] })
+            try check(USBShortcut(resolved.shortcut) != nil && resolved.shortcut.accelerator == preset.accelerator, "built-in Claude action resolves to supported USB output: " + preset.id)
+        }
         var adaptive = LayoutPart(kind: .action, x: 0, y: 0, action: "archiveThread", claudeShortcut: "Control+Tab")
         let claude = try ForegroundAction.resolve(adaptive, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { throw CLIError.runtime("must not read Codex settings for Claude") })
         try check(claude.shortcut.keyCode == 48 && claude.shortcut.flags == [.maskControl], "foreground Claude selects explicitly configured mapping without Codex settings")

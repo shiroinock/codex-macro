@@ -109,3 +109,14 @@ chords. Empty/invalid mappings prevent saving. Claude shortcuts depend on the ta
 see the [official Code tab shortcuts](https://code.claude.com/docs/en/desktop#keyboard-shortcuts).
 Physical verification in Claude remains pending because Claude Desktop is not
 installed in this machine's standard application directories.
+
+
+The inspector now includes 16 built-in **Claude Desktop Code tab** operations,
+selectable by name, with their outgoing keys shown. Enabling foreground routing
+prefills the matching operation for `newTask`, `composer.openModelPicker`, and
+`toggleTerminal`. Other operations require explicit selection; archive is not
+mapped to closing a session. Chat/Cowork bindings are not inferred from Code-tab
+documentation. Manual overrides remain available. Presets store their resolved
+accelerator in the existing `claudeShortcut` field, so existing layouts and
+custom mappings retain their behavior without migration. The catalog is bundled,
+not scraped from a locally installed Claude app.

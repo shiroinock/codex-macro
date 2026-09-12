@@ -269,9 +269,20 @@ struct LayoutEditorView: View {
                 }
                 Text(CodexAction.installed.isEmpty ? "標準の操作一覧を使用中" : "Codex から読み込んだ \(CodexAction.catalog.count) 操作").font(.caption).foregroundStyle(.secondary)
                 Toggle("前面アプリに合わせる", isOn: Binding(get: { part.claudeShortcut != nil }, set: { enabled in
-                    model.update { $0.claudeShortcut = enabled ? "" : nil }
+                    model.update { $0.claudeShortcut = enabled ? (ClaudeDesktopAction.equivalent(to: $0.action)?.accelerator ?? "") : nil }
                 }))
                 if part.claudeShortcut != nil {
+                    Menu("Claude の内蔵操作から選ぶ…") {
+                        ForEach(ClaudeDesktopAction.catalog) { action in
+                            Button(action.title + "  " + ActionShortcutDisplay(accelerator: action.accelerator, dedicated: false).label) {
+                                model.update { $0.claudeShortcut = action.accelerator }
+                            }
+                        }
+                    }
+                    if let preset = ClaudeDesktopAction.catalog.first(where: { $0.accelerator == part.claudeShortcut }) {
+                        Text(preset.title).font(.caption.bold())
+                    }
+                    Text("内蔵操作は Claude Desktop の Code タブ用です。Chat・Cowork の操作は手動指定してください。").font(.caption).foregroundStyle(.secondary)
                     TextField("Claude Desktop: Command+N など", text: Binding(get: { part.claudeShortcut ?? "" }, set: { value in
                         model.update { $0.claudeShortcut = value.trimmingCharacters(in: .whitespacesAndNewlines) }
                     }))
