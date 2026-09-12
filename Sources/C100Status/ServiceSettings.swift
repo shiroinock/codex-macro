@@ -55,8 +55,10 @@ final class ServiceSettingsModel: ObservableObject {
                 _ = try await execute(["config", "save", url.path])
                 saved = snapshot
                 message = "保存済み。デーモンを再起動しています…"
-                _ = try await execute(["install-agent"])
-                message = "保存してデーモンに反映しました"
+                let result = try await execute(["install-agent"])
+                message = result.trimmingCharacters(in: .whitespacesAndNewlines) == "daemon-paused"
+                    ? "保存済み。デーモン再開時に反映します"
+                    : "保存してデーモンに反映しました"
             } catch { message = "\(dirty ? "保存できませんでした" : "保存済み・再起動が必要です"): \(error)" }
         }
     }

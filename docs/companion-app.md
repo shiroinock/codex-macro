@@ -4,17 +4,21 @@ Build a local, ad-hoc signed app with `scripts/build-app.sh`, then copy `.build/
 
 The menu shows the daemon's connection state and selected firmware backend, offers four source layers, and controls LED brightness (10–200% of the existing palette). Brightness requires companion firmware; values above 100% saturate at the LED's maximum. Selection checkmarks follow physical layer-key changes. Closing the menu app leaves the daemon running.
 
+**Stop daemon** unloads the default per-user LaunchAgent without deleting its plist or settings. The app stays open and shows a stopped status; **Resume daemon** starts it again. Saving service settings while paused stores them for the next resume. The retained LaunchAgent starts at the next login. Manually launched daemons and custom labels remain CLI-managed.
+
 **Restart daemon** installs/reloads the per-user default LaunchAgent using the app's bundled executable and the selected configuration. This also starts an uninstalled daemon. Keep the installed app in place once its executable is registered. The first revision manages the default `com.kotainaba.c100-status.run` label; custom LaunchAgent labels remain CLI-managed.
 
 The default configuration is shared with the CLI. **Choose configuration file** selects another validated JSON file for this app; restarting the daemon applies it to the service too. **Open configuration file** opens it in the default editor (or creates a default starting file when none exists). Logs open in the default viewer. The menu app's configuration selection is remembered in its preferences.
 
 Brightness survives daemon restarts in `<socketPath>.display.json`, alongside the existing temporary runtime state. A system cleanup of `/tmp` resets it to 100%. Layer selection follows the existing layer state file. Login launch of the menu app can be configured in macOS Login Items; the daemon's LaunchAgent already starts at login.
 
-The UI runs CLI requests off its main thread, with a five-second timeout. It never opens HID itself. If the daemon is stopped or waiting for hardware before its socket is ready, the menu reports that it is waiting for a response. Stock firmware brightness control is disabled.
+The UI runs CLI requests off its main thread, with a five-second timeout. It never opens HID itself. If the daemon is stopped or waiting for hardware before its socket is ready, the menu reports that it is waiting for a response. A deliberate menu stop is displayed separately from a connection failure.
 
 ## CLI controls
 
 ```sh
+c100-status stop-agent                    # stop without removing login settings
+c100-status install-agent                 # resume / restart
 c100-status inspect                       # JSON: connected, backend, layer, brightness
 c100-status layer claude-terminal
 c100-status brightness 100                 # 10...200; companion firmware only

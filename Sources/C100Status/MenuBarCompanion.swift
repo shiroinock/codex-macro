@@ -11,6 +11,9 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var trackingMenu = false
     private var busy = false
+    private var paused = UserDefaults.standard.bool(forKey: "companion.daemonPaused") {
+        didSet { UserDefaults.standard.set(paused, forKey: "companion.daemonPaused") }
+    }
     private var information: [String: Any] = [:]
     private var problem: String?
     private var configPath: String? = UserDefaults.standard.string(forKey: "companion.configPath")
@@ -50,11 +53,13 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func rebuild() {
+        menu.autoenablesItems = false
         menu.removeAllItems()
         let connected = information["connected"] as? Bool == true
-        let title = problem != nil ? "デーモン応答待ち（未起動・接続待ち）" : (connected ? "C100 接続中" : "C100 未接続")
+        let title = paused ? "デーモン停止中（動作確認・書き込み用）" : problem != nil ? "デーモン応答待ち（未起動・接続待ち）" : (connected ? "C100 接続中" : "C100 未接続")
         menu.addItem(entry(title))
-        if let problem { menu.addItem(entry(String(problem.prefix(120)))) }
+        if paused { menu.addItem(entry("再開するまで接続しません。次回ログイン時は自動起動")) }
+        else if let problem { menu.addItem(entry(String(problem.prefix(120)))) }
         else { menu.addItem(entry("方式: \(information["backend"] as? String ?? "確認中")")) }
         if let top = information["topRow"] as? Int {
             menu.addItem(entry("表示行: \(top + 1)〜\(top + (information["viewportRows"] as? Int ?? 8)) ／ 列: \((information["leftColumn"] as? Int ?? 0) + 1)〜\((information["leftColumn"] as? Int ?? 0) + (information["viewportColumns"] as? Int ?? 10))"))
@@ -64,7 +69,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (key, title) in layerNames where (information["enabledSources"] as? [String] ?? layerNames.map { $0.0 }).contains(key) {
             let row = entry(title, action: #selector(selectLayer(_:)), value: key)
             row.state = information["layer"] as? String == key ? .on : .off
-            row.isEnabled = !busy && problem == nil
+            row.isEnabled = !busy && !paused && problem == nil
             layerMenu.addItem(row)
         }
         layerMenu.autoenablesItems = false
@@ -73,7 +78,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for value in [10, 25, 50, 75, 100, 150, 200] {
             let row = entry("\(value)%" + (value == 100 ? "（標準）" : ""), action: #selector(selectBrightness(_:)), value: value)
             row.state = information["brightness"] as? Int == value ? .on : .off
-            row.isEnabled = !busy && problem == nil && information["backend"] as? String == "companion"
+            row.isEnabled = !busy && !paused && problem == nil && information["backend"] as? String == "companion"
             brightnessMenu.addItem(row)
         }
         brightnessMenu.autoenablesItems = false
@@ -81,7 +86,12 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(entry("設定（レイアウト・サービス）…", action: #selector(openEditor)))
         if let error = information["actionError"] as? String, !error.isEmpty { menu.addItem(entry(error)) }
-        menu.addItem(entry("デーモンを再起動", action: #selector(restart)))
+        let resume = entry(paused || problem != nil ? "デーモンを再開" : "デーモンを再起動", action: #selector(restart))
+        resume.isEnabled = !busy
+        menu.addItem(resume)
+        let stop = entry("デーモンを停止", action: #selector(stopDaemon))
+        stop.isEnabled = !busy && !paused
+        menu.addItem(stop)
         menu.addItem(entry("ログを開く", action: #selector(openLog)))
         menu.addItem(entry("設定ファイルを開く", action: #selector(openConfig)))
         menu.addItem(entry("設定ファイルを選ぶ…", action: #selector(chooseConfig)))
@@ -109,17 +119,21 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let result = try await execute(["inspect"])
                 information = try JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any] ?? [:]
                 problem = nil
+                paused = false
             } catch { problem = String(describing: error); information = [:] }
             busy = false
             rebuild()
         }
     }
 
-    private func change(_ args: [String]) {
+    private func change(_ args: [String], pausedAfter: Bool? = nil) {
         guard !busy else { return }
         busy = true
         Task {
-            do { _ = try await execute(args) }
+            do {
+                _ = try await execute(args)
+                if let pausedAfter { paused = pausedAfter; information = [:] }
+            }
             catch { showError(error) }
             busy = false
             refresh()
@@ -135,7 +149,8 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if editor == nil {
             let path = configPath, executable = binary
             editorConfigPath = path
-            editor = LayoutEditorWindow(execute: { args in
+            editor = LayoutEditorWindow(execute: { [weak self] args in
+                if args.first == "install-agent", self?.paused == true { return "daemon-paused" }
                 let arguments = args + (path.map { ["--config", $0] } ?? [])
                 return try await Task.detached {
                     String(decoding: try HerdrProcessRunner.run(binary: executable, arguments: arguments, timeout: 10), as: UTF8.self)
@@ -147,7 +162,8 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectLayer(_ sender: NSMenuItem) { if let value = sender.representedObject as? String { change(["layer", value]) } }
     @objc private func selectBrightness(_ sender: NSMenuItem) { if let value = sender.representedObject as? Int { change(["brightness", String(value)]) } }
-    @objc private func restart() { change(["install-agent"]) }
+    @objc private func restart() { change(["install-agent"], pausedAfter: false) }
+    @objc private func stopDaemon() { change(["stop-agent"], pausedAfter: true) }
     @objc private func quit() { NSApplication.shared.terminate(nil) }
     @objc private func resetConfig() { configPath = nil; UserDefaults.standard.removeObject(forKey: "companion.configPath"); refresh() }
     @objc private func chooseConfig() {

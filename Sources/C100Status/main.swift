@@ -350,6 +350,9 @@ enum C100StatusCLI {
                 print("config_dir=\(result.configDir) settings=\(result.settingsPath) status=\(result.status.rawValue) \(result.message)")
             }
             print("summary: \(ClaudeHooksInstaller.summarize(results)) binary=\(binaryPath)")
+        case "stop-agent":
+            try AgentInstaller.stop(label: options.agentLabel ?? AgentInstaller.defaultLabel)
+            print("LaunchAgent stopped; login configuration retained")
         case "install-agent":
             let label = options.agentLabel ?? AgentInstaller.defaultLabel
             let binaryPath = options.binaryPathOverride ?? HelperInstaller.currentExecutableURL().path
@@ -2992,6 +2995,14 @@ enum C100StatusCLI {
         }
         recorded.arguments.removeAll()
 
+        let beforeStop = try Data(contentsOf: URL(fileURLWithPath: plistPath))
+        try AgentInstaller.stop(label: label, uid: 501, launchctl: stubLaunchctl)
+        guard recorded.arguments == [["bootout", "gui/501/\(label)"]],
+              try Data(contentsOf: URL(fileURLWithPath: plistPath)) == beforeStop else {
+            throw CLIError.runtime("stop-agent self-test: stop changed login settings or reloaded the job")
+        }
+        recorded.arguments.removeAll()
+
         // 5. Re-run with identical arguments: reported as .restarted, plist
         // unchanged, but still reloaded (bootout+bootstrap again).
         let sameContentsBefore = try String(contentsOfFile: plistPath, encoding: .utf8)
@@ -3071,6 +3082,8 @@ enum C100StatusCLI {
           c100-status self-test
 
         `install-claude-hooks` idempotently adds this binary's `hook --source claude` entries to each Claude Code profile's settings.json (profile directories from configuration, falling back to CLAUDE_CONFIG_DIR or ~/.claude), alongside any existing hooks (e.g. herdr's) without touching them. Repeat `--config-dir` to override the default set; `--binary` overrides the auto-detected absolute path to this executable. `--dry-run` reports planned changes without writing. `--uninstall` removes only the c100-managed entries. Each write is preceded by a `settings.json.c100-backup-<epoch-ms>` backup; a config dir with no settings.json is skipped, and unparseable settings.json is left untouched and reported as an error.
+        `stop-agent` unloads the per-user daemon without deleting its plist. `install-agent` resumes it; the retained login item also starts at the next login.
+
         `install-agent` installs `c100-status run` as a per-user LaunchAgent (~/Library/LaunchAgents/<label>.plist, default label com.kotainaba.c100-status.run), loaded via `launchctl bootstrap gui/<uid>` and kept alive by launchd (RunAtLoad+KeepAlive, ProcessType Interactive). `--location` is forwarded to `run` if given. `--binary` overrides the auto-detected absolute path to this executable; `--label` overrides the plist label (must match an existing manual `run` invocation's expectations if you rely on the default). `--dry-run` prints the plist and the launchctl commands that would run without touching disk or launchd. Re-running is idempotent: an unchanged plist is just restarted (bootout+bootstrap); a changed one is rewritten and reloaded. `--uninstall` runs `launchctl bootout` and deletes the plist. Refuses to run as root -- it manages your per-user (gui/<uid>) launchd domain, not the root helper. If a manually started `c100-status run` (e.g. via `nohup ... &`) is already using the device/socket when the LaunchAgent starts, the two will race for the same resources; stop the manual process (or use a different --socket/--location for one of them) before installing.
         `--herdr-bin` overrides the herdr binary path (else `HERDR_BIN` env, else /opt/homebrew/bin/herdr, /usr/local/bin/herdr, ~/.cargo/bin/herdr).
         If herdr can't be resolved, herdr support is silently disabled (logged once at INFO).

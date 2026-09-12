@@ -30,10 +30,10 @@ swift build -c release
 
 `list` の機種・VID・PID を確認します。`location` は USB ポートやマシンによって変わるため、後でこのマシンの値を使います。
 
-Keychron Launcher を閉じます。既存の C100 デーモンが動いている場合は停止します。ユーザー LaunchAgent を使っていた場合：
+Keychron Launcher を閉じます。既存の C100 デーモンが動いている場合は停止します。メニューバーの **C100 → デーモンを停止** を使います。メニューがない旧版では、ユーザー LaunchAgent を次のコマンドで停止できます：
 
 ```sh
-.build/release/c100-status install-agent --uninstall
+.build/release/c100-status stop-agent
 ```
 
 手動起動の `run` や診断用 watcher があれば、それも停止します。同じデバイスを複数のプロセスで制御しないでください。設定画面に未保存の編集があれば先に保存します。

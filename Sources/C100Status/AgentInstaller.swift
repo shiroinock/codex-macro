@@ -6,13 +6,6 @@ import Foundation
 /// logged-in user, keyed off `gui/<uid>` via `launchctl bootstrap`/`bootout`.
 /// Driven by `c100-status install-agent` (main.swift).
 ///
-/// This is the user-space counterpart to `HelperInstaller`, which installs
-/// the root-owned `LaunchDaemon` for the privileged grabber helper
-/// (`com.kotainaba.c100-status.grabber`). The label chosen here,
-/// `com.kotainaba.c100-status.run`, mirrors that naming scheme: same
-/// reverse-DNS prefix, suffixed with the CLI subcommand each plist launches
-/// (`grabber-service` vs. `run`) rather than a generic "agent"/"status" name.
-///
 /// Design notes, mirroring `ClaudeHooksInstaller`'s conventions:
 /// - **Idempotent.** Re-running with the same `--binary`/`--location`/
 ///   `--label` is a no-op write (the plist file is byte-identical) but still
@@ -148,6 +141,14 @@ enum AgentInstaller {
             throw CLIError.runtime("launchctl \(arguments.joined(separator: " ")) failed: \(text)")
         }
         return text
+    }
+
+    /// Unload without removing the login item or changing configuration.
+    static func stop(label: String = defaultLabel, uid: uid_t = getuid(),
+                     launchctl: LaunchctlRunner = defaultLaunchctlRunner) throws {
+        try validateLabel(label)
+        guard uid != 0 else { throw CLIError.usage("stop-agent must run as the logged-in user") }
+        _ = try launchctl(["bootout", "gui/\(uid)/\(label)"])
     }
 
     // MARK: - install / uninstall
