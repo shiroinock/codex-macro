@@ -924,8 +924,8 @@ final class StatusDaemon {
     private func layerKeyColors() -> [Int: HSVColor] {
         var colors: [Int: HSVColor] = [:]
         for part in keyboardLayout.parts where part.enabled && part.kind == .source {
-            guard let source = part.source else { continue }
-            let keyIndex = part.y * 10 + part.x
+            for assignment in part.serviceAssignments {
+            let source = assignment.source, keyIndex = assignment.key
             let statuses = (try? stateStore.assignments(source: source))?.map(\.slot.status) ?? []
             colors[keyIndex] = LayerKeyColorLogic.color(
                 for: source,
@@ -933,6 +933,7 @@ final class StatusDaemon {
                 sessionStatuses: statuses,
                 blinkPhaseOn: layerBlinkPhaseOn
             )
+        }
         }
         let viewport = configuredViewport()
         let utilities = viewport.utilityColors(projects: virtualProjects[activeLayer] ?? [:], slots: (try? stateStore.assignments(source: activeLayer).map(\.slot)) ?? [])
@@ -1266,7 +1267,7 @@ final class StatusDaemon {
             do { try scroll(part.direction!) } catch { logger.log(.error, "scroll failed error=\(error)") }
             return
         case .source:
-            if let source = part.source { switchLayer(to: source) }
+            if let source = part.serviceAssignments.first(where: { $0.key == keyIndex })?.source { switchLayer(to: source) }
             return
         case .action:
             do {

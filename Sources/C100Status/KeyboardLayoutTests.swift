@@ -33,8 +33,13 @@ enum KeyboardLayoutTests {
         try check(repeater.due(now: 1) == [0], "only relocated arrow repeats; former arrow may now be a task")
         repeater.updateHeld([0], now: 2, arrows: [])
         try check(repeater.due(now: 3).isEmpty, "layout change clears stale repeat")
-        layout.parts[1].enabled = false
-        try check(!layout.enabledSources.contains(.codex) && layout.part(at: 90) == nil, "disabled source releases key")
+        layout.parts[1].services = [.claudeHerdr, .claudeTerminal, .claudeDesktop]
+        try check(!layout.enabledSources.contains(.codex) && layout.parts[1].serviceAssignments.first?.source == .claudeHerdr, "service selection controls source discovery and grouped keys")
+        var legacy = KeyboardLayout.standard
+        legacy.parts.removeAll { $0.kind == .source }
+        legacy.parts += SessionSourceKind.allCases.enumerated().map { LayoutPart(kind: .source, x: $0.offset, y: 9, enabled: $0.element != .codex, source: $0.element) }
+        legacy.migrateParts(); try legacy.validate()
+        try check(legacy.parts.filter { $0.kind == .source }.count == 1 && !legacy.enabledSources.contains(.codex), "legacy service buttons merge and preserve choices")
         var collision = layout; collision.parts.append(LayoutPart(kind: .action, x: 2, y: 4, action: "composer.submit"))
         try rejects(collision, "overlap")
         collision.parts[collision.parts.count - 1].enabled = false; try collision.validate()

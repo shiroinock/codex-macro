@@ -81,9 +81,9 @@ enum C100StatusCLI {
                 return
             }
             if operation == "preview" {
-                guard positionals.count == 2 else { throw CLIError.usage("layout preview OUTPUT.png") }
+                guard (2...3).contains(positionals.count) else { throw CLIError.usage("layout preview OUTPUT.png [layout|services|search|assignment]") }
                 let layout = try LayoutStore(path: options.layoutPath).load()
-                try MainActor.assumeIsolated { try LayoutEditorWindow.render(layout, path: positionals[1]) }
+                try MainActor.assumeIsolated { try LayoutEditorWindow.render(layout, path: positionals[1], mode: positionals.count == 3 ? positionals[2] : "layout") }
                 return
             }
             var request = DaemonRequest(kind: .layout, hook: nil, status: nil, keyIndex: nil, color: nil)
@@ -407,6 +407,7 @@ enum C100StatusCLI {
             try ProjectGroupingTests.run()
             try GridViewportTests.run()
             try KeyboardLayoutTests.run()
+            try MainActor.assumeIsolated { try LayoutEditorTests.run() }
             try CompanionProtocol.selfTest()
             try selfTest()
         case "help", "--help", "-h":

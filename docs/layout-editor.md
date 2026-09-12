@@ -1,17 +1,17 @@
 # Layout editor and Codex actions
 
-Open **C100 → レイアウトを編集…** in the menu bar. Select a part on the keyboard or in the list, drag it to move, and use the inspector to change its position, dimensions, or action. **保存して反映** validates, saves, and applies the layout without restarting the daemon. Closing a dirty editor asks whether to discard the draft.
+Open **C100 → レイアウトを編集…** in the menu bar. Click a keyboard key to choose its function type, then choose an action, direction, service set, or task area. Existing buttons can be reassigned in place. The Codex action chooser has an autofocus search field and a scrolling result list with Japanese names and command IDs; words narrow results together. Select a part in the list to inspect its position and dimensions, or drag it on the keyboard to move it. **保存して反映** validates, saves, and applies the layout without restarting the daemon. Closing a dirty editor asks whether to discard the draft.
 
 Parts share the same 10 × 10 physical grid:
 
 - **Task area:** one rectangle, 1–10 keys wide/high. Move, resize, or transpose projects and tasks. Offscreen sessions retain status, and key presses resolve through the same projection used for LEDs.
 - **Scroll:** one key per arrow, placed anywhere. Moves the whole task viewport in physical directions, including when transposed. Holds repeat after 350 ms at 80 ms intervals.
-- **Service:** Codex, herdr, Claude CLI, or Claude Desktop. Each service has one movable switch. Turning it off stops task discovery and hooks for that source and frees its key. herdr background polling also pauses (an already-running request may finish). Action buttons are independent of task-source discovery.
+- **Service switch:** one rectangular part containing checkboxes for Codex, herdr, Claude CLI, and Claude Desktop. Selected services occupy keys from the top left in row order. Turning a service off stops task discovery and hooks for that source; the group keeps its rectangle until resized. herdr background polling also pauses (an already-running request may finish). Action buttons are independent of task-source discovery.
 - **Codex action:** choose an operation by name or command ID. The picker searches the installed desktop application's app-scoped, shortcut-configurable commands and Japanese titles. Existing keyboard shortcuts are retained; a separate unused F13–F20/modifier combination is added for each chosen command.
 
 The same Codex operation can be assigned to multiple buttons; they share one command alias.
 
-Disabled parts retain their positions but do not occupy keys. Active parts may not overlap or extend beyond the keyboard. The default layout preserves the previous 8 × 10 task area and bottom utility rows. Deleting all service parts is valid and leaves an actions-only controller.
+Only services have on/off choices inside their switch part. Other parts are removed with Delete, not enabled/disabled. Parts may not overlap or extend beyond the keyboard. A key inside the task area first offers area editing so that assigning a button cannot silently delete the entire area. The default layout preserves the previous 8 × 10 task area and bottom utility rows. Selecting no services (or deleting the service-switch part) is valid and leaves an actions-only controller. Legacy default service buttons migrate to one group while preserving their selected services and the group’s footprint.
 
 ## Codex compatibility
 

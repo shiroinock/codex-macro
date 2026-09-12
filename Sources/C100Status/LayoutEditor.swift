@@ -19,6 +19,7 @@ final class LayoutEditorModel: ObservableObject {
             do {
                 let data = try await execute(["layout", "show"])
                 layout = try JSONDecoder().decode(KeyboardLayout.self, from: Data(data.utf8))
+                layout.migrateParts()
                 saved = layout; selected = layout.parts.first?.id; loaded = true; message = "パーツを選び、ドラッグで移動できます"
             } catch { message = String(describing: error) }
             busy = false
@@ -44,11 +45,39 @@ final class LayoutEditorModel: ObservableObject {
     }
     func add(_ kind: LayoutPart.Kind, source: SessionSourceKind? = nil, direction: String? = nil) {
         if kind == .tasks, let existing = layout.parts.first(where: { $0.kind == .tasks }) { selected = existing.id; return }
-        if let source, let existing = layout.parts.first(where: { $0.source == source && $0.kind == .source }) { selected = existing.id; return }
+        if kind == .source, let existing = layout.parts.first(where: { $0.kind == .source }) { selected = existing.id; return }
         guard let key = (0..<100).first(where: { layout.part(at: $0) == nil }) else { message = "空きキーがありません。タスクエリアを縮めるか、パーツを無効にしてください"; return }
-        let part = LayoutPart(kind: kind, x: key % 10, y: key / 10, direction: direction, source: source,
-                              action: kind == .action ? CodexAction.catalog[0].id : nil)
-        layout.parts.append(part); selected = part.id
+        _ = assign(at: key, kind: kind, source: source, direction: direction, action: kind == .action ? CodexAction.catalog[0].id : nil)
+    }
+    /// Commit a key assignment only after the candidate passes layout validation.
+    func assign(at key: Int, kind: LayoutPart.Kind, source: SessionSourceKind?, direction: String?, action: String?, services: [SessionSourceKind] = SessionSourceKind.allCases) -> Bool {
+        guard (0..<100).contains(key) else { return false }
+        let target = layout.part(at: key)
+        if let target, target.kind == .tasks, target.width * target.height > 1 {
+            if kind == .tasks { selected = target.id; return true }
+            message = "タスクエリアを先に縮めて、このキーを空けてください"
+            return false
+        }
+        let existing = layout.parts.first { part in
+            (kind == .tasks && part.kind == .tasks) || (kind == .source && part.kind == .source)
+        }
+        var candidate = layout
+        candidate.parts.removeAll { $0.id == target?.id || $0.id == existing?.id }
+        var part = existing ?? LayoutPart(kind: kind, x: key % 10, y: key / 10)
+        if existing?.id != target?.id || existing == nil { part.x = key % 10; part.y = key / 10 }
+        part.enabled = true
+        part.source = nil; part.direction = direction; part.action = action
+        if kind == .source {
+            part.services = services
+            if part.width * part.height < max(1, services.count) {
+                part.width = min(10 - part.x, max(1, services.count)); part.height = max(1, (services.count + part.width - 1) / part.width)
+            }
+        }
+        candidate.parts.append(part)
+        do { try candidate.validate() }
+        catch { message = String(describing: error); return false }
+        layout = candidate; selected = part.id; message = "割り当てを変更しました。「保存して反映」で適用します"
+        return true
     }
     func remove() { layout.parts.removeAll { $0.id == selected }; selected = layout.parts.first?.id }
     func revert() { layout = saved; selected = layout.parts.first?.id; message = "未保存の変更を取り消しました" }
@@ -56,7 +85,8 @@ final class LayoutEditorModel: ObservableObject {
 
 struct LayoutEditorView: View {
     @ObservedObject var model: LayoutEditorModel
-    @State private var actionSearch = ""
+    @State private var assignmentKey: AssignmentKey?
+    @State private var choosingAction = false
     @State private var dragOrigin: (String, Int, Int)?
     private let cell: CGFloat = 46
     private func tint(_ part: LayoutPart) -> Color {
@@ -84,24 +114,29 @@ struct LayoutEditorView: View {
                             Menu("スクロール") { ForEach(["up","down","left","right"], id: \.self) { dir in
                                 Button(["up":"↑ 上","down":"↓ 下","left":"← 左","right":"→ 右"][dir]!) { model.add(.scroll, direction: dir) }
                             } }
-                            Menu("サービス") { ForEach(SessionSourceKind.allCases, id: \.rawValue) { source in
-                                Button(source.displayName) { model.add(.source, source: source) }
-                            } }
+                            Button("サービス切り替え") { model.add(.source) }
                             Button("Codex アクション") { model.add(.action) }
                         }.disabled(model.busy || !model.loaded)
                     }
                     ZStack(alignment: .topLeading) {
                         ForEach(0..<100, id: \.self) { key in
-                            RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.045))
-                                .overlay(Text("\(key / 10 + 1)·\(key % 10 + 1)").font(.system(size: 9)).foregroundStyle(.tertiary))
+                            Button { assignmentKey = AssignmentKey(key: key) } label: {
+                                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.045))
+                                    .overlay(Text("\(key / 10 + 1)·\(key % 10 + 1)").font(.system(size: 9)).foregroundStyle(.tertiary))
+                            }.buttonStyle(.plain).accessibilityLabel("\(key / 10 + 1)行\(key % 10 + 1)列に割り当て")
                                 .frame(width: cell - 4, height: cell - 4).offset(x: CGFloat(key % 10) * cell, y: CGFloat(key / 10) * cell)
                         }
                         ForEach(model.layout.parts.filter(\.enabled)) { part in
                             partView(part)
                                 .frame(width: CGFloat(part.width) * cell - 4, height: CGFloat(part.height) * cell - 4)
                                 .offset(x: CGFloat(part.x) * cell, y: CGFloat(part.y) * cell)
-                                .onTapGesture { model.selected = part.id }
-                                .gesture(DragGesture(minimumDistance: 3).onChanged { value in
+                                .gesture(SpatialTapGesture().onEnded { value in
+                                    model.selected = part.id
+                                    let x = min(part.width - 1, max(0, Int(value.location.x / cell)))
+                                    let y = min(part.height - 1, max(0, Int(value.location.y / cell)))
+                                    assignmentKey = AssignmentKey(key: (part.y + y) * 10 + part.x + x)
+                                })
+                                .simultaneousGesture(DragGesture(minimumDistance: 3).onChanged { value in
                                     if dragOrigin?.0 != part.id { dragOrigin = (part.id, part.x, part.y); model.selected = part.id }
                                     guard let origin = dragOrigin else { return }
                                     model.update { p in
@@ -112,7 +147,7 @@ struct LayoutEditorView: View {
                         }
                     }.frame(width: cell * 10, height: cell * 10, alignment: .topLeading)
                         .padding(12).background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
-                    Text("ドラッグで移動 · 右側でサイズ変更 · 重なりは保存時にチェック")
+                    Text("キーをクリックして割り当て · ドラッグで移動 · 右側でサイズ変更")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading, spacing: 12) {
@@ -131,11 +166,11 @@ struct LayoutEditorView: View {
                                 }.buttonStyle(.plain)
                             }
                         }
-                    }.frame(height: 190)
+                    }.frame(height: 150)
                     Divider()
-                    if let part = model.layout.parts.first(where: { $0.id == model.selected }) { inspector(part) }
+                    ScrollView { if let part = model.layout.parts.first(where: { $0.id == model.selected }) { inspector(part).frame(maxWidth: .infinity, alignment: .leading) } }
                     Spacer(minLength: 0)
-                }.frame(width: 285)
+                }.frame(width: 285, height: 540)
             }.disabled(model.busy || !model.loaded)
             if let error = model.validation { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout) }
             HStack {
@@ -145,6 +180,14 @@ struct LayoutEditorView: View {
                 Button("標準配置に戻す") { model.layout = .standard; model.selected = "tasks" }.disabled(model.busy || !model.loaded)
             }
         }.padding(24).frame(minWidth: 855, minHeight: 680).background(Color(nsColor: .windowBackgroundColor))
+        .sheet(item: $assignmentKey) { target in
+            KeyAssignmentView(model: model, key: target.key)
+        }
+        .sheet(isPresented: $choosingAction) {
+            CodexActionChooser(selected: model.layout.parts.first { $0.id == model.selected }?.action) { action in
+                model.update { $0.action = action }; choosingAction = false
+            }
+        }
     }
     private func partView(_ part: LayoutPart) -> some View {
         RoundedRectangle(cornerRadius: 7).fill(tint(part).opacity(0.18))
@@ -157,6 +200,8 @@ struct LayoutEditorView: View {
                         Text("\(part.width) 列 × \(part.height) 行").font(.caption)
                         Text(part.transposed ? "列：プロジェクト ／ 行：タスク" : "行：プロジェクト ／ 列：タスク").font(.caption2)
                     }.foregroundStyle(tint(part)).padding(6).minimumScaleFactor(0.4)
+                } else if part.kind == .source {
+                    VStack(spacing: 3) { Text("サービス切り替え").font(.caption2.bold()); Text(part.selectedServices.map(\.displayName).joined(separator: " · ")).font(.system(size: 9)) }.padding(3).foregroundStyle(tint(part))
                 } else { Text(part.title).font(.system(size: part.kind == .scroll ? 24 : 10, weight: .semibold)).multilineTextAlignment(.center).padding(3).foregroundStyle(tint(part)) }
             }.accessibilityLabel("\(part.title)、\(part.y + 1)行\(part.x + 1)列")
     }
@@ -166,14 +211,15 @@ struct LayoutEditorView: View {
     private func inspector(_ part: LayoutPart) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(part.title).font(.headline)
-            Toggle(part.kind == .source ? "このサービスを使用する" : "有効", isOn: Binding(get: { part.enabled }, set: { v in model.update { $0.enabled = v } }))
             HStack {
                 Stepper("列 \(part.x + 1)", value: integer(\.x, 0), in: 0...(10 - part.width))
                 Stepper("行 \(part.y + 1)", value: integer(\.y, 0), in: 0...(10 - part.height))
             }
-            if part.kind == .tasks {
+            if part.kind == .tasks || part.kind == .source {
                 Stepper("幅 \(part.width) キー", value: integer(\.width, 1), in: 1...(10 - part.x))
                 Stepper("高さ \(part.height) キー", value: integer(\.height, 1), in: 1...(10 - part.y))
+            }
+            if part.kind == .tasks {
                 Toggle("プロジェクトとタスクの縦横を入れ替える", isOn: Binding(get: { part.transposed }, set: { v in model.update { $0.transposed = v } }))
             }
             if part.kind == .scroll {
@@ -182,11 +228,22 @@ struct LayoutEditorView: View {
                 }
                 Text("長押しで連続移動。タスクエリア全体に作用します。").font(.caption).foregroundStyle(.secondary)
             }
-            if part.kind == .source { Text("OFF にすると、このサービスのタスク取得・表示・切り替えを停止します。配置は保持されます。").font(.caption).foregroundStyle(.secondary) }
+            if part.kind == .source {
+                Text("使用するサービス").font(.subheadline.bold())
+                ForEach(SessionSourceKind.allCases, id: \.rawValue) { source in
+                    Toggle(source.displayName, isOn: Binding(get: { part.selectedServices.contains(source) }, set: { enabled in
+                        model.update { p in
+                            var selected = Set(p.selectedServices)
+                            if enabled { selected.insert(source) } else { selected.remove(source) }
+                            p.services = SessionSourceKind.allCases.filter { selected.contains($0) }; p.source = nil
+                        }
+                    }))
+                }
+                Text("選んだサービスを左上から順に配置します。OFF のサービスはタスク取得も停止します。").font(.caption).foregroundStyle(.secondary)
+            }
             if part.kind == .action {
-                TextField("操作を検索", text: $actionSearch)
-                Picker("操作", selection: Binding(get: { part.action ?? CodexAction.catalog[0].id }, set: { v in model.update { $0.action = v } })) {
-                    ForEach(CodexAction.catalog.filter { actionSearch.isEmpty || $0.id == part.action || $0.title.localizedCaseInsensitiveContains(actionSearch) || $0.id.localizedCaseInsensitiveContains(actionSearch) }) { action in Text(action.title).tag(action.id) }
+                Button { choosingAction = true } label: {
+                    Label("操作を検索・変更…", systemImage: "magnifyingglass")
                 }
                 Text(CodexAction.installed.isEmpty ? "標準の操作一覧を使用中" : "Codex から読み込んだ \(CodexAction.catalog.count) 操作").font(.caption).foregroundStyle(.secondary)
                 Text("保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。").font(.caption).foregroundStyle(.secondary)
@@ -196,6 +253,117 @@ struct LayoutEditorView: View {
             }
             Button("パーツを削除", role: .destructive) { model.remove() }
         }
+    }
+}
+
+private struct AssignmentKey: Identifiable {
+    let key: Int
+    var id: Int { key }
+}
+
+struct CodexActionChooser: View {
+    var selected: String?
+    var choose: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
+    private var results: [CodexAction] { Self.search(query, in: CodexAction.catalog) }
+    static func search(_ query: String, in actions: [CodexAction]) -> [CodexAction] {
+        let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        return actions.filter { action in words.allSatisfy { action.title.localizedCaseInsensitiveContains($0) || action.id.localizedCaseInsensitiveContains($0) } }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack { Text("Codex アクションを選択").font(.title3.bold()); Spacer(); Button("閉じる") { dismiss() }.keyboardShortcut(.cancelAction) }
+            TextField("操作名やキーワードで検索（例：サイドバー、git、音声）", text: $query)
+                .textFieldStyle(.roundedBorder).focused($searchFocused)
+                .onSubmit { if let first = results.first { choose(first.id) } }
+            Text("\(results.count) 件").font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(spacing: 3) {
+                    ForEach(results) { action in
+                        Button { choose(action.id) } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(action.title).font(.body)
+                                    Text(action.id).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if action.id == selected { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
+                            }.padding(10).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                                .background(action.id == selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 7))
+                        }.buttonStyle(.plain)
+                    }
+                    if results.isEmpty { Text("一致する操作がありません").foregroundStyle(.secondary).padding(30) }
+                }
+            }.frame(height: 350)
+            Text("同じ操作を複数のボタンに割り当てられます").font(.caption).foregroundStyle(.secondary)
+        }.padding(22).frame(width: 540).onAppear { searchFocused = true }
+    }
+}
+
+private struct KeyAssignmentView: View {
+    @ObservedObject var model: LayoutEditorModel
+    let key: Int
+    @Environment(\.dismiss) private var dismiss
+    @State private var kind: LayoutPart.Kind = .action
+    @State private var services = Set(SessionSourceKind.allCases)
+    @State private var direction = "up"
+    @State private var action: String?
+    @State private var searching = false
+    private var occupied: LayoutPart? { model.layout.part(at: key) }
+    private var blockedByArea: Bool { occupied.map { $0.kind == .tasks && $0.width * $0.height > 1 && kind != .tasks } ?? false }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Text("\(key / 10 + 1) 行 · \(key % 10 + 1) 列の割り当て").font(.title3.bold())
+                Spacer(); Button("キャンセル") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            if let occupied {
+                HStack {
+                    Text("現在：\(occupied.title)").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("配置・サイズを編集") { model.selected = occupied.id; dismiss() }
+                }
+            }
+            Text("どの機能を割り当てますか？").font(.headline)
+            Picker("機能", selection: $kind) {
+                Text("Codex アクション").tag(LayoutPart.Kind.action)
+                Text("矢印").tag(LayoutPart.Kind.scroll)
+                Text("サービス切り替え").tag(LayoutPart.Kind.source)
+                Text("タスクエリア").tag(LayoutPart.Kind.tasks)
+            }.pickerStyle(.segmented).labelsHidden()
+            switch kind {
+            case .action:
+                Button { searching = true } label: {
+                    Label(action.flatMap { id in CodexAction.catalog.first { $0.id == id }?.title } ?? "Codex アクションを検索…", systemImage: "magnifyingglass")
+                }
+            case .scroll:
+                Picker("方向", selection: $direction) {
+                    Text("↑ 上").tag("up"); Text("↓ 下").tag("down"); Text("← 左").tag("left"); Text("→ 右").tag("right")
+                }.pickerStyle(.segmented)
+            case .source:
+                Text("使用するサービス")
+                ForEach(SessionSourceKind.allCases, id: \.rawValue) { source in
+                    Toggle(source.displayName, isOn: Binding(get: { services.contains(source) }, set: { enabled in
+                        if enabled { services.insert(source) } else { services.remove(source) }
+                    }))
+                }
+                Text("選択したサービスを1つのパーツにまとめます。配置済みなら、このキーへ移動します。").font(.caption).foregroundStyle(.secondary)
+            case .tasks:
+                Text("タスクエリアは1つです。新規は1キーから作り、右側の設定で幅と高さを広げます。配置済みならそのエリアを移動・編集します。").font(.callout).foregroundStyle(.secondary)
+            }
+            if blockedByArea { Text("このキーはタスクエリア内です。「配置・サイズを編集」でエリアを縮めてから割り当ててください。").foregroundStyle(.orange) }
+            HStack {
+                Text(model.message).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                Spacer()
+                Button("割り当て") {
+                    if model.assign(at: key, kind: kind, source: nil, direction: kind == .scroll ? direction : nil, action: kind == .action ? action : nil, services: SessionSourceKind.allCases.filter { services.contains($0) }) { dismiss() }
+                }.buttonStyle(.borderedProminent).disabled(blockedByArea || (kind == .action && action == nil))
+            }
+        }.padding(24).frame(width: 560)
+            .onAppear { if let occupied { kind = occupied.kind; services = Set(occupied.selectedServices); direction = occupied.direction ?? "up"; action = occupied.action } }
+            .sheet(isPresented: $searching) { CodexActionChooser(selected: action) { action = $0; searching = false } }
     }
 }
 
@@ -221,12 +389,19 @@ final class LayoutEditorWindow: NSWindowController, NSWindowDelegate {
 }
 
 extension LayoutEditorWindow {
-    static func render(_ layout: KeyboardLayout, path: String) throws {
+    static func render(_ layout: KeyboardLayout, path: String, mode: String = "layout") throws {
         _ = NSApplication.shared
         let model = LayoutEditorModel(execute: { _ in "" })
         model.layout = layout; model.selected = layout.parts.first(where: { $0.kind == .action })?.id ?? layout.parts.first?.id; model.loaded = true; model.message = "パーツを選び、ドラッグで移動できます"
-        let view = NSHostingView(rootView: LayoutEditorView(model: model))
-        view.frame = NSRect(x: 0, y: 0, width: 870, height: 730)
+        if mode == "services" { model.selected = layout.parts.first { $0.kind == .source }?.id }
+        let content: AnyView
+        switch mode {
+        case "search": content = AnyView(CodexActionChooser(selected: nil, choose: { _ in }))
+        case "assignment": content = AnyView(KeyAssignmentView(model: model, key: 80))
+        default: content = AnyView(LayoutEditorView(model: model))
+        }
+        let view = NSHostingView(rootView: content.background(Color(nsColor: .windowBackgroundColor)))
+        view.frame = NSRect(x: 0, y: 0, width: mode == "search" ? 584 : mode == "assignment" ? 608 : 870, height: mode == "search" ? 540 : mode == "assignment" ? 350 : 730)
         let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = view
         view.layoutSubtreeIfNeeded()
