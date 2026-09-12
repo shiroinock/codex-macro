@@ -8,7 +8,7 @@ C100 Companion は、**Keychron C100 8K（通常動作時の VID `3434` / PID `0
 
 このガイドは検証済みの C100 8K・AT32 DFU 構成を対象にしています。USB ID やフラッシュの表示が違う場合は、以下の数値をそのまま使わず、機種を確認してください。ファームウェアの動作は実験的です。[検証記録](VALIDATION.md)で確認済み・未確認の範囲を確認できます。
 
-ブラウザで進める場合は [Web Flasher（実験版）](https://shiroinock.github.io/codex-macro/) も利用できます。macOS の Chrome 向けで、ブラウザ経由の実機検証は未完了です。以下は CLI 方式の手順です。
+ブラウザで進める場合は [Web Flasher（実験版）](https://shiroinock.github.io/codex-macro/) も利用できます。macOS の Chrome 向けで、実機でバックアップ保存・書き込み・読み戻し照合・再起動後の Companion 動作を確認済みです。通常ファームウェアへの復元は未確認です。以下は CLI 方式の手順です。
 
 ## 1. 用意するもの
 

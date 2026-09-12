@@ -263,4 +263,4 @@ Assign one semantic action per key. Enabled services and the foreground app dete
 
 ## Browser firmware installer
 
-The [experimental Web Flasher](https://shiroinock.github.io/codex-macro/) targets Chrome on macOS. It requires a downloaded backup to be reselected and compared before writing, verifies flash by reading it back, and supports restoring a device backup. Backups stay local. Browser-to-device validation is still pending; use the [CLI guide](firmware/FLASHING.ja.md) for the previously validated flashing path.
+The [experimental Web Flasher](https://shiroinock.github.io/codex-macro/) targets Chrome on macOS. It requires a downloaded backup to be reselected and compared before writing, verifies flash by reading it back, and supports restoring a device backup. Backups stay local. The user confirmed physical backup saving, flashing, readback comparison, and Companion operation after restart. The device already had custom firmware, so restoring stock firmware remains unverified. See the [validation record](firmware/VALIDATION.md) and [CLI guide](firmware/FLASHING.ja.md).

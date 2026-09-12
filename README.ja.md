@@ -284,4 +284,4 @@ sudo .build/release/c100-status uninstall-helper
 
 ## ブラウザからファームウェアを導入する
 
-[Web Flasher（実験版）](https://shiroinock.github.io/codex-macro/) は、macOS の Chrome 向けのバックアップ・書き込み・復元サイトです。保存したバックアップの再選択と照合を必須にし、書き込み後は読み戻してから再起動します。バックアップをサーバーへ送信しません。ブラウザ経由の実機検証は未完了です。CLI による確認済みの手順は [導入・復元ガイド](firmware/FLASHING.ja.md) を参照してください。
+[Web Flasher（実験版）](https://shiroinock.github.io/codex-macro/) は、macOS の Chrome 向けのバックアップ・書き込み・復元サイトです。保存したバックアップの再選択と照合を必須にし、書き込み後は読み戻してから再起動します。バックアップをサーバーへ送信しません。実機でバックアップ保存・書き込み・読み戻し照合・再起動後の Companion 動作を確認済みです。通常ファームウェアへの復元は未確認です。CLI による確認済みの手順は [導入・復元ガイド](firmware/FLASHING.ja.md) を参照してください。

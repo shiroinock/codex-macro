@@ -61,3 +61,17 @@ No new lifecycle hooks were installed as part of this firmware validation.
 
 Evidence: ignored `firmware/build/keyboard-output-*` files and
 `pre-keyboard-output-flash.bin`. The manifest records image/readback/backup hashes.
+
+## Web Flasher — 2026-09-13 (user-reported)
+
+The user tested the published GitHub Pages installer and confirmed backup
+saving, firmware writing, the readback-match result, and Companion operation
+after restarting the C100. These are user-observed results; no browser USB
+trace or new device readback artifact was collected by the agent in this run.
+
+The device already contained codex-macro companion firmware before the test.
+Its new backup therefore preserves that custom firmware, not the original
+stock firmware. Restoration to stock firmware / ordinary keyboard operation
+remains unverified. Do not interpret this report as validating that path.
+Disconnect recovery during erase/write and other browser/OS versions also
+remain unverified. The website retains its experimental label.

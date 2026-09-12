@@ -39,7 +39,11 @@ source archive including libraries and licenses. Device backups under
 as the build source. Workflow dispatch can republish; relevant main pushes also
 trigger it.
 
-Automated tests and simulated browser flow pass. Actual WebUSB on the C100 AT32
-bootloader, disconnect recovery during erase/write, and hardware restore are
-still unverified. Keep the experimental notice until those checks are recorded.
-Do not equate prior dfu-util validation with browser validation.
+Automated tests and simulated browser flow pass. On 2026-09-13, the user
+confirmed physical backup saving, flashing, readback comparison, and Companion
+operation after restart through the published site. Their C100 already had
+custom firmware: this does not validate restoration to stock firmware. A backup
+preserves the firmware currently on the device, not necessarily its factory state.
+See `firmware/VALIDATION.md` for the evidence boundary. Disconnect recovery during
+erase/write, stock restoration, and other browser/OS versions remain unverified;
+keep the experimental label.
