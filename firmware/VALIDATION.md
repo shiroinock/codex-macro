@@ -71,7 +71,24 @@ trace or new device readback artifact was collected by the agent in this run.
 
 The device already contained codex-macro companion firmware before the test.
 Its new backup therefore preserves that custom firmware, not the original
-stock firmware. Restoration to stock firmware / ordinary keyboard operation
-remains unverified. Do not interpret this report as validating that path.
+stock firmware. The initial report alone did not validate stock restoration;
+the follow-up below covers that path.
 Disconnect recovery during erase/write and other browser/OS versions also
 remain unverified. The website retains its experimental label.
+
+### Stock restoration and return to companion — same-day follow-up
+
+- Before restoration, the agent verified that the initial 262,144-byte
+  `original-device-flash.bin` still matched its recorded SHA-256:
+  `453bed79c89de0622cdd9821efba28eec8c0eb6fca84d38ab1b11740f1e2a1c6`.
+- The user confirmed the Web Flasher restoration procedure, including
+  readback comparison, restart, and ordinary text input with stock firmware.
+- The user then confirmed reinstallation of companion firmware, comparison,
+  and restart using the Web Flasher.
+- The agent checked the per-user LaunchAgent was running and `inspect`
+  reported `connected=true`, `backend=companion`,
+  `actionTransport=keyboard-hid`, and an empty `actionError`.
+
+The physical steps are user-reported; the daemon state was checked directly.
+This validates restoration from this device's original backup, not the
+separately source-built standard-keymap image or interruption recovery.

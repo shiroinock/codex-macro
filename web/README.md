@@ -42,8 +42,11 @@ trigger it.
 Automated tests and simulated browser flow pass. On 2026-09-13, the user
 confirmed physical backup saving, flashing, readback comparison, and Companion
 operation after restart through the published site. Their C100 already had
-custom firmware: this does not validate restoration to stock firmware. A backup
+custom firmware. A follow-up test confirmed restoration from the original stock
+backup, ordinary keyboard input, and reinstallation of companion firmware. The
+daemon subsequently reported connected=true and actionTransport=keyboard-hid
+with no action error. A backup
 preserves the firmware currently on the device, not necessarily its factory state.
 See `firmware/VALIDATION.md` for the evidence boundary. Disconnect recovery during
-erase/write, stock restoration, and other browser/OS versions remain unverified;
+erase/write and other browser/OS versions remain unverified;
 keep the experimental label.
