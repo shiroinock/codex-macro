@@ -31,6 +31,33 @@ struct CodexSidebarOrdering {
     let threadIDsByProject: [String: [String]]
     let pinnedThreadIDs: [String]
     let projectAssignments: [String: String]
+    var projectRoots: [String: [String]] = [:]
+    var projectlessIDs: Set<String> = []
+    var workspaceRootsByThread: [String: String] = [:]
+
+    func resolvedProjectID(sessionID: String, cwd: String, catalogProjectID: String?) -> String? {
+        if projectlessIDs.contains(sessionID) { return nil }
+        if let explicit = projectAssignments[sessionID] { return explicit }
+        if let catalogProjectID, !catalogProjectID.isEmpty { return catalogProjectID }
+        // Legacy threads have no project_id. Match only saved project roots,
+        // never Git origin or a guessed repository basename.
+        for candidate in [workspaceRootsByThread[sessionID], cwd].compactMap({ $0 }) {
+            let path = URL(fileURLWithPath: candidate).standardizedFileURL.path
+            let matches = projectRoots.flatMap { project, roots in
+                roots.compactMap { root -> (String, Int)? in
+                    let root = URL(fileURLWithPath: root).standardizedFileURL.path
+                    return path == root || path.hasPrefix(root == "/" ? "/" : root + "/") ? (project, root.count) : nil
+                }
+            }
+            if let length = matches.map({ $0.1 }).max() {
+                let projects = Set(matches.filter { $0.1 == length }.map { $0.0 })
+                // Overlapping saved projects need an explicit assignment.
+                if projects.count == 1 { return projects.first }
+                return nil
+            }
+        }
+        return nil
+    }
 
     static let empty = Self(
         projectIDs: [],
@@ -209,7 +236,7 @@ enum CodexCatalog {
             result.append(CatalogSession(
                 sessionID: sessionID,
                 cwd: String(cString: cwdText),
-                projectID: catalogProjectID ?? sidebar.projectAssignments[sessionID],
+                projectID: sidebar.resolvedProjectID(sessionID: sessionID, cwd: String(cString: cwdText), catalogProjectID: catalogProjectID),
                 recency: sqlite3_column_double(statement, 3),
                 createdAt: sqlite3_column_double(statement, 4)
             ))
@@ -249,7 +276,7 @@ enum CodexCatalog {
         return candidates.map { candidate in
             let forkedFromID = firstLine(atPath: candidate.rolloutPath).flatMap(forkedFromID)
             let projectID = resolvedForkProjectID(
-                explicitProjectID: candidate.projectID ?? sidebar.projectAssignments[candidate.sessionID],
+                explicitProjectID: sidebar.projectAssignments[candidate.sessionID] ?? candidate.projectID,
                 forkedFromID: forkedFromID,
                 parentByChild: parentByChild,
                 projectBySession: projectBySession
@@ -257,7 +284,7 @@ enum CodexCatalog {
             return CatalogSession(
                 sessionID: candidate.sessionID,
                 cwd: candidate.cwd,
-                projectID: projectID,
+                projectID: sidebar.resolvedProjectID(sessionID: candidate.sessionID, cwd: candidate.cwd, catalogProjectID: projectID),
                 recency: candidate.recency,
                 createdAt: candidate.createdAt
             )
@@ -381,7 +408,10 @@ enum CodexCatalog {
             projectIDs: projectIDs,
             threadIDsByProject: threadIDsByProject,
             pinnedThreadIDs: pinnedThreadIDs,
-            projectAssignments: projectAssignments
+            projectAssignments: projectAssignments,
+            projectRoots: (root["local-projects"] as? [String: [String: Any]] ?? [:]).mapValues { $0["rootPaths"] as? [String] ?? [] },
+            projectlessIDs: Set(root["projectless-thread-ids"] as? [String] ?? []),
+            workspaceRootsByThread: root["thread-workspace-root-hints"] as? [String: String] ?? [:]
         )
     }
 }

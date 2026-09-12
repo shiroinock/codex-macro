@@ -175,7 +175,7 @@ Pressing a green (`done`) session key acknowledges the completed state after Cod
 
 Codex does not emit the `Stop` hook when an active turn is interrupted with Esc. The daemon therefore tails the local Codex rollout for each assigned task during its two-second catalog refresh. A new `turn_aborted` event returns only that interrupted task from blue or amber to white.
 
-Project identity uses Codex's local task-to-project assignment, so each worktree shares a row with its saved Codex project without merging separately saved projects that happen to use the same Git origin. Tasks without a project assignment fall back to their exact normalized working-directory path. The 10 most recently active projects and up to 10 most recent tasks per project fit on the physical grid.
+Project identity honors explicit projectless selection and Codex task-to-project assignments first. Legacy tasks without an assignment or catalog project ID are matched against saved local project roots (longest directory match, including multiple roots and workspace-root hints). Ambiguous roots remain projectless. The grid groups Codex tasks by resolved project ID, so separate saved projects never merge just because they share a working directory. Each displayed project has up to 10 task keys. The running daemon has nine task rows because the bottom row is reserved for layer switching; overflow does not merge unrelated projects.
 
 Codex forks inherit their source task's project by following the recorded fork and subagent ancestry. This keeps both same-directory session forks and separate-worktree forks on the source project's row while assigning each fork its own column and key.
 

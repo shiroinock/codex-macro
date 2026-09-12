@@ -376,6 +376,7 @@ enum C100StatusCLI {
             print(options.logPath)
         case "self-test":
             try ConfigurationTests.run()
+            try ProjectGroupingTests.run()
             try CompanionProtocol.selfTest()
             try selfTest()
         case "help", "--help", "-h":

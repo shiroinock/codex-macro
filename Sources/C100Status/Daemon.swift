@@ -30,7 +30,6 @@ final class StatusDaemon {
     private var pressedKeyIndexes: Set<Int> = []
     private var nextCatalogSync = Date.distantPast
     private var catalogProjectBySession: [String: String] = [:]
-    private var catalogProjectByCWD: [String: String] = [:]
     private var catalogSessionIDs: Set<String> = []
     /// Sticky feedback for `UnifiedLayout.compute`, kept *per layer* (M5):
     /// each `SessionSourceKind` gets its own independent `compute()` call
@@ -1314,10 +1313,7 @@ final class StatusDaemon {
             catalogProjectBySession = Dictionary(
                 uniqueKeysWithValues: catalogSessions.map { ($0.sessionID, $0.projectKey) }
             )
-            catalogProjectByCWD = Dictionary(
-                catalogSessions.map { (URL(fileURLWithPath: $0.cwd).standardizedFileURL.path, $0.projectKey) },
-                uniquingKeysWith: { first, _ in first }
-            )
+
 
             var agentSessions: [AgentSession] = []
             for provider in providers {
@@ -1788,7 +1784,6 @@ final class StatusDaemon {
     private func resolvedProjectKey(for hook: HookInput) -> String {
         guard hook.effectiveSource == .codex else { return hook.projectKey }
         return catalogProjectBySession[hook.sessionID]
-            ?? catalogProjectByCWD[hook.projectKey]
             ?? CodexCatalog.projectKey(sessionID: hook.sessionID, paths: codexPaths)
     }
 

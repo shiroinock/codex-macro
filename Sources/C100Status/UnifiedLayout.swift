@@ -316,10 +316,13 @@ enum UnifiedLayout {
     /// never merges purely because it happens to share a cwd with something
     /// else (another herdr workspace, a Codex session, ...) -- see the
     /// doc comment on `compute(sessions:previousPlacements:maxRows:)` for
-    /// why. Everything else (Codex sessions, hint-less sessions) is keyed by
-    /// its cwd as before, so `codexProjectID` union across differing cwds
-    /// (the worktree case) still works.
+    /// why. Codex uses its resolved project key, so two saved projects
+    /// sharing a cwd remain separate while worktrees of one project share
+    /// a row. Only sessions without either identity fall back to cwd.
     private static func groupingNode(for session: AgentSession) -> String {
+        if session.sourceKind == .codex, let projectID = session.rowHints.codexProjectID {
+            return "codex:" + projectID
+        }
         if let workspaceID = session.rowHints.herdrWorkspaceID {
             return "herdr:\(workspaceID)"
         }
