@@ -109,10 +109,14 @@ final class LayoutEditorModel: ObservableObject {
 
 struct LayoutEditorView: View {
     @ObservedObject var model: LayoutEditorModel
-    @State private var assignmentKey: AssignmentKey?
-    @State private var choosingAction = false
+    @State private var selectedKey: Int?
     @State private var dragOrigin: (String, Int, Int)?
     private let cell: CGFloat = 46
+    private var inspectorKey: Int? {
+        guard let part = model.layout.parts.first(where: { $0.id == model.selected }) else { return selectedKey }
+        if let selectedKey, part.keys.contains(selectedKey) { return selectedKey }
+        return part.y * 10 + part.x
+    }
     private func tint(_ part: LayoutPart) -> Color {
         switch part.kind { case .tasks: .indigo; case .scroll: .teal; case .source: .orange; case .action: .purple }
     }
@@ -133,19 +137,12 @@ struct LayoutEditorView: View {
                     HStack {
                         Text("10 × 10 キー").font(.headline)
                         Spacer()
-                        Menu("パーツを追加") {
-                            Button("タスクエリア") { model.add(.tasks) }
-                            Menu("スクロール") { ForEach(["up","down","left","right"], id: \.self) { dir in
-                                Button(["up":"↑ 上","down":"↓ 下","left":"← 左","right":"→ 右"][dir]!) { model.add(.scroll, direction: dir) }
-                            } }
-                            Button("サービス切り替え") { model.add(.source) }
-                            Button("アクション") { model.add(.action) }
-                        }.disabled(model.busy || !model.loaded)
                     }
                     ZStack(alignment: .topLeading) {
                         ForEach(0..<100, id: \.self) { key in
-                            Button { assignmentKey = AssignmentKey(key: key) } label: {
+                            Button { selectedKey = key; model.selected = model.layout.part(at: key)?.id } label: {
                                 RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.045))
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(selectedKey == key && model.selected == nil ? Color.accentColor : .clear, lineWidth: 2))
                                     .overlay(Text("\(key / 10 + 1)·\(key % 10 + 1)").font(.system(size: 9)).foregroundStyle(.tertiary))
                             }.buttonStyle(.plain).accessibilityLabel("\(key / 10 + 1)行\(key % 10 + 1)列に割り当て")
                                 .frame(width: cell - 4, height: cell - 4).offset(x: CGFloat(key % 10) * cell, y: CGFloat(key / 10) * cell)
@@ -158,10 +155,10 @@ struct LayoutEditorView: View {
                                     model.selected = part.id
                                     let x = min(part.width - 1, max(0, Int(value.location.x / cell)))
                                     let y = min(part.height - 1, max(0, Int(value.location.y / cell)))
-                                    assignmentKey = AssignmentKey(key: (part.y + y) * 10 + part.x + x)
+                                    selectedKey = (part.y + y) * 10 + part.x + x
                                 })
                                 .simultaneousGesture(DragGesture(minimumDistance: 3).onChanged { value in
-                                    if dragOrigin?.0 != part.id { dragOrigin = (part.id, part.x, part.y); model.selected = part.id }
+                                    if dragOrigin?.0 != part.id { dragOrigin = (part.id, part.x, part.y); model.selected = part.id; selectedKey = nil }
                                     guard let origin = dragOrigin else { return }
                                     model.update { p in
                                         p.x = min(10 - p.width, max(0, origin.1 + Int((value.translation.width / cell).rounded())))
@@ -174,27 +171,15 @@ struct LayoutEditorView: View {
                     Text("キーをクリックして割り当て · ドラッグで移動 · 右側でサイズ変更")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("配置したパーツ").font(.headline)
-                    ScrollView {
-                        VStack(spacing: 3) {
-                            ForEach(model.layout.parts) { part in
-                                Button { model.selected = part.id } label: {
-                                    HStack {
-                                        Circle().fill(part.enabled ? tint(part) : .gray).frame(width: 7, height: 7)
-                                        Text(part.title).lineLimit(1)
-                                        Spacer()
-                                        Text(part.enabled ? "\(part.y + 1),\(part.x + 1)" : "OFF").font(.caption).foregroundStyle(.secondary)
-                                    }.padding(7).contentShape(Rectangle())
-                                        .background(model.selected == part.id ? Color.accentColor.opacity(0.13) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
-                                }.buttonStyle(.plain)
-                            }
-                        }
-                    }.frame(height: 150)
-                    Divider()
-                    ScrollView { if let part = model.layout.parts.first(where: { $0.id == model.selected }) { inspector(part).frame(maxWidth: .infinity, alignment: .leading) } }
-                    Spacer(minLength: 0)
+                ScrollView {
+                    if let key = inspectorKey {
+                        InlineKeyEditor(model: model, key: key) { current in inspector(current) }
+                            .id("\(key):\(model.selected ?? "empty")")
+                    } else {
+                        Text("左のキーをクリックして、機能を割り当ててください。").foregroundStyle(.secondary)
+                    }
                 }.frame(width: 285, height: 540)
+
             }.disabled(model.busy || !model.loaded)
             if let error = model.validation { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout) }
             HStack {
@@ -204,15 +189,8 @@ struct LayoutEditorView: View {
                 Button("標準配置に戻す") { model.layout = .standard; model.selected = "tasks" }.disabled(model.busy || !model.loaded)
             }
         }.padding(24).frame(minWidth: 855, minHeight: 680).background(Color(nsColor: .windowBackgroundColor))
-        .sheet(item: $assignmentKey) { target in
-            KeyAssignmentView(model: model, key: target.key)
-        }
-        .sheet(isPresented: $choosingAction) {
-            CodexActionChooser(selected: model.layout.parts.first { $0.id == model.selected }?.action, enabledServices: model.enabledActionServices) { action in
-                model.update { if $0.action != action { $0.claudeShortcut = nil }; $0.action = action }; choosingAction = false
-            }
-        }
     }
+
     private func partView(_ part: LayoutPart) -> some View {
         RoundedRectangle(cornerRadius: 7).fill(tint(part).opacity(0.18))
             .overlay(RoundedRectangle(cornerRadius: 7).stroke(model.selected == part.id ? tint(part) : tint(part).opacity(0.3), lineWidth: model.selected == part.id ? 3 : 1))
@@ -266,9 +244,6 @@ struct LayoutEditorView: View {
                 Text("選んだサービスを左上から順に配置します。ここでは切り替え先を選びます。利用の ON/OFF は「サービス」タブで設定します。").font(.caption).foregroundStyle(.secondary)
             }
             if part.kind == .action {
-                Button { choosingAction = true } label: {
-                    Label("操作を検索・変更…", systemImage: "magnifyingglass")
-                }
                 Text("有効なサービスのうち、前面のアプリに操作を送ります。送信キーは「アクション」タブで確認できます。").font(.caption).foregroundStyle(.secondary)
                 if !model.actionCandidates.contains(where: { $0.id == part.action }) {
                     Text("現在のサービス設定では、この操作の送信先がありません。").font(.caption).foregroundStyle(.orange)
@@ -278,11 +253,6 @@ struct LayoutEditorView: View {
             Button("パーツを削除", role: .destructive) { model.remove() }
         }
     }
-}
-
-private struct AssignmentKey: Identifiable {
-    let key: Int
-    var id: Int { key }
 }
 
 struct CodexActionChooser: View {
@@ -327,68 +297,76 @@ struct CodexActionChooser: View {
     }
 }
 
-private struct KeyAssignmentView: View {
+private struct InlineKeyEditor<Inspector: View>: View {
     @ObservedObject var model: LayoutEditorModel
     let key: Int
-    @Environment(\.dismiss) private var dismiss
+    @ViewBuilder var inspector: (LayoutPart) -> Inspector
     @State private var kind: LayoutPart.Kind = .action
-    @State private var services = Set(SessionSourceKind.allCases)
+    @State private var query = ""
     @State private var direction = "up"
-    @State private var action: String?
-    @State private var searching = false
+    @State private var services = Set(SessionSourceKind.allCases)
     private var occupied: LayoutPart? { model.layout.part(at: key) }
     private var blockedByArea: Bool { occupied.map { $0.kind == .tasks && $0.width * $0.height > 1 && kind != .tasks } ?? false }
+    private func assign(action: String? = nil) {
+        _ = model.assign(at: key, kind: kind, source: nil, direction: kind == .scroll ? direction : nil, action: action, services: SessionSourceKind.allCases.filter { services.contains($0) })
+    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("\(key / 10 + 1) 行 · \(key % 10 + 1) 列の割り当て").font(.title3.bold())
-                Spacer(); Button("キャンセル") { dismiss() }.keyboardShortcut(.cancelAction)
-            }
-            if let occupied {
-                HStack {
-                    Text("現在：\(occupied.title)").foregroundStyle(.secondary)
-                    Spacer()
-                    Button("配置・サイズを編集") { model.selected = occupied.id; dismiss() }
-                }
-            }
-            Text("どの機能を割り当てますか？").font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            Text("\(key / 10 + 1) 行 · \(key % 10 + 1) 列").font(.headline)
             Picker("機能", selection: $kind) {
                 Text("アクション").tag(LayoutPart.Kind.action)
                 Text("矢印").tag(LayoutPart.Kind.scroll)
                 Text("サービス切り替え").tag(LayoutPart.Kind.source)
                 Text("タスクエリア").tag(LayoutPart.Kind.tasks)
-            }.pickerStyle(.segmented).labelsHidden()
-            switch kind {
-            case .action:
-                Button { searching = true } label: {
-                    Label(action.flatMap { id in DesktopActionCatalog.catalog.first { $0.id == id }?.title } ?? "アクションを検索…", systemImage: "magnifyingglass")
+            }.pickerStyle(.menu)
+            if blockedByArea {
+                Text("タスクエリアを縮めて、このキーを空けてから割り当ててください。").font(.caption).foregroundStyle(.orange)
+            } else if kind == .action {
+                if let occupied { Text(occupied.title).font(.subheadline.bold()) }
+                TextField("操作を検索", text: $query).textFieldStyle(.roundedBorder)
+                let actions = CodexActionChooser.search(query, in: model.actionCandidates)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        ForEach(actions) { action in
+                            Button { assign(action: action.id) } label: {
+                                HStack {
+                                    Text(action.title).multilineTextAlignment(.leading)
+                                    Spacer()
+                                    if occupied?.action == action.id { Image(systemName: "checkmark") }
+                                }.padding(7).frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                    .background(occupied?.action == action.id ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+                            }.buttonStyle(.plain)
+                        }
+                        if actions.isEmpty { Text("候補がありません。サービス設定と検索条件を確認してください。").font(.caption).foregroundStyle(.secondary) }
+                    }
+                }.frame(height: 190)
+            } else if occupied?.kind != kind {
+                if kind == .scroll {
+                    Picker("方向", selection: $direction) {
+                        Text("↑ 上").tag("up"); Text("↓ 下").tag("down")
+                        Text("← 左").tag("left"); Text("→ 右").tag("right")
+                    }
                 }
-            case .scroll:
-                Picker("方向", selection: $direction) {
-                    Text("↑ 上").tag("up"); Text("↓ 下").tag("down"); Text("← 左").tag("left"); Text("→ 右").tag("right")
-                }.pickerStyle(.segmented)
-            case .source:
-                Text("使用するサービス")
-                ForEach(SessionSourceKind.allCases, id: \.rawValue) { source in
-                    Toggle(source.displayName, isOn: Binding(get: { services.contains(source) }, set: { enabled in
-                        if enabled { services.insert(source) } else { services.remove(source) }
-                    }))
+                if kind == .source {
+                    ForEach(SessionSourceKind.allCases, id: \.rawValue) { source in
+                        Toggle(source.displayName, isOn: Binding(get: { services.contains(source) }, set: { on in
+                            if on { services.insert(source) } else { services.remove(source) }
+                        }))
+                    }
                 }
-                Text("選択したサービスを1つのパーツにまとめます。配置済みなら、このキーへ移動します。").font(.caption).foregroundStyle(.secondary)
-            case .tasks:
-                Text("タスクエリアは1つです。新規は1キーから作り、右側の設定で幅と高さを広げます。配置済みならそのエリアを移動・編集します。").font(.callout).foregroundStyle(.secondary)
+                Button("このキーに割り当て") { assign() }.buttonStyle(.borderedProminent)
             }
-            if blockedByArea { Text("このキーはタスクエリア内です。「配置・サイズを編集」でエリアを縮めてから割り当ててください。").foregroundStyle(.orange) }
-            HStack {
-                Text(model.message).font(.caption).foregroundStyle(.secondary).lineLimit(3)
-                Spacer()
-                Button("割り当て") {
-                    if model.assign(at: key, kind: kind, source: nil, direction: kind == .scroll ? direction : nil, action: kind == .action ? action : nil, services: SessionSourceKind.allCases.filter { services.contains($0) }) { dismiss() }
-                }.buttonStyle(.borderedProminent).disabled(blockedByArea || (kind == .action && action == nil))
+            if let occupied {
+                Divider()
+                inspector(occupied)
+            } else {
+                Text("操作を選ぶとプレビューに反映します。「保存して反映」で実機に適用します。").font(.caption).foregroundStyle(.secondary)
             }
-        }.padding(24).frame(width: 560)
-            .onAppear { if let occupied { kind = occupied.kind; services = Set(occupied.selectedServices); direction = occupied.direction ?? "up"; action = occupied.action } }
-            .sheet(isPresented: $searching) { CodexActionChooser(selected: action, enabledServices: model.enabledActionServices) { action = $0; searching = false } }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+            .onAppear {
+                if let occupied { kind = occupied.kind; direction = occupied.direction ?? "up"; services = Set(occupied.selectedServices) }
+            }
     }
 }
 
@@ -439,7 +417,7 @@ extension LayoutEditorWindow {
             services.message = "サービス設定はレイアウトから独立して保存します"
             content = AnyView(ServiceSettingsView(model: services))
         case "search": content = AnyView(CodexActionChooser(selected: nil, choose: { _ in }))
-        case "assignment": content = AnyView(KeyAssignmentView(model: model, key: 80))
+        case "assignment": content = AnyView(InlineKeyEditor(model: model, key: 80) { part in Text(part.title) })
         default: content = AnyView(LayoutEditorView(model: model))
         }
         let view = NSHostingView(rootView: content.background(Color(nsColor: .windowBackgroundColor)))

@@ -130,3 +130,14 @@ UI candidates; saving the Services tab applies them to the daemon. Layout
 inspection only selects and positions the semantic action; shortcut details
 now live in the Actions tab. Claude Desktop settings import remains pending
 validation on the other machine.
+
+
+### Inline key editing
+
+Click either an empty key or a placed part to edit it in the right-hand panel.
+The panel combines function type, inline action search, position, size and
+service/direction settings. Selecting an action updates the preview immediately;
+Save applies the layout to the device. The placed-parts list, add-parts menu and
+assignment/action sheets are removed from the layout flow. Dragging and position
+edits keep the inspector attached to the selected part. Multi-key task areas
+still require shrinking before replacing an interior key.
