@@ -87,3 +87,25 @@ its permission requirement. Shortcut resolution and displayed key are shared
 between the transports; the hardware path additionally converts the virtual key
 to a USB HID usage and modifiers. It authorizes physical presses only while Codex
 is foreground and revokes pending output when it observes another foreground app.
+
+
+### Foreground app routing
+
+An action button can opt into **前面アプリに合わせる**. Set the equivalent
+Claude Desktop shortcut on that button (for example `Command+N`, `Control+Tab`,
+or `Escape`, only where the target Claude tab supports that operation). Codex
+continues to resolve its actual configured binding. Claude's mapping is explicit:
+we do not infer equivalence or copy Codex shortcuts into Claude. The inspector
+shows both keys, and the daemon logs the selected recipient and accelerator.
+The optional `claudeShortcut` layout field preserves Codex-only behavior when
+absent; changing the selected operation clears the old Claude mapping.
+
+The foreground process at the physical press selects the recipient, independently
+of the task/service layer. Other apps receive no action. A process change during
+USB configuration cancels the press, including a switch between Codex and Claude.
+The firmware is unchanged and the hardware path needs no Accessibility access.
+Claude mappings can contain a single key or modified key, but not multi-step
+chords. Empty/invalid mappings prevent saving. Claude shortcuts depend on the tab;
+see the [official Code tab shortcuts](https://code.claude.com/docs/en/desktop#keyboard-shortcuts).
+Physical verification in Claude remains pending because Claude Desktop is not
+installed in this machine's standard application directories.

@@ -88,6 +88,7 @@ final class LayoutEditorModel: ObservableObject {
         if existing?.id != target?.id || existing == nil { part.x = key % 10; part.y = key / 10 }
         part.enabled = true
         part.source = nil; part.direction = direction; part.action = action
+        if kind == .action, target?.action == action { part.claudeShortcut = target?.claudeShortcut }
         if kind == .source {
             part.services = services
             if part.width * part.height < max(1, services.count) {
@@ -206,7 +207,7 @@ struct LayoutEditorView: View {
         }
         .sheet(isPresented: $choosingAction) {
             CodexActionChooser(selected: model.layout.parts.first { $0.id == model.selected }?.action) { action in
-                model.update { $0.action = action }; choosingAction = false
+                model.update { if $0.action != action { $0.claudeShortcut = nil }; $0.action = action }; choosingAction = false
             }
         }
     }
@@ -267,7 +268,21 @@ struct LayoutEditorView: View {
                     Label("操作を検索・変更…", systemImage: "magnifyingglass")
                 }
                 Text(CodexAction.installed.isEmpty ? "標準の操作一覧を使用中" : "Codex から読み込んだ \(CodexAction.catalog.count) 操作").font(.caption).foregroundStyle(.secondary)
-                GroupBox("送信するキー") {
+                Toggle("前面アプリに合わせる", isOn: Binding(get: { part.claudeShortcut != nil }, set: { enabled in
+                    model.update { $0.claudeShortcut = enabled ? "" : nil }
+                }))
+                if part.claudeShortcut != nil {
+                    TextField("Claude Desktop: Command+N など", text: Binding(get: { part.claudeShortcut ?? "" }, set: { value in
+                        model.update { $0.claudeShortcut = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    }))
+                    if let key = part.claudeShortcut, CodexKeyboardShortcut.parse(key, allowUnmodified: true).flatMap(USBShortcut.init) != nil {
+                        Text("Claude Desktop → " + ActionShortcutDisplay(accelerator: key, dedicated: false).label).font(.caption.monospaced())
+                    } else {
+                        Text("Claude 側で同じ役割を持つ操作のキーを入力してください。").font(.caption).foregroundStyle(.orange)
+                    }
+                    Text("Claude の対象タブで使えるキーを指定します。対応する操作がない場合は自動切り替えを OFF にしてください。").font(.caption).foregroundStyle(.secondary)
+                }
+                GroupBox("Codex に送信するキー") {
                     VStack(alignment: .leading, spacing: 6) {
                         if let error = model.shortcutError {
                             Text(error).font(.caption).foregroundStyle(.secondary)
@@ -282,7 +297,7 @@ struct LayoutEditorView: View {
                         Button("送信キーを再確認") { model.refreshShortcuts() }.font(.caption)
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
                 }
-                Text("保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。").font(.caption).foregroundStyle(.secondary)
+                Text(part.claudeShortcut == nil ? "保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。" : "押した瞬間の前面アプリで送信キーを選びます。その他のアプリには送信しません。Codex のキーは本体の設定に追従します。").font(.caption).foregroundStyle(.secondary)
                 if !model.hardwareKeyOutput { Button("アクセシビリティ設定を開く") {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                 }.font(.caption) }

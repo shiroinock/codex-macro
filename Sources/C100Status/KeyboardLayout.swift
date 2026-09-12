@@ -14,6 +14,8 @@ struct LayoutPart: Codable, Equatable, Identifiable {
     var source: SessionSourceKind?
     var services: [SessionSourceKind]?
     var action: String?
+    /// nil preserves Codex-only behavior; a value opts into foreground routing.
+    var claudeShortcut: String?
 
     var title: String {
         switch kind {
@@ -67,7 +69,11 @@ struct KeyboardLayout: Codable, Equatable {
             case .source:
                 try require(part.selectedServices.count <= part.width * part.height, "サービス数に合わせてパーツの幅・高さを広げてください")
                 for source in part.selectedServices { try require(sources.insert(source).inserted, "同じサービスは1つまで配置できます") }
-            case .action: try require(CodexAction.catalog.contains { $0.id == part.action }, "アクションを選んでください")
+            case .action:
+                try require(CodexAction.catalog.contains { $0.id == part.action }, "アクションを選んでください")
+                if let key = part.claudeShortcut {
+                    try require(CodexKeyboardShortcut.parse(key, allowUnmodified: true).flatMap(USBShortcut.init) != nil, "Claude Desktop の送信キーを指定してください（例: Command+N、Escape）")
+                }
             }
             if part.enabled {
                 try require(occupied.isDisjoint(with: part.keys), "\(part.title): 他のパーツと重なっています")

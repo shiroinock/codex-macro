@@ -20,6 +20,28 @@ enum KeyboardLayoutTests {
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: conflictBindings, characterCode: { _ in 0 })?.keyCode == 105, "conflicting primary shortcut falls back to isolated alias")
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings + [["command": "archiveThread", "key": NSNull()]]) == nil, "disabled command is never dispatched")
         try check(CodexKeyboardShortcut.parse("Enter") == nil && CodexKeyboardShortcut.parse("Escape") == nil && CodexKeyboardShortcut.parse("Cmd+K Cmd+C") == nil, "bare keys and chords are not dispatched as another action")
+        var adaptive = LayoutPart(kind: .action, x: 0, y: 0, action: "archiveThread", claudeShortcut: "Control+Tab")
+        let claude = try ForegroundAction.resolve(adaptive, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { throw CLIError.runtime("must not read Codex settings for Claude") })
+        try check(claude.shortcut.keyCode == 48 && claude.shortcut.flags == [.maskControl], "foreground Claude selects explicitly configured mapping without Codex settings")
+        let codex = try ForegroundAction.resolve(adaptive, foreground: CodexNavigator.bundleIdentifier, bindings: { archiveBindings })
+        try check(codex.shortcut.accelerator == "CmdOrCtrl+Shift+A", "same button follows actual Codex mapping")
+        for foreground in [nil, "com.apple.finder"] as [String?] {
+            var rejected = false
+            do { _ = try ForegroundAction.resolve(adaptive, foreground: foreground, bindings: { archiveBindings }) } catch { rejected = true }
+            try check(rejected, "unrelated or missing foreground never receives adaptive action")
+        }
+        adaptive.claudeShortcut = nil
+        var rejected = false
+        do { _ = try ForegroundAction.resolve(adaptive, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { archiveBindings }) } catch { rejected = true }
+        try check(rejected, "legacy Codex-only action stays inactive in Claude")
+        adaptive.claudeShortcut = "Escape"
+        try KeyboardLayout(parts: [adaptive]).validate()
+        try check(try JSONDecoder().decode(LayoutPart.self, from: JSONEncoder().encode(adaptive)) == adaptive, "per-button foreground mapping survives persistence")
+        try check(CodexKeyboardShortcut.parse("Escape", allowUnmodified: true)?.keyCode == 53, "explicit Claude mapping can use bare Escape without changing Codex default resolution")
+        adaptive.claudeShortcut = "Command+K Command+C"
+        try rejects(KeyboardLayout(parts: [adaptive]), "invalid adaptive shortcut")
+        adaptive.claudeShortcut = ""
+        try rejects(KeyboardLayout(parts: [adaptive]), "empty adaptive shortcut")
         var layout = KeyboardLayout.standard
         try layout.validate()
         try check(layout.arrows == GridViewport.arrows && layout.enabledSources.count == 4, "legacy default")

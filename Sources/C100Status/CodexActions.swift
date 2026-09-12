@@ -87,7 +87,7 @@ struct CodexKeyboardShortcut {
     let keyCode: CGKeyCode
     let flags: CGEventFlags
 
-    static func parse(_ accelerator: String, characterCode: (String) -> CGKeyCode? = currentCharacterCode) -> Self? {
+    static func parse(_ accelerator: String, allowUnmodified: Bool = false, characterCode: (String) -> CGKeyCode? = currentCharacterCode) -> Self? {
         let tokens = accelerator.split(separator: "+").map(String.init)
         guard let key = tokens.last, !key.isEmpty, !accelerator.contains(" ") else { return nil }
         var flags: CGEventFlags = []
@@ -101,7 +101,7 @@ struct CodexKeyboardShortcut {
             }
         }
         // Bare Enter/Escape must not conflate approval, submission and dismissal.
-        guard !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return nil }
+        guard allowUnmodified || !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return nil }
         let named: [String: CGKeyCode] = ["enter": 36, "return": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49, "up": 126, "down": 125, "left": 123, "right": 124]
         let functionCodes: [CGKeyCode] = [122,120,99,118,96,97,98,100,101,109,103,111,105,107,113,106,64,79,80,90]
         let code: CGKeyCode?
