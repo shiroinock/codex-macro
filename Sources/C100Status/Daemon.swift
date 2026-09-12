@@ -30,6 +30,7 @@ final class StatusDaemon {
     private var grabberHeartbeatFailureSince: Date?
     private var protocolVersion = 0
     private var pressedKeyIndexes: Set<Int> = []
+    private var arrowKeyRepeat = ArrowKeyRepeat()
     private var nextCatalogSync = Date.distantPast
     private var catalogProjectBySession: [String: String] = [:]
     private var catalogSessionIDs: Set<String> = []
@@ -354,18 +355,11 @@ final class StatusDaemon {
                 guard let direction = request.direction, ["up", "down", "left", "right"].contains(direction) else { throw CLIError.usage("Invalid scroll direction") }
                 try scroll(direction)
                 return DaemonResponse(ok: true, message: "viewport updated", status: nil)
-            case .focusRow:
-                guard let row = request.focusRow, (0..<8).contains(row) else { throw CLIError.usage("Focus row must be 1...8") }
-                var viewport = viewports[activeLayer] ?? GridViewport()
-                viewport.selectedRow = row
-                viewports[activeLayer] = viewport
-                try reconcileLEDs()
-                return DaemonResponse(ok: true, message: "focus row updated", status: nil)
             case .inspect:
                 let visible = try visibleAssignments()
                 let viewport = viewports[activeLayer] ?? GridViewport()
                 let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
-                    "topRow": viewport.topRow, "selectedRow": viewport.selectedRow, "columnOffsets": viewport.columnOffsets,
+                    "topRow": viewport.topRow, "leftColumn": viewport.leftColumn,
                     "projectRows": virtualProjects[activeLayer] ?? [:],
                     "visible": visible.map { ["key": $0.key, "sessionID": $0.sessionID, "project": $0.slot.projectKey, "column": $0.slot.column, "status": $0.slot.status.rawValue] as [String: Any] }]
                 let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
@@ -964,7 +958,7 @@ final class StatusDaemon {
         viewport.move(direction, projects: virtualProjects[activeLayer] ?? [:], slots: try stateStore.assignments(source: activeLayer).map(\.slot))
         viewports[activeLayer] = viewport
         try reconcileLEDs()
-        logger.log(.info, "viewport direction=\(direction) topRow=\(viewport.topRow) selectedRow=\(viewport.selectedRow) columns=\(viewport.columnOffsets)")
+        logger.log(.info, "viewport direction=\(direction) topRow=\(viewport.topRow) leftColumn=\(viewport.leftColumn)")
     }
 
     /// Handles a press on one of the 4 layer-switch keys (90=Codex,
@@ -1207,9 +1201,15 @@ final class StatusDaemon {
         for current in states {
             let newlyPressed = current.subtracting(pressedKeyIndexes)
             pressedKeyIndexes = current
+            arrowKeyRepeat.updateHeld(current, now: ProcessInfo.processInfo.systemUptime)
             for keyIndex in newlyPressed.sorted() {
                 handleKeyPress(keyIndex: keyIndex)
             }
+        }
+        // Companion reports arrive only when state changes, so repeat even
+        // when this poll received no new HID reports. Releases above cancel first.
+        for keyIndex in arrowKeyRepeat.due(now: ProcessInfo.processInfo.systemUptime) {
+            handleKeyPress(keyIndex: keyIndex)
         }
     }
 
@@ -1217,13 +1217,6 @@ final class StatusDaemon {
         // Utility keys never enter task navigation; arrows operate the viewport.
         if let direction = GridViewport.arrows[keyIndex] {
             do { try scroll(direction) } catch { logger.log(.error, "scroll failed error=\(error)") }
-            return
-        }
-        if (80..<88).contains(keyIndex) {
-            var viewport = viewports[activeLayer] ?? GridViewport()
-            viewport.selectedRow = keyIndex - 80
-            viewports[activeLayer] = viewport
-            try? reconcileLEDs()
             return
         }
         if keyIndex >= 80 {

@@ -161,7 +161,7 @@ The mapping is:
 | `Stop` | green (`done`) |
 | `SessionEnd` | white (`idle`) while the task remains cataloged |
 
-Each hook invocation is a short-lived sender. The foreground daemon maps projects to rows and tasks inside each project to columns. The visible key is computed from the vertical window and the selected project's horizontal offset. Project rows follow Codex app's saved `project-order`, including empty project rows. Tasks follow the app's pinned/explicit sidebar order, then its recency order. Tasks without a saved project are grouped into one final `projectless` row instead of receiving one row per working directory. The top eight rows show ten tasks per project at a time; additional projects and tasks remain tracked and are reachable by scrolling.
+Each hook invocation is a short-lived sender. The foreground daemon maps projects to rows and tasks inside each project to columns. The visible key is computed from the vertical window and the shared horizontal offset. Project rows follow Codex app's saved `project-order`, including empty project rows. Tasks follow the app's pinned/explicit sidebar order, then its recency order. Tasks without a saved project are grouped into one final `projectless` row instead of receiving one row per working directory. The top eight rows show ten tasks per project at a time; additional projects and tasks remain tracked and are reachable by scrolling.
 
 The daemon rereads the Codex catalog and sidebar state every two seconds. Adding or reordering projects, and adding or reordering tasks within a project, therefore remaps the grid without restarting the daemon. Existing task status colors move with their tasks.
 
@@ -256,7 +256,7 @@ A session counts as alive if it isn't archived (`isArchived: false`) and at leas
 
 The keyboard multiplexes four independent grids ("layers"), one per session source: Codex Desktop, herdr, plain-terminal Claude Code, and Claude Desktop. Only one layer's sessions are shown on the main 0-79 key grid at a time; switching layers is instant and every layer keeps its own row/project bookkeeping, so a herdr session and a Codex session that happen to share a cwd never merge into (or fight over) the same row.
 
-**The bottom two physical rows (keys 80–99) are utility rows.** Keys 80–87 select a visible project row for horizontal scrolling, 88 is up, and 97/98/99 are left/down/right. Keys 90–93 retain the layer switches; 89 and 94–96 stay off.
+**The bottom two physical rows (keys 80–99) are utility rows.** Key 88 is up, and 97/98/99 are left/down/right. Horizontal scrolling moves all project rows together; keys 80–87 are inactive. Keys 90–93 retain the layer switches; 89 and 94–96 stay off.
 
 | Key | Layer | Base color | Why |
 | --- | --- | --- | --- |

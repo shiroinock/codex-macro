@@ -40,7 +40,6 @@ struct DaemonRequest: Codable {
         case layer
         case brightness
         case scroll
-        case focusRow
     }
 
     let kind: Kind
@@ -51,7 +50,6 @@ struct DaemonRequest: Codable {
     var layer: SessionSourceKind? = nil
     var brightness: Int? = nil
     var direction: String? = nil
-    var focusRow: Int? = nil
 
     static func hook(_ input: HookInput) -> Self {
         Self(kind: .hook, hook: input, status: nil, keyIndex: nil, color: nil)

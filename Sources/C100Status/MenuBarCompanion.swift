@@ -54,7 +54,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let problem { menu.addItem(entry(String(problem.prefix(120)))) }
         else { menu.addItem(entry("方式: \(information["backend"] as? String ?? "確認中")")) }
         if let top = information["topRow"] as? Int {
-            menu.addItem(entry("表示行: \(top + 1)〜\(top + 8) ／ 横移動対象: \((information["selectedRow"] as? Int ?? 0) + 1)行目"))
+            menu.addItem(entry("表示行: \(top + 1)〜\(top + 8) ／ 列: \((information["leftColumn"] as? Int ?? 0) + 1)〜\((information["leftColumn"] as? Int ?? 0) + 10)"))
         }
         menu.addItem(.separator())
         let layerMenu = NSMenu()
