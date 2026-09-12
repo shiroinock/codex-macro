@@ -13,6 +13,7 @@ enum CLIError: Error, CustomStringConvertible {
 }
 
 struct Options {
+    var enabledServices: [SessionSourceKind]?
     var layoutPath = Configuration.defaultPath().replacingOccurrences(of: "config.json", with: "layout.json")
     var dryRun = false
     var companion = false
@@ -115,6 +116,14 @@ enum C100StatusCLI {
             switch positionals.first ?? "show" {
             case "show":
                 FileHandle.standardOutput.write(try options.effectiveConfiguration().json())
+            case "save":
+                guard positionals.count == 2, let target = options.configTargetPath else { throw CLIError.usage("config save FILE") }
+                let (candidate, _, _) = try Configuration.load(explicitPath: positionals[1])
+                let destination = URL(fileURLWithPath: target)
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try candidate.json().write(to: destination, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+                print("設定を保存しました。デーモンの再起動で反映します")
             case "init":
                 guard let target = options.configTargetPath else { throw CLIError.runtime("Missing configuration target") }
                 let data = try Configuration.example.json()
@@ -202,6 +211,7 @@ enum C100StatusCLI {
                 claudeDesktopConfigDir: options.claudeDesktopConfigDir,
                 codexPaths: options.codexPaths,
                 defaultLayer: options.defaultLayer,
+                enabledServices: options.enabledServices,
                 layoutPath: options.layoutPath
             )
             try daemon.run()

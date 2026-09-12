@@ -79,7 +79,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         brightnessMenu.autoenablesItems = false
         let brightness = entry("LED の明るさ"); brightness.submenu = brightnessMenu; menu.addItem(brightness)
         menu.addItem(.separator())
-        menu.addItem(entry("レイアウトを編集…", action: #selector(openEditor)))
+        menu.addItem(entry("設定（レイアウト・サービス）…", action: #selector(openEditor)))
         if let error = information["actionError"] as? String, !error.isEmpty { menu.addItem(entry(error)) }
         menu.addItem(entry("デーモンを再起動", action: #selector(restart)))
         menu.addItem(entry("ログを開く", action: #selector(openLog)))
@@ -141,7 +141,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     String(decoding: try HerdrProcessRunner.run(binary: executable, arguments: arguments, timeout: 10), as: UTF8.self)
                 }.value
             })
-        } else if editor?.window?.isVisible == false && editor?.model.dirty == false { editor?.model.load() }
+        } else if editor?.window?.isVisible == false && editor?.model.dirty == false { editor?.model.load(); editor?.services.load() }
         editor?.showWindow(nil); NSApplication.shared.activate(ignoringOtherApps: true)
     }
 

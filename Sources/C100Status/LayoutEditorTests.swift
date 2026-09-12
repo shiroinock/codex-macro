@@ -4,6 +4,12 @@ import Foundation
 enum LayoutEditorTests {
     static func run() throws {
         func check(_ condition: Bool, _ message: String) throws { if !condition { throw CLIError.runtime("Editor self-test: " + message) } }
+        let services = ServiceSettingsModel(execute: { _ in "" })
+        services.setEnabled(.codex, true)
+        services.setEnabled(.claudeTerminal, true)
+        services.setEnabled(.codex, false)
+        try check(services.configuration.enabledServices == [.claudeTerminal] && services.configuration.defaultLayer == "claude-terminal", "disabling the selected service selects an available default")
+        try services.configuration.validate()
         let model = LayoutEditorModel(execute: { _ in "" })
         try check(model.assign(at: 80, kind: .action, source: nil, direction: nil, action: "toggleSidebar"), "assign clicked empty key")
         try check(model.assign(at: 81, kind: .action, source: nil, direction: nil, action: "toggleSidebar"), "duplicate action on another key")

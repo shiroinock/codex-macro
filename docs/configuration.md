@@ -51,3 +51,20 @@ Earlier versions implicitly scanned personal profiles under `~/.claude-config`. 
   "defaultLayer": "codex"
 }
 ```
+
+## Service settings in Companion
+
+The settings window has separate Layout and Services tabs. Services stores
+`enabledServices` and `defaultLayer` in config.json, independent of switch parts.
+Select at least one service. With one enabled service no switch part is needed;
+with several, the menu bar can also switch services. Disabled services' physical
+switch keys stay dark and do nothing. Existing configurations without
+`enabledServices` retain their layout selection until Services is saved; without
+any switch part they fall back to `defaultLayer`.
+
+The Services tab also edits Claude CLI's multiple `claudeConfigDirs` (one per line),
+Codex's home and optional database paths, Claude Desktop directories, and herdr's
+binary path. Codex and Claude Desktop currently each have one configured home;
+multiple concurrent profile directories are supported for Claude CLI. Saving
+restarts the daemon and preserves the layout. It does not install profile hooks.
+If restart fails, the UI distinguishes saved settings from pending activation.

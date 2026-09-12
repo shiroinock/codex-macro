@@ -11,7 +11,7 @@ Parts share the same 10 × 10 physical grid:
 
 The same Codex operation can be assigned to multiple buttons; they share one command alias.
 
-Only services have on/off choices inside their switch part. Other parts are removed with Delete, not enabled/disabled. Parts may not overlap or extend beyond the keyboard. A key inside the task area first offers area editing so that assigning a button cannot silently delete the entire area. The default layout preserves the previous 8 × 10 task area and bottom utility rows. Selecting no services (or deleting the service-switch part) is valid and leaves an actions-only controller. Legacy default service buttons migrate to one group while preserving their selected services and the group’s footprint.
+The Services settings tab controls enabled providers independently of layout. The switch part only selects which service destinations appear on keys. Other parts are removed with Delete, not enabled/disabled. Parts may not overlap or extend beyond the keyboard. A key inside the task area first offers area editing so that assigning a button cannot silently delete the entire area. The default layout preserves the previous 8 × 10 task area and bottom utility rows. Deleting the switch part leaves the configured service available; a single-service setup needs no switch keys. Remove the task area for an actions-only controller. Legacy default service buttons migrate to one group while preserving their selected services and the group’s footprint.
 
 ## Codex compatibility
 

@@ -19,6 +19,7 @@ struct CodexPaths {
 
 struct Configuration: Codable {
     var schemaVersion: Int? = 1
+    var enabledServices: [SessionSourceKind]?
     var layoutPath: String?
     var backend: String?
     var locationID: String?
@@ -36,7 +37,7 @@ struct Configuration: Codable {
     var grabberSocketPath: String?
 
     static let keys: Set<String> = [
-        "schemaVersion", "layoutPath", "backend", "locationID", "claudeConfigDirs",
+        "enabledServices", "schemaVersion", "layoutPath", "backend", "locationID", "claudeConfigDirs",
         "claudeDesktopSessionsDir", "claudeDesktopConfigDir", "codexHome",
         "codexCatalogDatabase", "codexStateDatabase", "codexSidebarState",
         "herdrBinary", "defaultLayer", "socketPath", "logPath", "grabberSocketPath"
@@ -106,6 +107,10 @@ struct Configuration: Codable {
 
     func validate() throws {
         guard schemaVersion == nil || schemaVersion == 1 else { throw CLIError.usage("Unsupported configuration schemaVersion; expected 1") }
+        if let enabledServices {
+            guard !enabledServices.isEmpty, Set(enabledServices).count == enabledServices.count else { throw CLIError.usage("使用サービスを1つ以上、重複なしで選んでください") }
+            if let defaultLayer, let source = SessionSourceKind(rawValue: defaultLayer), !enabledServices.contains(source) { throw CLIError.usage("初期表示は使用サービスから選んでください") }
+        }
         if let backend, !["stock", "companion"].contains(backend) { throw CLIError.usage("backend must be stock or companion") }
         if let defaultLayer, SessionSourceKind(rawValue: defaultLayer) == nil { throw CLIError.usage("Unknown defaultLayer: \(defaultLayer)") }
         if let locationID { _ = try Self.location(locationID) }
@@ -135,6 +140,7 @@ struct Configuration: Codable {
 extension Options {
     mutating func apply(_ configuration: Configuration, environment: [String: String] = ProcessInfo.processInfo.environment,
                         home: String = NSHomeDirectory(), cwd: String = FileManager.default.currentDirectoryPath) throws {
+        enabledServices = configuration.enabledServices
         if !providedFlags.contains("--companion") && !providedFlags.contains("--backend") { companion = configuration.backend == "companion" }
         if !providedFlags.contains("--location"), let location = configuration.locationID { locationID = try Configuration.location(location) }
         if !providedFlags.contains("--claude-config-dirs") {
@@ -146,7 +152,7 @@ extension Options {
         if !providedFlags.contains("--claude-desktop-config-dir") { claudeDesktopConfigDir = configuration.claudeDesktopConfigDir ?? home + "/.claude" }
         if !providedFlags.contains("--herdr-bin") { herdrBinaryPath = configuration.herdrBinary ?? environment["HERDR_BIN"] }
         if !providedFlags.contains("--codex-home") { codexHome = configuration.codexHome ?? environment["CODEX_HOME"] ?? home + "/.codex" }
-        if !providedFlags.contains("--default-layer") { defaultLayer = SessionSourceKind(rawValue: configuration.defaultLayer ?? "codex")! }
+        if !providedFlags.contains("--default-layer") { defaultLayer = SessionSourceKind(rawValue: configuration.defaultLayer ?? configuration.enabledServices?.first?.rawValue ?? "codex")! }
         if !providedFlags.contains("--socket"), let path = configuration.socketPath { socketPath = path }
         if !providedFlags.contains("--log-file"), let path = configuration.logPath { logPath = path }
         if !providedFlags.contains("--grabber-socket"), let path = configuration.grabberSocketPath { grabberSocketPath = path }
@@ -165,6 +171,7 @@ extension Options {
 
     func effectiveConfiguration() -> Configuration {
         var c = Configuration()
+        c.enabledServices = enabledServices
         c.layoutPath = layoutPath
         c.backend = companion ? "companion" : "stock"
         c.locationID = locationID.map { "0x" + String($0, radix: 16) } ?? "auto"

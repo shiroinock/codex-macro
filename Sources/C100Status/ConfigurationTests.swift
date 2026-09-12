@@ -16,6 +16,17 @@ enum ConfigurationTests {
             return try Configuration.load(explicitPath: config.path, home: "/fixture/home", environment: [:]).0
         }
         let document = try load(#"{"schemaVersion":1,"backend":"companion","locationID":"0x2110000","claudeConfigDirs":["profiles/team a","profiles/team a","~/custom"],"codexHome":"data","codexCatalogDatabase":"catalog.db","codexStateDatabase":"state.db","codexSidebarState":"sidebar.json","claudeDesktopConfigDir":"desktop-profile","socketPath":"daemon.sock","defaultLayer":"claude-terminal"}"#)
+        let standalone = try load(#"{"enabledServices":["claude-terminal"],"defaultLayer":"claude-terminal","claudeConfigDirs":["~/work","~/personal"]}"#)
+        var standaloneOptions = Options()
+        try standaloneOptions.apply(standalone, environment: [:], home: "/fixture/home")
+        try check(standaloneOptions.enabledServices == [.claudeTerminal] && standaloneOptions.defaultLayer == .claudeTerminal, "standalone service selection independent of layout")
+        try check(standaloneOptions.effectiveConfiguration().enabledServices == [.claudeTerminal], "service selection round trip")
+        try check(standaloneOptions.claudeConfigDirs == ["/fixture/home/work", "/fixture/home/personal"], "multiple service profiles")
+        for invalid in [#"{"enabledServices":[]}"#, #"{"enabledServices":["codex","codex"]}"#, #"{"enabledServices":["codex"],"defaultLayer":"claude-terminal"}"#] {
+            var rejected = false
+            do { _ = try load(invalid) } catch { rejected = true }
+            try check(rejected, "invalid service selection")
+        }
         var options = Options()
         try options.apply(document, environment: ["CLAUDE_CONFIG_DIR": "/wrong", "CODEX_HOME": "/wrong"], home: "/fixture/home", cwd: "/")
         try check(options.claudeConfigDirs == [root.path + "/profiles/team a", "/fixture/home/custom"], "profiles must replace defaults and deduplicate")

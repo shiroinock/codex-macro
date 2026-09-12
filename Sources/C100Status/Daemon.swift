@@ -18,6 +18,12 @@ final class StatusDaemon {
     private let dryRun: Bool
     private let companion: Bool
     private let codexPaths: CodexPaths
+    private let configuredServices: [SessionSourceKind]?
+    private var enabledSources: Set<SessionSourceKind> {
+        if let configuredServices { return Set(configuredServices) }
+        let legacy = keyboardLayout.enabledSources
+        return legacy.isEmpty ? [defaultLayer] : legacy
+    }
     private let defaultLayer: SessionSourceKind
     private let claudeDesktopConfigDir: String
     private let logger: StatusLogger
@@ -94,7 +100,7 @@ final class StatusDaemon {
         self?.logger.log(level, message)
     }
     private let herdrBinaryPath: String?
-    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath, enabled: keyboardLayout.enabledSources.contains(.claudeHerdr)) { [weak self] level, message in
+    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath, enabled: enabledSources.contains(.claudeHerdr)) { [weak self] level, message in
         self?.logger.log(level, message)
     }
     private let claudeConfigDirs: [String]
@@ -226,6 +232,7 @@ final class StatusDaemon {
         claudeDesktopConfigDir: String? = nil,
         codexPaths: CodexPaths = CodexPaths(),
         defaultLayer: SessionSourceKind = .codex,
+        enabledServices: [SessionSourceKind]? = nil,
         layoutPath: String = Configuration.defaultPath().replacingOccurrences(of: "config.json", with: "layout.json")
     ) throws {
         guard geteuid() != 0 else {
@@ -242,6 +249,7 @@ final class StatusDaemon {
         self.companion = companion
         self.codexPaths = codexPaths
         self.defaultLayer = defaultLayer
+        self.configuredServices = enabledServices
         self.claudeDesktopConfigDir = claudeDesktopConfigDir ?? NSHomeDirectory() + "/.claude"
         self.herdrBinaryPath = herdrBinaryPath
         self.claudeConfigDirs = claudeConfigDirs ?? ClaudeConfigDirs.resolved(additional: [])
@@ -290,7 +298,7 @@ final class StatusDaemon {
            let value = try? JSONDecoder().decode(Int.self, from: data), (10...200).contains(value) { brightnessPercent = value }
         connection?.brightnessPercent = brightnessPercent
         activeLayer = layerStore.load(defaultLayer: defaultLayer)
-        if !keyboardLayout.enabledSources.contains(activeLayer) { activeLayer = SessionSourceKind.allCases.first { keyboardLayout.enabledSources.contains($0) } ?? defaultLayer }
+        if !enabledSources.contains(activeLayer) { activeLayer = SessionSourceKind.allCases.first { enabledSources.contains($0) } ?? defaultLayer }
         logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
         // Bug fix (M5.1): force a fresh repack of every layer on this first
@@ -365,13 +373,13 @@ final class StatusDaemon {
                     let bindings = CodexActionBindings(home: codexPaths.home)
                     try layoutStore.apply(layout, bindings: bindings)
                     keyboardLayout = layout
-                    herdrCatalog.setEnabled(layout.enabledSources.contains(.claudeHerdr))
-                    claudeSessions = claudeSessions.filter { layout.enabledSources.contains($0.value.sourceKind) }
-                    if !layout.enabledSources.contains(.codex) { deferredHooks.removeAll(); pendingApprovals.removeAll() }
+                    herdrCatalog.setEnabled(enabledSources.contains(.claudeHerdr))
+                    claudeSessions = claudeSessions.filter { enabledSources.contains($0.value.sourceKind) }
+                    if !enabledSources.contains(.codex) { deferredHooks.removeAll(); pendingApprovals.removeAll() }
                     arrowKeyRepeat = ArrowKeyRepeat()
                     viewports.removeAll()
-                    if !layout.enabledSources.contains(activeLayer) {
-                        activeLayer = SessionSourceKind.allCases.first { layout.enabledSources.contains($0) } ?? defaultLayer
+                    if !enabledSources.contains(activeLayer) {
+                        activeLayer = SessionSourceKind.allCases.first { enabledSources.contains($0) } ?? defaultLayer
                         layerStore.save(activeLayer)
                     }
                     lastPaintedFrame = nil
@@ -389,14 +397,14 @@ final class StatusDaemon {
                 let viewport = configuredViewport()
                 let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
                     "topRow": viewport.topRow, "leftColumn": viewport.leftColumn, "viewportRows": viewport.rowCount, "viewportColumns": viewport.columnCount,
-                    "enabledSources": keyboardLayout.enabledSources.map(\.rawValue).sorted(), "actionError": actionError ?? "",
+                    "enabledSources": enabledSources.map(\.rawValue).sorted(), "actionError": actionError ?? "",
                     "accessibilityTrusted": AXIsProcessTrusted(), "layoutPath": layoutStore.path,
                     "projectRows": virtualProjects[activeLayer] ?? [:],
                     "visible": visible.map { ["key": $0.key, "sessionID": $0.sessionID, "project": $0.slot.projectKey, "column": $0.slot.column, "status": $0.slot.status.rawValue] as [String: Any] }]
                 let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
                 return DaemonResponse(ok: true, message: String(decoding: data, as: UTF8.self), status: nil)
             case .layer:
-                guard let layer = request.layer, keyboardLayout.enabledSources.contains(layer) else { throw CLIError.usage("Missing layer") }
+                guard let layer = request.layer, enabledSources.contains(layer) else { throw CLIError.usage("Missing layer") }
                 switchLayer(to: layer)
                 return DaemonResponse(ok: true, message: "layer=\(activeLayer.rawValue)", status: nil)
             case .brightness:
@@ -437,7 +445,7 @@ final class StatusDaemon {
                 guard let hook = request.hook else {
                     throw CLIError.runtime("hook request is missing hook data")
                 }
-                guard keyboardLayout.enabledSources.contains(hook.effectiveSource) else { return DaemonResponse(ok: true, message: "source disabled", status: nil) }
+                guard enabledSources.contains(hook.effectiveSource) else { return DaemonResponse(ok: true, message: "source disabled", status: nil) }
                 return try handleHook(hook)
             }
         } catch {
@@ -924,7 +932,7 @@ final class StatusDaemon {
     private func layerKeyColors() -> [Int: HSVColor] {
         var colors: [Int: HSVColor] = [:]
         for part in keyboardLayout.parts where part.enabled && part.kind == .source {
-            for assignment in part.serviceAssignments {
+            for assignment in part.serviceAssignments where enabledSources.contains(assignment.source) {
             let source = assignment.source, keyIndex = assignment.key
             let statuses = (try? stateStore.assignments(source: source))?.map(\.slot.status) ?? []
             colors[keyIndex] = LayerKeyColorLogic.color(
@@ -988,7 +996,7 @@ final class StatusDaemon {
     }
 
     private func visibleAssignments() throws -> [(key: Int, sessionID: String, slot: SessionSlot)] {
-        guard keyboardLayout.taskArea != nil, keyboardLayout.enabledSources.contains(activeLayer) else { return [] }
+        guard keyboardLayout.taskArea != nil, enabledSources.contains(activeLayer) else { return [] }
         let assignments = try stateStore.assignments(source: activeLayer)
         var viewport = configuredViewport()
         viewport.normalize(projects: virtualProjects[activeLayer] ?? [:], slots: assignments.map(\.slot))
@@ -999,7 +1007,7 @@ final class StatusDaemon {
     }
 
     private func scroll(_ direction: String) throws {
-        guard keyboardLayout.taskArea != nil, keyboardLayout.enabledSources.contains(activeLayer) else { return }
+        guard keyboardLayout.taskArea != nil, enabledSources.contains(activeLayer) else { return }
         var viewport = configuredViewport()
         viewport.move(direction, projects: virtualProjects[activeLayer] ?? [:], slots: try stateStore.assignments(source: activeLayer).map(\.slot))
         viewports[activeLayer] = viewport
@@ -1016,7 +1024,7 @@ final class StatusDaemon {
     /// no separate read receipt; switching to it and seeing its sessions is
     /// the acknowledgment).
     private func switchLayer(to newLayer: SessionSourceKind) {
-        guard keyboardLayout.enabledSources.contains(newLayer) else { return }
+        guard enabledSources.contains(newLayer) else { return }
         guard newLayer != activeLayer else {
             logger.log(.debug, "layer press layer=\(newLayer.rawValue) action=already_active")
             return
@@ -1398,7 +1406,7 @@ final class StatusDaemon {
             // through the generic AgentSession abstraction, since they need
             // Codex-only fields (rollout paths, createdAt) that the unified
             // model does not carry.
-            let codexLayout = keyboardLayout.enabledSources.contains(.codex) ? try CodexCatalog.layout(paths: codexPaths, unbounded: true) : CodexCatalog.orderedLayout([], sidebar: .empty, unbounded: true)
+            let codexLayout = enabledSources.contains(.codex) ? try CodexCatalog.layout(paths: codexPaths, unbounded: true) : CodexCatalog.orderedLayout([], sidebar: .empty, unbounded: true)
             let catalogSessions = codexLayout.placements.map(\.session)
             let nextCatalogSessionIDs = Set(catalogSessions.map(\.sessionID))
             catalogProjectBySession = Dictionary(
@@ -1407,7 +1415,7 @@ final class StatusDaemon {
 
 
             var agentSessions: [AgentSession] = []
-            for provider in providers where keyboardLayout.enabledSources.contains(provider.kind) {
+            for provider in providers where enabledSources.contains(provider.kind) {
                 agentSessions.append(contentsOf: try provider.snapshot())
             }
 
@@ -1583,7 +1591,7 @@ final class StatusDaemon {
             // session and a Codex session that happen to share a cwd land on
             // independent rows in their own layers instead of merging into
             // one shared row the way pre-M5's single grid did.
-            agentSessions = agentSessions.filter { keyboardLayout.enabledSources.contains($0.sourceKind) }
+            agentSessions = agentSessions.filter { enabledSources.contains($0.sourceKind) }
             var unifiedBySource: [SessionSourceKind: UnifiedLayoutResult] = [:]
             var reconciliationBySource: [SessionSourceKind: GridReconciliation] = [:]
             var anyReconciliationChanged = false

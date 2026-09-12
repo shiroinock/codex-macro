@@ -239,7 +239,7 @@ struct LayoutEditorView: View {
                         }
                     }))
                 }
-                Text("選んだサービスを左上から順に配置します。OFF のサービスはタスク取得も停止します。").font(.caption).foregroundStyle(.secondary)
+                Text("選んだサービスを左上から順に配置します。ここでは切り替え先を選びます。利用の ON/OFF は「サービス」タブで設定します。").font(.caption).foregroundStyle(.secondary)
             }
             if part.kind == .action {
                 Button { choosingAction = true } label: {
@@ -370,20 +370,26 @@ private struct KeyAssignmentView: View {
 @MainActor
 final class LayoutEditorWindow: NSWindowController, NSWindowDelegate {
     let model: LayoutEditorModel
+    let services: ServiceSettingsModel
     init(execute: @escaping ([String]) async throws -> String) {
         model = LayoutEditorModel(execute: execute)
+        services = ServiceSettingsModel(execute: execute)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 870, height: 710), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "C100 レイアウト"; window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: LayoutEditorView(model: model))
+        window.title = "C100 設定"; window.isReleasedWhenClosed = false
+        let layoutModel = model, serviceModel = services
+        window.contentView = NSHostingView(rootView: TabView {
+            LayoutEditorView(model: layoutModel).tabItem { Text("レイアウト") }
+            ServiceSettingsView(model: serviceModel).tabItem { Text("サービス") }
+        })
         super.init(window: window)
         window.delegate = self; window.center(); model.load()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if model.busy { return false }
-        guard model.dirty else { return true }
+        if model.busy || services.busy { return false }
+        guard model.dirty || services.dirty else { return true }
         let alert = NSAlert(); alert.messageText = "未保存の変更があります"; alert.addButton(withTitle: "編集を続ける"); alert.addButton(withTitle: "変更を破棄")
-        if alert.runModal() == .alertSecondButtonReturn { model.revert(); return true }
+        if alert.runModal() == .alertSecondButtonReturn { model.revert(); services.revert(); return true }
         return false
     }
 }
@@ -396,6 +402,12 @@ extension LayoutEditorWindow {
         if mode == "services" { model.selected = layout.parts.first { $0.kind == .source }?.id }
         let content: AnyView
         switch mode {
+        case "service-settings":
+            let services = ServiceSettingsModel(execute: { _ in "" })
+            services.loaded = true; services.configuration = Configuration.example
+            services.configuration.enabledServices = [.codex]
+            services.message = "サービス設定はレイアウトから独立して保存します"
+            content = AnyView(ServiceSettingsView(model: services))
         case "search": content = AnyView(CodexActionChooser(selected: nil, choose: { _ in }))
         case "assignment": content = AnyView(KeyAssignmentView(model: model, key: 80))
         default: content = AnyView(LayoutEditorView(model: model))
