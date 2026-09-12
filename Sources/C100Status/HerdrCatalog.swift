@@ -347,6 +347,10 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         let seedStatus: AgentStatus
     }
 
+    private let enabledLock = NSLock()
+    private var pollingEnabled: Bool
+    func setEnabled(_ enabled: Bool) { enabledLock.lock(); pollingEnabled = enabled; enabledLock.unlock() }
+    private var isEnabled: Bool { enabledLock.lock(); defer { enabledLock.unlock() }; return pollingEnabled }
     private let binaryPath: String?
     private let refreshInterval: TimeInterval
     private let staleGrace: TimeInterval
@@ -359,12 +363,14 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     ///   - environment: injectable for tests.
     init(
         herdrBinaryPath: String?,
+        enabled: Bool = true,
         refreshInterval: TimeInterval = 2,
         staleGrace: TimeInterval = 15,
         processTimeout: TimeInterval = 2,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         log: @escaping (StatusLogger.Level, String) -> Void = { _, _ in }
     ) {
+        self.pollingEnabled = enabled
         self.refreshInterval = refreshInterval
         self.staleGrace = staleGrace
         self.processTimeout = processTimeout
@@ -382,7 +388,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     /// process: it only reads the lock-protected result of the background
     /// thread's most recent successful fetch.
     func snapshot() throws -> [AgentSession] {
-        guard binaryPath != nil else { return [] }
+        guard isEnabled, binaryPath != nil else { return [] }
         let entries = store.currentEntries(staleGrace: staleGrace)
         let recency = Date().timeIntervalSince1970
         return entries.map { entry in
@@ -600,7 +606,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     }
 
     private func refreshOnce() {
-        guard let binaryPath else { return }
+        guard isEnabled, let binaryPath else { return }
         do {
             let entries = try Self.fetchOnce(binary: binaryPath, timeout: processTimeout, log: log)
             store.recordSuccess(entries)

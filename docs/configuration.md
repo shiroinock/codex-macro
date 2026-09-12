@@ -9,6 +9,7 @@ Setting precedence: explicit CLI flag > JSON field > supported environment varia
 | JSON field | Default / meaning |
 | --- | --- |
 | `schemaVersion` | `1` |
+| `layoutPath` | `layout.json` next to the selected config; editable from the companion app |
 | `backend` | `stock`; use `companion` after installing companion firmware |
 | `locationID` | `"auto"`; optionally a quoted decimal or `0x` USB location ID |
 | `claudeConfigDirs` | `[CLAUDE_CONFIG_DIR]`, otherwise `["~/.claude"]`; replaces the entire profile list; `[]` disables terminal catalog scanning and default Claude hook installation |

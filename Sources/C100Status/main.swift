@@ -13,6 +13,7 @@ enum CLIError: Error, CustomStringConvertible {
 }
 
 struct Options {
+    var layoutPath = Configuration.defaultPath().replacingOccurrences(of: "config.json", with: "layout.json")
     var dryRun = false
     var companion = false
     var hookProfileDir: String?
@@ -72,6 +73,29 @@ enum C100StatusCLI {
             throw CLIError.usage("--companion is supported by run and install-agent only; use companion-info or companion-watch for diagnostics")
         }
         switch command {
+        case "layout":
+            let operation = positionals.first ?? "show"
+            if operation == "actions" {
+                let values = CodexAction.catalog.map { ["id": $0.id, "title": $0.title, "shortcuts": $0.defaults] as [String: Any] }
+                print(String(decoding: try JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
+                return
+            }
+            if operation == "preview" {
+                guard positionals.count == 2 else { throw CLIError.usage("layout preview OUTPUT.png") }
+                let layout = try LayoutStore(path: options.layoutPath).load()
+                try MainActor.assumeIsolated { try LayoutEditorWindow.render(layout, path: positionals[1]) }
+                return
+            }
+            var request = DaemonRequest(kind: .layout, hook: nil, status: nil, keyIndex: nil, color: nil)
+            if operation == "apply" {
+                guard positionals.count == 2 else { throw CLIError.usage("layout apply PATH") }
+                guard FileManager.default.fileExists(atPath: positionals[1]) else { throw CLIError.usage("Layout file not found") }
+                request.layout = try LayoutStore(path: positionals[1]).load()
+            } else if operation == "reset" { request.layout = .standard }
+            else if operation != "show" { throw CLIError.usage("layout show|apply PATH|reset") }
+            let response = try send(request, options: options)
+            guard response.ok else { throw CLIError.runtime(response.message) }
+            print(response.message)
         case "inspect", "layer", "brightness", "scroll":
             var request = DaemonRequest(kind: .inspect, hook: nil, status: nil, keyIndex: nil, color: nil)
             if command == "scroll" {
@@ -177,7 +201,8 @@ enum C100StatusCLI {
                 claudeDesktopDir: options.claudeDesktopDir,
                 claudeDesktopConfigDir: options.claudeDesktopConfigDir,
                 codexPaths: options.codexPaths,
-                defaultLayer: options.defaultLayer
+                defaultLayer: options.defaultLayer,
+                layoutPath: options.layoutPath
             )
             try daemon.run()
         case "grabber-service":
@@ -381,6 +406,7 @@ enum C100StatusCLI {
             try ConfigurationTests.run()
             try ProjectGroupingTests.run()
             try GridViewportTests.run()
+            try KeyboardLayoutTests.run()
             try CompanionProtocol.selfTest()
             try selfTest()
         case "help", "--help", "-h":
@@ -3079,6 +3105,7 @@ enum C100StatusCLI {
         Usage (user commands accept --config PATH; CLI overrides JSON settings):
           c100-status app
           c100-status inspect [--config PATH]
+          c100-status layout <show|actions|apply PATH|reset|preview OUTPUT.png>
           c100-status scroll <up|down|left|right>
           c100-status layer <codex|claude-herdr|claude-terminal|claude-desktop>
           c100-status brightness <10...200>

@@ -19,6 +19,7 @@ struct CodexPaths {
 
 struct Configuration: Codable {
     var schemaVersion: Int? = 1
+    var layoutPath: String?
     var backend: String?
     var locationID: String?
     var claudeConfigDirs: [String]?
@@ -35,7 +36,7 @@ struct Configuration: Codable {
     var grabberSocketPath: String?
 
     static let keys: Set<String> = [
-        "schemaVersion", "backend", "locationID", "claudeConfigDirs",
+        "schemaVersion", "layoutPath", "backend", "locationID", "claudeConfigDirs",
         "claudeDesktopSessionsDir", "claudeDesktopConfigDir", "codexHome",
         "codexCatalogDatabase", "codexStateDatabase", "codexSidebarState",
         "herdrBinary", "defaultLayer", "socketPath", "logPath", "grabberSocketPath"
@@ -91,7 +92,7 @@ struct Configuration: Codable {
         if let dirs = claudeConfigDirs {
             claudeConfigDirs = try Self.uniquePaths(dirs, relativeTo: base, home: home)
         }
-        for key in [\Configuration.claudeDesktopSessionsDir, \.claudeDesktopConfigDir, \.codexHome,
+        for key in [\Configuration.layoutPath, \.claudeDesktopSessionsDir, \.claudeDesktopConfigDir, \.codexHome,
                     \.codexCatalogDatabase, \.codexStateDatabase, \.codexSidebarState, \.herdrBinary,
                     \.socketPath, \.logPath, \.grabberSocketPath] {
             if let value = self[keyPath: key] { self[keyPath: key] = try Self.path(value, relativeTo: base, home: home) }
@@ -150,6 +151,7 @@ extension Options {
         if !providedFlags.contains("--log-file"), let path = configuration.logPath { logPath = path }
         if !providedFlags.contains("--grabber-socket"), let path = configuration.grabberSocketPath { grabberSocketPath = path }
         if let hookProfileDir { self.hookProfileDir = try Configuration.path(hookProfileDir, relativeTo: cwd, home: home) }
+        layoutPath = configuration.layoutPath ?? URL(fileURLWithPath: configTargetPath ?? Configuration.defaultPath(home: home, environment: environment)).deletingLastPathComponent().appendingPathComponent("layout.json").path
         codexPaths = CodexPaths(home: try Configuration.path(codexHome!, relativeTo: cwd, home: home),
                                catalogDatabase: configuration.codexCatalogDatabase,
                                stateDatabase: configuration.codexStateDatabase, sidebarState: configuration.codexSidebarState)
@@ -163,6 +165,7 @@ extension Options {
 
     func effectiveConfiguration() -> Configuration {
         var c = Configuration()
+        c.layoutPath = layoutPath
         c.backend = companion ? "companion" : "stock"
         c.locationID = locationID.map { "0x" + String($0, radix: 16) } ?? "auto"
         c.claudeConfigDirs = claudeConfigDirs; c.claudeDesktopSessionsDir = claudeDesktopDir

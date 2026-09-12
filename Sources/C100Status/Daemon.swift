@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -8,6 +9,9 @@ private func requestDaemonStop(_: Int32) {
 }
 
 final class StatusDaemon {
+    private var keyboardLayout: KeyboardLayout
+    private let layoutStore: LayoutStore
+    private var actionError: String?
     private let socketPath: String
     private let locationID: Int?
     private let grabberSocketPath: String
@@ -90,7 +94,7 @@ final class StatusDaemon {
         self?.logger.log(level, message)
     }
     private let herdrBinaryPath: String?
-    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath) { [weak self] level, message in
+    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath, enabled: keyboardLayout.enabledSources.contains(.claudeHerdr)) { [weak self] level, message in
         self?.logger.log(level, message)
     }
     private let claudeConfigDirs: [String]
@@ -221,13 +225,16 @@ final class StatusDaemon {
         claudeDesktopDir: String? = nil,
         claudeDesktopConfigDir: String? = nil,
         codexPaths: CodexPaths = CodexPaths(),
-        defaultLayer: SessionSourceKind = .codex
+        defaultLayer: SessionSourceKind = .codex,
+        layoutPath: String = Configuration.defaultPath().replacingOccurrences(of: "config.json", with: "layout.json")
     ) throws {
         guard geteuid() != 0 else {
             throw CLIError.runtime(
                 "Refusing to run the user daemon as root. Install the helper once with sudo, then run c100-status without sudo."
             )
         }
+        self.layoutStore = LayoutStore(path: layoutPath)
+        self.keyboardLayout = try self.layoutStore.load()
         self.socketPath = socketPath
         self.locationID = locationID
         self.grabberSocketPath = grabberSocketPath
@@ -283,6 +290,7 @@ final class StatusDaemon {
            let value = try? JSONDecoder().decode(Int.self, from: data), (10...200).contains(value) { brightnessPercent = value }
         connection?.brightnessPercent = brightnessPercent
         activeLayer = layerStore.load(defaultLayer: defaultLayer)
+        if !keyboardLayout.enabledSources.contains(activeLayer) { activeLayer = SessionSourceKind.allCases.first { keyboardLayout.enabledSources.contains($0) } ?? defaultLayer }
         logger.log(.info, "layer active=\(activeLayer.rawValue) source=restored_or_default")
         try applyAll(color: LEDColorName.off.color)
         // Bug fix (M5.1): force a fresh repack of every layer on this first
@@ -351,21 +359,44 @@ final class StatusDaemon {
     private func handle(_ request: DaemonRequest) -> DaemonResponse {
         do {
             switch request.kind {
+            case .layout:
+                if let layout = request.layout {
+                    try layout.validate()
+                    let bindings = CodexActionBindings(home: codexPaths.home)
+                    try layoutStore.apply(layout, bindings: bindings)
+                    keyboardLayout = layout
+                    herdrCatalog.setEnabled(layout.enabledSources.contains(.claudeHerdr))
+                    claudeSessions = claudeSessions.filter { layout.enabledSources.contains($0.value.sourceKind) }
+                    if !layout.enabledSources.contains(.codex) { deferredHooks.removeAll(); pendingApprovals.removeAll() }
+                    arrowKeyRepeat = ArrowKeyRepeat()
+                    viewports.removeAll()
+                    if !layout.enabledSources.contains(activeLayer) {
+                        activeLayer = SessionSourceKind.allCases.first { layout.enabledSources.contains($0) } ?? defaultLayer
+                        layerStore.save(activeLayer)
+                    }
+                    lastPaintedFrame = nil
+                    lastPaintedLayerColors.removeAll()
+                    syncCatalog(forceRepackSources: Set(SessionSourceKind.allCases))
+                    try reconcileLEDs()
+                }
+                return DaemonResponse(ok: true, message: String(decoding: try keyboardLayout.json(), as: UTF8.self), status: nil)
             case .scroll:
                 guard let direction = request.direction, ["up", "down", "left", "right"].contains(direction) else { throw CLIError.usage("Invalid scroll direction") }
                 try scroll(direction)
                 return DaemonResponse(ok: true, message: "viewport updated", status: nil)
             case .inspect:
                 let visible = try visibleAssignments()
-                let viewport = viewports[activeLayer] ?? GridViewport()
+                let viewport = configuredViewport()
                 let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
-                    "topRow": viewport.topRow, "leftColumn": viewport.leftColumn,
+                    "topRow": viewport.topRow, "leftColumn": viewport.leftColumn, "viewportRows": viewport.rowCount, "viewportColumns": viewport.columnCount,
+                    "enabledSources": keyboardLayout.enabledSources.map(\.rawValue).sorted(), "actionError": actionError ?? "",
+                    "accessibilityTrusted": AXIsProcessTrusted(), "layoutPath": layoutStore.path,
                     "projectRows": virtualProjects[activeLayer] ?? [:],
                     "visible": visible.map { ["key": $0.key, "sessionID": $0.sessionID, "project": $0.slot.projectKey, "column": $0.slot.column, "status": $0.slot.status.rawValue] as [String: Any] }]
                 let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
                 return DaemonResponse(ok: true, message: String(decoding: data, as: UTF8.self), status: nil)
             case .layer:
-                guard let layer = request.layer else { throw CLIError.usage("Missing layer") }
+                guard let layer = request.layer, keyboardLayout.enabledSources.contains(layer) else { throw CLIError.usage("Missing layer") }
                 switchLayer(to: layer)
                 return DaemonResponse(ok: true, message: "layer=\(activeLayer.rawValue)", status: nil)
             case .brightness:
@@ -406,6 +437,7 @@ final class StatusDaemon {
                 guard let hook = request.hook else {
                     throw CLIError.runtime("hook request is missing hook data")
                 }
+                guard keyboardLayout.enabledSources.contains(hook.effectiveSource) else { return DaemonResponse(ok: true, message: "source disabled", status: nil) }
                 return try handleHook(hook)
             }
         } catch {
@@ -891,8 +923,9 @@ final class StatusDaemon {
     /// without doing a full grid repaint.
     private func layerKeyColors() -> [Int: HSVColor] {
         var colors: [Int: HSVColor] = [:]
-        for source in LayerKeyColorLogic.order {
-            guard let keyIndex = LayerKeyColorLogic.keyIndexes[source] else { continue }
+        for part in keyboardLayout.parts where part.enabled && part.kind == .source {
+            guard let source = part.source else { continue }
+            let keyIndex = part.y * 10 + part.x
             let statuses = (try? stateStore.assignments(source: source))?.map(\.slot.status) ?? []
             colors[keyIndex] = LayerKeyColorLogic.color(
                 for: source,
@@ -901,9 +934,12 @@ final class StatusDaemon {
                 blinkPhaseOn: layerBlinkPhaseOn
             )
         }
-        let viewport = viewports[activeLayer] ?? GridViewport()
+        let viewport = configuredViewport()
         let utilities = viewport.utilityColors(projects: virtualProjects[activeLayer] ?? [:], slots: (try? stateStore.assignments(source: activeLayer).map(\.slot)) ?? [])
         colors.merge(utilities) { _, utility in utility }
+        for part in keyboardLayout.parts where part.enabled && part.kind == .action {
+            colors[part.y * 10 + part.x] = HSVColor(hue: 128, saturation: 170, value: 100)
+        }
         return colors
     }
 
@@ -943,9 +979,17 @@ final class StatusDaemon {
         try reconcileLEDs()
     }
 
-    private func visibleAssignments() throws -> [(key: Int, sessionID: String, slot: SessionSlot)] {
-        let assignments = try stateStore.assignments(source: activeLayer)
+    private func configuredViewport() -> GridViewport {
         var viewport = viewports[activeLayer] ?? GridViewport()
+        if let area = keyboardLayout.taskArea { viewport.area = area }
+        viewport.arrowKeys = keyboardLayout.taskArea == nil ? [:] : keyboardLayout.arrows
+        return viewport
+    }
+
+    private func visibleAssignments() throws -> [(key: Int, sessionID: String, slot: SessionSlot)] {
+        guard keyboardLayout.taskArea != nil, keyboardLayout.enabledSources.contains(activeLayer) else { return [] }
+        let assignments = try stateStore.assignments(source: activeLayer)
+        var viewport = configuredViewport()
         viewport.normalize(projects: virtualProjects[activeLayer] ?? [:], slots: assignments.map(\.slot))
         viewports[activeLayer] = viewport
         return assignments.compactMap { assignment in
@@ -954,7 +998,8 @@ final class StatusDaemon {
     }
 
     private func scroll(_ direction: String) throws {
-        var viewport = viewports[activeLayer] ?? GridViewport()
+        guard keyboardLayout.taskArea != nil, keyboardLayout.enabledSources.contains(activeLayer) else { return }
+        var viewport = configuredViewport()
         viewport.move(direction, projects: virtualProjects[activeLayer] ?? [:], slots: try stateStore.assignments(source: activeLayer).map(\.slot))
         viewports[activeLayer] = viewport
         try reconcileLEDs()
@@ -970,6 +1015,7 @@ final class StatusDaemon {
     /// no separate read receipt; switching to it and seeing its sessions is
     /// the acknowledgment).
     private func switchLayer(to newLayer: SessionSourceKind) {
+        guard keyboardLayout.enabledSources.contains(newLayer) else { return }
         guard newLayer != activeLayer else {
             logger.log(.debug, "layer press layer=\(newLayer.rawValue) action=already_active")
             return
@@ -1201,7 +1247,7 @@ final class StatusDaemon {
         for current in states {
             let newlyPressed = current.subtracting(pressedKeyIndexes)
             pressedKeyIndexes = current
-            arrowKeyRepeat.updateHeld(current, now: ProcessInfo.processInfo.systemUptime)
+            arrowKeyRepeat.updateHeld(current, now: ProcessInfo.processInfo.systemUptime, arrows: Set(keyboardLayout.arrows.keys))
             for keyIndex in newlyPressed.sorted() {
                 handleKeyPress(keyIndex: keyIndex)
             }
@@ -1214,18 +1260,25 @@ final class StatusDaemon {
     }
 
     private func handleKeyPress(keyIndex: Int) {
-        // Utility keys never enter task navigation; arrows operate the viewport.
-        if let direction = GridViewport.arrows[keyIndex] {
-            do { try scroll(direction) } catch { logger.log(.error, "scroll failed error=\(error)") }
+        guard let part = keyboardLayout.part(at: keyIndex) else { return }
+        switch part.kind {
+        case .scroll:
+            do { try scroll(part.direction!) } catch { logger.log(.error, "scroll failed error=\(error)") }
             return
-        }
-        if keyIndex >= 80 {
-            if let source = LayerKeyColorLogic.keyIndexes.first(where: { $0.value == keyIndex })?.key {
-                switchLayer(to: source)
-            } else {
-                logger.log(.debug, "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) action=ignored_unused_layer_key")
+        case .source:
+            if let source = part.source { switchLayer(to: source) }
+            return
+        case .action:
+            do {
+                try CodexActionBindings(home: codexPaths.home).execute(part.action!)
+                actionError = nil
+                logger.log(.info, "action dispatched id=\(part.action!)")
+            } catch {
+                actionError = String(describing: error)
+                logger.log(.error, "action failed id=\(part.action!) error=\(error)")
             }
             return
+        case .tasks: break
         }
         do {
             guard let assignment = try visibleAssignments().first(where: { $0.key == keyIndex }) else {
@@ -1344,7 +1397,7 @@ final class StatusDaemon {
             // through the generic AgentSession abstraction, since they need
             // Codex-only fields (rollout paths, createdAt) that the unified
             // model does not carry.
-            let codexLayout = try CodexCatalog.layout(paths: codexPaths, unbounded: true)
+            let codexLayout = keyboardLayout.enabledSources.contains(.codex) ? try CodexCatalog.layout(paths: codexPaths, unbounded: true) : CodexCatalog.orderedLayout([], sidebar: .empty, unbounded: true)
             let catalogSessions = codexLayout.placements.map(\.session)
             let nextCatalogSessionIDs = Set(catalogSessions.map(\.sessionID))
             catalogProjectBySession = Dictionary(
@@ -1353,7 +1406,7 @@ final class StatusDaemon {
 
 
             var agentSessions: [AgentSession] = []
-            for provider in providers {
+            for provider in providers where keyboardLayout.enabledSources.contains(provider.kind) {
                 agentSessions.append(contentsOf: try provider.snapshot())
             }
 
@@ -1529,6 +1582,7 @@ final class StatusDaemon {
             // session and a Codex session that happen to share a cwd land on
             // independent rows in their own layers instead of merging into
             // one shared row the way pre-M5's single grid did.
+            agentSessions = agentSessions.filter { keyboardLayout.enabledSources.contains($0.sourceKind) }
             var unifiedBySource: [SessionSourceKind: UnifiedLayoutResult] = [:]
             var reconciliationBySource: [SessionSourceKind: GridReconciliation] = [:]
             var anyReconciliationChanged = false

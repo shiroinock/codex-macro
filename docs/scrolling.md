@@ -1,8 +1,8 @@
 # Scrolling the task grid
 
-The top **8 × 10** keys show a window into the task catalog. Projects are rows and tasks are columns. The catalog is no longer truncated at ten projects or ten tasks. Offscreen tasks keep receiving status updates and layer attention indicators include them.
+The default layout’s top **8 × 10** keys show a window into the task catalog. Projects are rows and tasks are columns. The catalog is no longer truncated at ten projects or ten tasks. Offscreen tasks keep receiving status updates and layer attention indicators include them.
 
-The bottom two rows are utilities (positions below are one-based):
+[The layout editor](layout-editor.md) can resize, move, or transpose this area and relocate all controls. In the default layout, the bottom two rows are utilities (positions below are one-based):
 
 | Physical row | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

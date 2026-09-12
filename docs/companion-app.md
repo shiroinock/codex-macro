@@ -27,3 +27,5 @@ All commands accept `--config PATH` and use the configured daemon socket. The ap
 ## Validation (2026-09-13)
 
 Release build and all existing self-tests passed. The report fixture was updated to the current idle-white value of 96. The local app bundle passed code-signature verification. On the connected C100, the installed executable switched all four layers, changed brightness to 50/150/100%, rejected 201%, and retained 75% through LaunchAgent restart. Tests restored Codex and 100%. The menu process and bundled daemon were both running. Automated native-menu inspection was unavailable because the computer-use service timed out; menu clicks still require a visual smoke check.
+
+The menu now includes **レイアウトを編集…**. See [Layout editor](layout-editor.md) for movable parts, task-area sizing, source switches, and imported Codex command assignments.

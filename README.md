@@ -308,3 +308,7 @@ Existing-task bootstrap reads Codex's local SQLite task catalog, which is an int
 ## License and protocol references
 
 The original Swift source in this repository is licensed under the MIT License. See [LICENSE](LICENSE). Interoperability notes and third-party acknowledgements are in [NOTICE.md](NOTICE.md).
+
+### レイアウト編集と Codex アクション
+
+メニューバーの **C100 → レイアウトを編集…** から、タスクエリアの移動・サイズ変更・縦横入れ替え、矢印とサービス切り替えの再配置、サービスの ON/OFF、Codex の操作ボタン追加ができます。Codex 本体の設定可能なアプリ内コマンドを読み込み、操作名／ID で検索します。詳しくは [レイアウトエディタ](docs/layout-editor.md) を参照してください。

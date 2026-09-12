@@ -39,6 +39,7 @@ struct DaemonRequest: Codable {
         case inspect
         case layer
         case brightness
+        case layout
         case scroll
     }
 
@@ -49,6 +50,7 @@ struct DaemonRequest: Codable {
     let color: HSVColor?
     var layer: SessionSourceKind? = nil
     var brightness: Int? = nil
+    var layout: KeyboardLayout? = nil
     var direction: String? = nil
 
     static func hook(_ input: HookInput) -> Self {

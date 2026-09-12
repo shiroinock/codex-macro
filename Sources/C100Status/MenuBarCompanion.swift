@@ -4,6 +4,8 @@ import Foundation
 /// The menu owns no HID handle. Every display operation goes through the daemon.
 @MainActor
 final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var editor: LayoutEditorWindow?
+    private var editorConfigPath: String?
     private var item: NSStatusItem!
     private let menu = NSMenu()
     private var timer: Timer?
@@ -31,6 +33,7 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         rebuild()
         refresh()
+        if CommandLine.arguments.contains("--layout") { openEditor() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
@@ -54,11 +57,11 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let problem { menu.addItem(entry(String(problem.prefix(120)))) }
         else { menu.addItem(entry("方式: \(information["backend"] as? String ?? "確認中")")) }
         if let top = information["topRow"] as? Int {
-            menu.addItem(entry("表示行: \(top + 1)〜\(top + 8) ／ 列: \((information["leftColumn"] as? Int ?? 0) + 1)〜\((information["leftColumn"] as? Int ?? 0) + 10)"))
+            menu.addItem(entry("表示行: \(top + 1)〜\(top + (information["viewportRows"] as? Int ?? 8)) ／ 列: \((information["leftColumn"] as? Int ?? 0) + 1)〜\((information["leftColumn"] as? Int ?? 0) + (information["viewportColumns"] as? Int ?? 10))"))
         }
         menu.addItem(.separator())
         let layerMenu = NSMenu()
-        for (key, title) in layerNames {
+        for (key, title) in layerNames where (information["enabledSources"] as? [String] ?? layerNames.map { $0.0 }).contains(key) {
             let row = entry(title, action: #selector(selectLayer(_:)), value: key)
             row.state = information["layer"] as? String == key ? .on : .off
             row.isEnabled = !busy && problem == nil
@@ -76,6 +79,8 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
         brightnessMenu.autoenablesItems = false
         let brightness = entry("LED の明るさ"); brightness.submenu = brightnessMenu; menu.addItem(brightness)
         menu.addItem(.separator())
+        menu.addItem(entry("レイアウトを編集…", action: #selector(openEditor)))
+        if let error = information["actionError"] as? String, !error.isEmpty { menu.addItem(entry(error)) }
         menu.addItem(entry("デーモンを再起動", action: #selector(restart)))
         menu.addItem(entry("ログを開く", action: #selector(openLog)))
         menu.addItem(entry("設定ファイルを開く", action: #selector(openConfig)))
@@ -119,6 +124,25 @@ final class MenuBarCompanion: NSObject, NSApplicationDelegate, NSMenuDelegate {
             busy = false
             refresh()
         }
+    }
+
+    @objc private func openEditor() {
+        if editor != nil && editorConfigPath != configPath {
+            editor?.window?.performClose(nil)
+            if editor?.window?.isVisible == true { return }
+            editor = nil
+        }
+        if editor == nil {
+            let path = configPath, executable = binary
+            editorConfigPath = path
+            editor = LayoutEditorWindow(execute: { args in
+                let arguments = args + (path.map { ["--config", $0] } ?? [])
+                return try await Task.detached {
+                    String(decoding: try HerdrProcessRunner.run(binary: executable, arguments: arguments, timeout: 10), as: UTF8.self)
+                }.value
+            })
+        } else if editor?.window?.isVisible == false && editor?.model.dirty == false { editor?.model.load() }
+        editor?.showWindow(nil); NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     @objc private func selectLayer(_ sender: NSMenuItem) { if let value = sender.representedObject as? String { change(["layer", value]) } }
