@@ -132,13 +132,15 @@ enum SessionSourceDedup {
 struct CodexSourceProvider: SessionSourceProvider {
     let kind: SessionSourceKind = .codex
     private let paths: CodexPaths
+    private let unbounded: Bool
 
-    init(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) {
+    init(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil, unbounded: Bool = false) {
+        self.unbounded = unbounded
         self.paths = paths ?? CodexPaths(homeDirectory: homeDirectory)
     }
 
     func snapshot() throws -> [AgentSession] {
-        let layout = try CodexCatalog.layout(paths: paths)
+        let layout = try CodexCatalog.layout(paths: paths, unbounded: unbounded)
         return layout.placements.map { placement in
             let session = placement.session
             let normalizedCWD = URL(fileURLWithPath: session.cwd).standardizedFileURL.path

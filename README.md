@@ -161,7 +161,7 @@ The mapping is:
 | `Stop` | green (`done`) |
 | `SessionEnd` | white (`idle`) while the task remains cataloged |
 
-Each hook invocation is a short-lived sender. The foreground daemon maps projects to rows and tasks inside each project to columns. Thus `keyIndex = projectRow * 10 + sessionColumn`. Project rows follow Codex app's saved `project-order`, including empty project rows. Tasks follow the app's pinned/explicit sidebar order, then its recency order. Tasks without a saved project are grouped into one final `projectless` row instead of receiving one row per working directory. The 10 by 10 grid supports up to 10 rows and 10 tasks per row.
+Each hook invocation is a short-lived sender. The foreground daemon maps projects to rows and tasks inside each project to columns. The visible key is computed from the vertical window and the selected project's horizontal offset. Project rows follow Codex app's saved `project-order`, including empty project rows. Tasks follow the app's pinned/explicit sidebar order, then its recency order. Tasks without a saved project are grouped into one final `projectless` row instead of receiving one row per working directory. The top eight rows show ten tasks per project at a time; additional projects and tasks remain tracked and are reachable by scrolling.
 
 The daemon rereads the Codex catalog and sidebar state every two seconds. Adding or reordering projects, and adding or reordering tasks within a project, therefore remaps the grid without restarting the daemon. Existing task status colors move with their tasks.
 
@@ -175,7 +175,7 @@ Pressing a green (`done`) session key acknowledges the completed state after Cod
 
 Codex does not emit the `Stop` hook when an active turn is interrupted with Esc. The daemon therefore tails the local Codex rollout for each assigned task during its two-second catalog refresh. A new `turn_aborted` event returns only that interrupted task from blue or amber to white.
 
-Project identity honors explicit projectless selection and Codex task-to-project assignments first. Legacy tasks without an assignment or catalog project ID are matched against saved local project roots (longest directory match, including multiple roots and workspace-root hints). Ambiguous roots remain projectless. The grid groups Codex tasks by resolved project ID, so separate saved projects never merge just because they share a working directory. Each displayed project has up to 10 task keys. The running daemon has nine task rows because the bottom physical row is reserved for layer switching. When projectless chats exist, they occupy the ninth task row (keys 80–89), and named projects use rows 1–8. This reservation overrides previous placements and sidebar rank conflicts; overflow does not merge unrelated projects.
+Project identity honors explicit projectless selection and Codex task-to-project assignments first. Legacy tasks without an assignment or catalog project ID are matched against saved local project roots (longest directory match, including multiple roots and workspace-root hints). Ambiguous roots remain projectless. The grid groups Codex tasks by resolved project ID, so separate saved projects never merge just because they share a working directory. The top eight rows are a scrollable window into the complete catalog. Projectless chats follow the named projects and scroll normally; they are not pinned to a physical row. Offscreen task status is retained. See [scroll controls](docs/scrolling.md).
 
 Codex forks inherit their source task's project by following the recorded fork and subagent ancestry. This keeps both same-directory session forks and separate-worktree forks on the source project's row while assigning each fork its own column and key.
 
@@ -254,9 +254,9 @@ A session counts as alive if it isn't archived (`isArchived: false`) and at leas
 
 ## Layers (per-source grids)
 
-The keyboard multiplexes four independent grids ("layers"), one per session source: Codex Desktop, herdr, plain-terminal Claude Code, and Claude Desktop. Only one layer's sessions are shown on the main 0-89 key grid at a time; switching layers is instant and every layer keeps its own row/project bookkeeping, so a herdr session and a Codex session that happen to share a cwd never merge into (or fight over) the same row.
+The keyboard multiplexes four independent grids ("layers"), one per session source: Codex Desktop, herdr, plain-terminal Claude Code, and Claude Desktop. Only one layer's sessions are shown on the main 0-79 key grid at a time; switching layers is instant and every layer keeps its own row/project bookkeeping, so a herdr session and a Codex session that happen to share a cwd never merge into (or fight over) the same row.
 
-**Row 9 (keys 90-99) is the layer switch bar.** Keys 94-99 are reserved for future use and always stay off.
+**The bottom two physical rows (keys 80–99) are utility rows.** Keys 80–87 select a visible project row for horizontal scrolling, 88 is up, and 97/98/99 are left/down/right. Keys 90–93 retain the layer switches; 89 and 94–96 stay off.
 
 | Key | Layer | Base color | Why |
 | --- | --- | --- | --- |
@@ -269,7 +269,7 @@ Pressing a layer key switches the active layer immediately and persists the choi
 
 **Non-active layers still light up their key** so you know something needs attention without switching over: whenever a background layer has a session in `approval`, `error`, or `done` (checked in that priority order), its key blinks -- toggling roughly every 600ms between its normal base color and that status's real color -- instead of staying static. The active layer's own key is always shown at full brightness with no blink. Because a layer's brand hue can sit close to a status color (Codex's blue-violet is near `.working`'s blue; Claude's orange is near `.approval`'s amber and `.error`'s red), the blink -- not the static color alone -- is what makes "this layer needs attention" reliably distinguishable from "this is just the layer's resting color".
 
-Hooks and catalog syncs for non-active layers keep updating that layer's internal state (and therefore its key's blink) in the background; they just don't repaint the main grid until you switch to that layer. Navigating a key (0-89) and the "press a done session to mark it read" acknowledgement only ever apply to the currently active layer's sessions.
+Hooks and catalog syncs for non-active layers keep updating that layer's internal state (and therefore its key's blink) in the background; they just don't repaint the main grid until you switch to that layer. Navigating a key (0-79) and the "press a done session to mark it read" acknowledgement only ever apply to the currently active layer's sessions.
 
 ## Runtime paths and options
 

@@ -20,6 +20,8 @@ c100-status layer claude-terminal
 c100-status brightness 100                 # 10...200; companion firmware only
 ```
 
+Use `scroll up|down|left|right` and `focus-row 1...8` to operate the scroll window from the CLI. The physical utility keys are described in [scrolling.md](scrolling.md).
+
 All commands accept `--config PATH` and use the configured daemon socket. The app is a local build, not a notarized distribution.
 
 ## Validation (2026-09-13)

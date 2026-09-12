@@ -82,7 +82,7 @@ enum UnifiedLayout {
         sessions: [AgentSession],
         previousPlacements: [String: PreviousSlot] = [:],
         maxRows: Int = UnifiedLayout.maxRows,
-        reserveLastRowForProjectless: Bool = false
+        columnCapacity: Int = UnifiedLayout.maxColumns
     ) -> UnifiedLayoutResult {
         guard !sessions.isEmpty else {
             return UnifiedLayoutResult(projectRows: [:], placements: [], warnings: [])
@@ -154,12 +154,9 @@ enum UnifiedLayout {
             )
         }
 
-        let projectless = reserveLastRowForProjectless && maxRows > 0
-            ? rowGroups.first { $0.label == CodexCatalog.projectlessKey && $0.sessions.allSatisfy { $0.sourceKind == .codex } }
-            : nil
-        let (namedAssignments, rowWarnings) = assignSlots(
-            rowGroups.filter { projectless == nil || $0.label != CodexCatalog.projectlessKey },
-            capacity: projectless == nil ? maxRows : maxRows - 1,
+        let (rowAssignments, rowWarnings) = assignSlots(
+            rowGroups,
+            capacity: maxRows,
             explicitSlot: { $0.rank },
             previousSlot: { $0.previousRow },
             stableKey: { $0.label },
@@ -171,7 +168,6 @@ enum UnifiedLayout {
             slotNoun: "row"
         )
 
-        let rowAssignments = namedAssignments + (projectless.map { [(slot: maxRows - 1, item: $0)] } ?? [])
         var warnings = rowWarnings
         var projectRows: [String: Int] = [:]
         var placements: [UnifiedPlacement] = []
@@ -179,7 +175,7 @@ enum UnifiedLayout {
             projectRows[group.label] = row
             let (columnAssignments, columnWarnings) = assignSlots(
                 group.sessions,
-                capacity: maxColumns,
+                capacity: columnCapacity,
                 explicitSlot: { $0.columnRank },
                 previousSlot: { previousPlacements[$0.sessionID]?.column },
                 stableKey: { $0.sessionID },

@@ -57,9 +57,9 @@ struct SessionSlot: Codable, Equatable {
 /// `LayerSelectionStore`'s file, which does need to survive a restart and is
 /// therefore kept as its own small, independently-versioned file.
 struct GridState: Codable, Equatable {
-    /// Grid rows 0-8 are available to session placement; row 9 (keys
-    /// 90-99) is reserved for the layer switch bar (see `LayerKeyColorLogic`).
-    static let rowCapacity = 9
+    /// Initial allocation search size, not a logical capacity limit.
+    /// GridViewport projects these logical slots onto the top eight rows.
+    static let rowCapacity = 8
     static let columnCapacity = 10
 
     /// `source.rawValue` -> project key -> row, scoped per layer.
@@ -87,7 +87,7 @@ struct GridState: Codable, Equatable {
                     row = assignedRow
                 } else {
                     let usedRows = Set(rowsForSource.values)
-                    guard let freeRow = (0..<Self.rowCapacity).first(where: { !usedRows.contains($0) }) else {
+                    guard let freeRow = (0...max(Self.rowCapacity, (usedRows.max() ?? -1) + 1)).first(where: { !usedRows.contains($0) }) else {
                         throw CLIError.runtime("No unassigned C100 project rows remain for layer \(source.rawValue)")
                     }
                     row = freeRow
@@ -98,7 +98,7 @@ struct GridState: Codable, Equatable {
                 let usedColumns = Set(
                     sessions.values.filter { $0.source == source && $0.row == row }.map(\.column)
                 )
-                guard let column = (0..<Self.columnCapacity).first(where: { !usedColumns.contains($0) }) else {
+                guard let column = (0...max(Self.columnCapacity, (usedColumns.max() ?? -1) + 1)).first(where: { !usedColumns.contains($0) }) else {
                     throw CLIError.runtime("No unassigned C100 session columns remain for project \(projectKey)")
                 }
                 sessions[sessionID] = SessionSlot(

@@ -83,7 +83,7 @@ enum CodexCatalog {
         try layout(homeDirectory: homeDirectory, paths: paths).placements.map(\.session)
     }
 
-    static func layout(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) throws -> CatalogLayout {
+    static func layout(homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil, unbounded: Bool = false) throws -> CatalogLayout {
         let paths = paths ?? CodexPaths(homeDirectory: homeDirectory)
         let sidebar = sidebarOrdering(paths: paths)
         let databasePath = paths.catalogDatabase
@@ -97,7 +97,7 @@ enum CodexCatalog {
             catalogSessions: result,
             sidebar: sidebar
         ).filter { !existingSessionIDs.contains($0.sessionID) })
-        return orderedLayout(result, sidebar: sidebar)
+        return orderedLayout(result, sidebar: sidebar, unbounded: unbounded)
     }
 
     static func projectKey(sessionID: String, homeDirectory: String = NSHomeDirectory(), paths: CodexPaths? = nil) -> String {
@@ -108,7 +108,8 @@ enum CodexCatalog {
 
     static func orderedLayout(
         _ sessions: [CatalogSession],
-        sidebar: CodexSidebarOrdering
+        sidebar: CodexSidebarOrdering,
+        unbounded: Bool = false
     ) -> CatalogLayout {
         let sessionsByProject = Dictionary(grouping: sessions, by: \.projectKey)
         let hasProjectless = sessionsByProject[projectlessKey]?.isEmpty == false
@@ -120,7 +121,7 @@ enum CodexCatalog {
         }
 
         let namedRowLimit = hasProjectless ? 9 : 10
-        orderedProjectKeys = Array(orderedProjectKeys.prefix(namedRowLimit))
+        if !unbounded { orderedProjectKeys = Array(orderedProjectKeys.prefix(namedRowLimit)) }
         var projectRows = Dictionary(
             uniqueKeysWithValues: orderedProjectKeys.enumerated().map { ($0.element, $0.offset) }
         )
@@ -158,7 +159,7 @@ enum CodexCatalog {
                 if lhs.recency != rhs.recency { return lhs.recency > rhs.recency }
                 return lhs.sessionID < rhs.sessionID
             }
-            for (column, session) in orderedSessions.prefix(10).enumerated() {
+            for (column, session) in orderedSessions.prefix(unbounded ? orderedSessions.count : 10).enumerated() {
                 placements.append(CatalogPlacement(session: session, row: row, column: column))
             }
         }

@@ -18,6 +18,8 @@ final class StatusDaemon {
     private let claudeDesktopConfigDir: String
     private let logger: StatusLogger
     private let stateStore = StateStore()
+    private var viewports: [SessionSourceKind: GridViewport] = [:]
+    private var virtualProjects: [SessionSourceKind: [String: Int]] = [:]
     private var brightnessPercent = 100
     private var connection: C100Connection?
     private var grabberLease: GrabberLeaseClient?
@@ -44,7 +46,7 @@ final class StatusDaemon {
     /// -- see `UnifiedLayout.compute`'s doc comment.
     private var previousUnifiedPlacements: [SessionSourceKind: [String: UnifiedLayout.PreviousSlot]] = [:]
     /// M5: which of the 4 `SessionSourceKind` layers is currently displayed
-    /// on keys 0-89. Loaded from `layerStore` at startup (defaults to
+    /// on keys 0-79. Loaded from `layerStore` at startup (defaults to
     /// `.claudeHerdr`) and persisted every time it changes so a daemon
     /// restart resumes on the same layer.
     private var activeLayer: SessionSourceKind = LayerSelectionStore.defaultLayer
@@ -103,7 +105,7 @@ final class StatusDaemon {
         log: { [weak self] level, message in self?.logger.log(level, message) }
     )
     private lazy var providers: [SessionSourceProvider] = [
-        CodexSourceProvider(paths: codexPaths), herdrCatalog, claudeSessionsCatalog, claudeDesktopCatalog,
+        CodexSourceProvider(paths: codexPaths, unbounded: true), herdrCatalog, claudeSessionsCatalog, claudeDesktopCatalog,
     ]
     /// Claude is hook-authoritative (M1): the daemon itself remembers every
     /// session a Claude hook has told it about -- cwd/source for
@@ -348,8 +350,24 @@ final class StatusDaemon {
     private func handle(_ request: DaemonRequest) -> DaemonResponse {
         do {
             switch request.kind {
+            case .scroll:
+                guard let direction = request.direction, ["up", "down", "left", "right"].contains(direction) else { throw CLIError.usage("Invalid scroll direction") }
+                try scroll(direction)
+                return DaemonResponse(ok: true, message: "viewport updated", status: nil)
+            case .focusRow:
+                guard let row = request.focusRow, (0..<8).contains(row) else { throw CLIError.usage("Focus row must be 1...8") }
+                var viewport = viewports[activeLayer] ?? GridViewport()
+                viewport.selectedRow = row
+                viewports[activeLayer] = viewport
+                try reconcileLEDs()
+                return DaemonResponse(ok: true, message: "focus row updated", status: nil)
             case .inspect:
-                let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent]
+                let visible = try visibleAssignments()
+                let viewport = viewports[activeLayer] ?? GridViewport()
+                let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
+                    "topRow": viewport.topRow, "selectedRow": viewport.selectedRow, "columnOffsets": viewport.columnOffsets,
+                    "projectRows": virtualProjects[activeLayer] ?? [:],
+                    "visible": visible.map { ["key": $0.key, "sessionID": $0.sessionID, "project": $0.slot.projectKey, "column": $0.slot.column, "status": $0.slot.status.rawValue] as [String: Any] }]
                 let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
                 return DaemonResponse(ok: true, message: String(decoding: data, as: UTF8.self), status: nil)
             case .layer:
@@ -804,12 +822,12 @@ final class StatusDaemon {
     }
 
     /// Only meaningful for the currently-displayed layer -- painting every
-    /// layer's sessions the same manual color onto keys 0-89 would overlay
+    /// layer's sessions the same manual color onto keys 0-79 would overlay
     /// up to 4 layers' worth of placements onto the same physical keys at
     /// once, which makes no sense since only one layer's grid is ever
     /// visible.
     private func applyAssigned(status: AgentStatus) throws {
-        let assignments = try stateStore.assignments(source: activeLayer)
+        let assignments = try visibleAssignments()
         if dryRun {
             logger.log(.info, "HID skipped assigned_keys status=\(status.rawValue) assigned=\(assignments.count) layer=\(activeLayer.rawValue)")
             return
@@ -818,7 +836,7 @@ final class StatusDaemon {
             throw CLIError.runtime("C100 vendor HID connection is unavailable")
         }
         var colors = Dictionary(
-            uniqueKeysWithValues: assignments.map { ($0.slot.keyIndex, status.color) }
+            uniqueKeysWithValues: assignments.map { ($0.key, status.color) }
         )
         for (key, color) in layerKeyColors() { colors[key] = color }
         try connection.apply(colorsByIndex: colors, defaultColor: LEDColorName.off.color)
@@ -830,12 +848,11 @@ final class StatusDaemon {
         logger.log(.info, "HID applied frame assigned=\(assignments.count) unassigned=\(100 - assignments.count) layer=\(activeLayer.rawValue) persistence=volatile")
     }
 
-    /// Repaints keys 0-89 with `activeLayer`'s sessions only (every other
+    /// Repaints keys 0-79 with `activeLayer`'s sessions only (every other
     /// layer's sessions stay tracked in `StateStore` but never reach the
     /// LEDs while inactive -- see the M5 doc comment on `GridState`), keys
     /// 90-93 with the layer bar (base color, or blinking between
-    /// base/attention color -- see `LayerKeyColorLogic`), and keys 94-99
-    /// always off (unused, per the M5 spec).
+    /// base/attention color), plus row selectors and directional controls.
     ///
     /// Sends an incremental diff (`C100Connection.update`) against
     /// `lastPaintedFrame` whenever that cache is populated, so a session
@@ -850,7 +867,7 @@ final class StatusDaemon {
     /// empty and `update` sends nothing at all -- there's no need to
     /// separately restrict those triggers to the active layer.
     private func reconcileLEDs() throws {
-        let assignments = try stateStore.assignments(source: activeLayer)
+        let assignments = try visibleAssignments()
         let layerColors = layerKeyColors()
         lastPaintedLayerColors = layerColors
         if dryRun {
@@ -861,7 +878,7 @@ final class StatusDaemon {
             throw CLIError.runtime("C100 vendor HID connection is unavailable")
         }
         var colors = Dictionary(
-            uniqueKeysWithValues: assignments.map { ($0.slot.keyIndex, $0.slot.status.color) }
+            uniqueKeysWithValues: assignments.map { ($0.key, $0.slot.status.color) }
         )
         for (key, color) in layerColors { colors[key] = color }
         if let previous = lastPaintedFrame {
@@ -890,6 +907,9 @@ final class StatusDaemon {
                 blinkPhaseOn: layerBlinkPhaseOn
             )
         }
+        let viewport = viewports[activeLayer] ?? GridViewport()
+        let utilities = viewport.utilityColors(projects: virtualProjects[activeLayer] ?? [:], slots: (try? stateStore.assignments(source: activeLayer).map(\.slot)) ?? [])
+        colors.merge(utilities) { _, utility in utility }
         return colors
     }
 
@@ -914,7 +934,7 @@ final class StatusDaemon {
     /// A status mutation only ever needs to touch the LEDs when it belongs
     /// to the layer currently on screen -- a hook for a background layer's
     /// session still updates `StateStore` (see every `stateStore.update`
-    /// call site), but must never repaint keys 0-89, which only ever show
+    /// call site), but must never repaint keys 0-79, which only ever show
     /// `activeLayer`. `mutation.previousSlot == nil` (a session's very first
     /// placement) still goes through `reconcileLEDs()` rather than a
     /// single-key write, since only `reconcileLEDs()` knows how to bring a
@@ -926,11 +946,25 @@ final class StatusDaemon {
     /// own single-key path already costs for the region resend.
     private func applyLayerAwareUpdate(source: SessionSourceKind, mutation: SessionMutation, slot: SessionSlot) throws {
         guard source == activeLayer else { return }
-        if mutation.previousSlot == nil {
-            try reconcileLEDs()
-        } else {
-            try apply(color: slot.status.color, at: slot.keyIndex)
+        try reconcileLEDs()
+    }
+
+    private func visibleAssignments() throws -> [(key: Int, sessionID: String, slot: SessionSlot)] {
+        let assignments = try stateStore.assignments(source: activeLayer)
+        var viewport = viewports[activeLayer] ?? GridViewport()
+        viewport.normalize(projects: virtualProjects[activeLayer] ?? [:], slots: assignments.map(\.slot))
+        viewports[activeLayer] = viewport
+        return assignments.compactMap { assignment in
+            viewport.key(for: assignment.slot).map { (key: $0, sessionID: assignment.sessionID, slot: assignment.slot) }
         }
+    }
+
+    private func scroll(_ direction: String) throws {
+        var viewport = viewports[activeLayer] ?? GridViewport()
+        viewport.move(direction, projects: virtualProjects[activeLayer] ?? [:], slots: try stateStore.assignments(source: activeLayer).map(\.slot))
+        viewports[activeLayer] = viewport
+        try reconcileLEDs()
+        logger.log(.info, "viewport direction=\(direction) topRow=\(viewport.topRow) selectedRow=\(viewport.selectedRow) columns=\(viewport.columnOffsets)")
     }
 
     /// Handles a press on one of the 4 layer-switch keys (90=Codex,
@@ -1180,9 +1214,19 @@ final class StatusDaemon {
     }
 
     private func handleKeyPress(keyIndex: Int) {
-        // Row 9 (keys 90-99): 90-93 are the layer switch bar, 94-99 are
-        // unused (per the M5 spec) and never reach grid navigation below.
-        if keyIndex >= 90 {
+        // Utility keys never enter task navigation; arrows operate the viewport.
+        if let direction = GridViewport.arrows[keyIndex] {
+            do { try scroll(direction) } catch { logger.log(.error, "scroll failed error=\(error)") }
+            return
+        }
+        if (80..<88).contains(keyIndex) {
+            var viewport = viewports[activeLayer] ?? GridViewport()
+            viewport.selectedRow = keyIndex - 80
+            viewports[activeLayer] = viewport
+            try? reconcileLEDs()
+            return
+        }
+        if keyIndex >= 80 {
             if let source = LayerKeyColorLogic.keyIndexes.first(where: { $0.value == keyIndex })?.key {
                 switchLayer(to: source)
             } else {
@@ -1191,7 +1235,7 @@ final class StatusDaemon {
             return
         }
         do {
-            guard let assignment = try stateStore.assignment(at: keyIndex, source: activeLayer) else {
+            guard let assignment = try visibleAssignments().first(where: { $0.key == keyIndex }) else {
                 logger.log(.debug, "input key=\(keyIndex) row=\(keyIndex / 10) col=\(keyIndex % 10) layer=\(activeLayer.rawValue) action=ignored_unassigned")
                 return
             }
@@ -1238,8 +1282,8 @@ final class StatusDaemon {
                 source: activeLayer,
                 status: .idle
             )
-            guard let slot = mutation.slot else { return }
-            try apply(color: slot.status.color, at: slot.keyIndex)
+            guard mutation.slot != nil else { return }
+            try reconcileLEDs()
             logger.log(
                 .info,
                 "input key=\(keyIndex) session=\(shortSession(assignment.sessionID)) action=acknowledge_done status=idle"
@@ -1307,7 +1351,7 @@ final class StatusDaemon {
             // through the generic AgentSession abstraction, since they need
             // Codex-only fields (rollout paths, createdAt) that the unified
             // model does not carry.
-            let codexLayout = try CodexCatalog.layout(paths: codexPaths)
+            let codexLayout = try CodexCatalog.layout(paths: codexPaths, unbounded: true)
             let catalogSessions = codexLayout.placements.map(\.session)
             let nextCatalogSessionIDs = Set(catalogSessions.map(\.sessionID))
             catalogProjectBySession = Dictionary(
@@ -1485,7 +1529,7 @@ final class StatusDaemon {
                 )
             })
             // M5: each layer (SessionSourceKind) gets its own independent
-            // `UnifiedLayout.compute` -- 9-row cap (row 9 is the layer bar),
+            // `UnifiedLayout.compute` over all logical rows and columns,
             // no cross-layer row merging -- and its own `StateStore.reconcile`
             // call, which only ever touches that layer's slice of the grid
             // (see `GridState`'s doc comment). This is what makes a herdr
@@ -1509,9 +1553,10 @@ final class StatusDaemon {
                 let unified = UnifiedLayout.compute(
                     sessions: sourceSessions,
                     previousPlacements: sourcePreviousPlacements,
-                    maxRows: GridState.rowCapacity,
-                    reserveLastRowForProjectless: source == .codex
+                    maxRows: max(sourceSessions.count, (sourceSessions.compactMap(\.rowRank).max() ?? -1) + 1, 1),
+                    columnCapacity: max(sourceSessions.count, (sourceSessions.compactMap(\.columnRank).max() ?? -1) + 1, 10)
                 )
+                virtualProjects[source] = unified.projectRows
                 for placement in unified.placements {
                     nextSessionNavigationBySession[placement.session.sessionID] = placement.session.navigation
                 }

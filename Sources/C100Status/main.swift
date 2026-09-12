@@ -72,9 +72,15 @@ enum C100StatusCLI {
             throw CLIError.usage("--companion is supported by run and install-agent only; use companion-info or companion-watch for diagnostics")
         }
         switch command {
-        case "inspect", "layer", "brightness":
+        case "inspect", "layer", "brightness", "scroll", "focus-row":
             var request = DaemonRequest(kind: .inspect, hook: nil, status: nil, keyIndex: nil, color: nil)
-            if command == "layer" {
+            if command == "scroll" {
+                guard let direction = positionals.first, ["up", "down", "left", "right"].contains(direction) else { throw CLIError.usage("scroll requires up, down, left or right") }
+                request = DaemonRequest(kind: .scroll, hook: nil, status: nil, keyIndex: nil, color: nil, direction: direction)
+            } else if command == "focus-row" {
+                guard let row = positionals.first.flatMap(Int.init), (1...8).contains(row) else { throw CLIError.usage("focus-row requires 1...8") }
+                request = DaemonRequest(kind: .focusRow, hook: nil, status: nil, keyIndex: nil, color: nil, focusRow: row - 1)
+            } else if command == "layer" {
                 guard let value = positionals.first, let layer = SessionSourceKind(rawValue: value) else { throw CLIError.usage("layer requires codex, claude-herdr, claude-terminal or claude-desktop") }
                 request = DaemonRequest(kind: .layer, hook: nil, status: nil, keyIndex: nil, color: nil, layer: layer)
             } else if command == "brightness" {
@@ -224,7 +230,7 @@ enum C100StatusCLI {
                 print("\(descriptor.product) vid=0x\(hex(descriptor.vendorID, width: 4)) pid=0x\(hex(descriptor.productID, width: 4)) location=0x\(hex(descriptor.locationID, width: 6)) registry=0x\(String(descriptor.registryEntryID, radix: 16))")
             }
         case "catalog":
-            let layout = try CodexCatalog.layout(paths: options.codexPaths)
+            let layout = try CodexCatalog.layout(paths: options.codexPaths, unbounded: true)
             for (project, row) in layout.projectRows.sorted(by: { $0.value < $1.value }) {
                 print("row=\(row) project=\(project)")
                 for placement in layout.placements.filter({ $0.row == row }) {
@@ -377,6 +383,7 @@ enum C100StatusCLI {
         case "self-test":
             try ConfigurationTests.run()
             try ProjectGroupingTests.run()
+            try GridViewportTests.run()
             try CompanionProtocol.selfTest()
             try selfTest()
         case "help", "--help", "-h":
@@ -3075,6 +3082,8 @@ enum C100StatusCLI {
         Usage (user commands accept --config PATH; CLI overrides JSON settings):
           c100-status app
           c100-status inspect [--config PATH]
+          c100-status scroll <up|down|left|right>
+          c100-status focus-row <1...8>
           c100-status layer <codex|claude-herdr|claude-terminal|claude-desktop>
           c100-status brightness <10...200>
           c100-status config show [--config PATH]
