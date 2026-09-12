@@ -44,3 +44,29 @@ Self-tests cover resized/offset/transposed projection, physical arrow directions
 On this machine (2026-09-13), 118 app-scoped commands were imported with Japanese labels. The full release self-test suite passed using that installed catalog. A connected C100 accepted a relocated 5 × 4 transposed task area, reported matching physical key projections, and correctly hid all tasks when sources were disabled; the default layout was restored. The editor's task-area and action inspectors were rendered and visually checked. The user granted Accessibility and the running daemon confirmed it. A physical button check of two identical Codex action assignments is pending.
 
 After adding a new action alias, Codex may need to refresh its cached shortcut settings. If it does not respond yet, return focus to Codex after about a minute or restart Codex. This adapter does not restart Codex while a task is running.
+
+
+### Action delivery validation (2026-09-13)
+
+Action buttons prefer an existing configured shortcut that can be represented
+as a single modified keystroke, skipping explicit conflicts. Bare Enter/Escape
+and multi-stroke chords are not emitted; commands without a usable shortcut
+fall back to their dedicated alias. Character keys are resolved using the current
+input layout, and function keys include the macOS function-key flag. Events are
+posted through the login session only while Codex is foreground. Logs say
+`key_posted` with the shortcut and `execution=unconfirmed`; posting is not an ack.
+
+On this machine the user confirmed physical archive success after re-registering
+C100 Companion in Accessibility. The corresponding daemon log recorded
+`archiveThread`, `CmdOrCtrl+Shift+A`, and the session route, with Accessibility
+trusted and no action error. Earlier Control+F13 attempts did not archive even
+when trusted; changing only the posting route did not resolve that case.
+Other context-dependent actions and dedicated aliases still need physical checks.
+The full self-test suite passed on the final build. One earlier suite run failed
+an unrelated Claude hook uninstall assertion; the final rerun passed.
+
+The local bundle is ad-hoc signed: its designated requirement contains a code
+hash that changes on rebuild. Updating it can invalidate Accessibility permission.
+If the daemon reports untrusted despite the Settings switch being on, removing
+and re-adding the installed app can restore it. Avoid reinstalling an unchanged
+validated build. A stable signing identity remains a separate deployment issue.

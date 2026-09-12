@@ -65,7 +65,7 @@ struct ActionShortcut {
     var keyCode: CGKeyCode { [105,107,113,106,64,79,80,90][slot % 8] }
     var flags: CGEventFlags {
         let bank = slot / 8 + 1
-        var flags: CGEventFlags = []
+        var flags: CGEventFlags = [.maskSecondaryFn]
         if bank & 1 != 0 { flags.insert(.maskControl) }
         if bank & 2 != 0 { flags.insert(.maskAlternate) }
         if bank & 4 != 0 { flags.insert(.maskShift) }
@@ -81,6 +81,60 @@ struct ActionShortcut {
     }
 }
 
+/// A currently configured shortcut, independent of the C100 alias allocation.
+struct CodexKeyboardShortcut {
+    let accelerator: String
+    let keyCode: CGKeyCode
+    let flags: CGEventFlags
+
+    static func parse(_ accelerator: String, characterCode: (String) -> CGKeyCode? = currentCharacterCode) -> Self? {
+        let tokens = accelerator.split(separator: "+").map(String.init)
+        guard let key = tokens.last, !key.isEmpty, !accelerator.contains(" ") else { return nil }
+        var flags: CGEventFlags = []
+        for modifier in tokens.dropLast() {
+            switch modifier.lowercased() {
+            case "cmdorctrl", "commandorcontrol", "cmd", "command", "meta", "super": flags.insert(.maskCommand)
+            case "ctrl", "control": flags.insert(.maskControl)
+            case "alt", "option": flags.insert(.maskAlternate)
+            case "shift": flags.insert(.maskShift)
+            default: return nil
+            }
+        }
+        // Bare Enter/Escape must not conflate approval, submission and dismissal.
+        guard !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return nil }
+        let named: [String: CGKeyCode] = ["enter": 36, "return": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49, "up": 126, "down": 125, "left": 123, "right": 124]
+        let functionCodes: [CGKeyCode] = [122,120,99,118,96,97,98,100,101,109,103,111,105,107,113,106,64,79,80,90]
+        let code: CGKeyCode?
+        if key.lowercased().hasPrefix("f"), let number = Int(key.dropFirst()), (1...20).contains(number) { code = functionCodes[number - 1]; flags.insert(.maskSecondaryFn) }
+        else { code = named[key.lowercased()] ?? characterCode(key.lowercased()) }
+        guard let code else { return nil }
+        return Self(accelerator: accelerator, keyCode: code, flags: flags)
+    }
+
+    private static func currentCharacterCode(_ character: String) -> CGKeyCode? {
+        guard character.count == 1 else { return nil }
+        // Resolve through the current input layout instead of assuming US keys.
+        return (0...50).map { CGKeyCode($0) }.first { code in
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true) else { return false }
+            event.flags = []
+            return NSEvent(cgEvent: event)?.charactersIgnoringModifiers?.lowercased() == character
+        }
+    }
+
+    static func forCommand(_ id: String, bindings: [[String: Any]], characterCode: (String) -> CGKeyCode? = currentCharacterCode) -> Self? {
+        let owned = bindings.filter { $0["command"] as? String == id }
+        guard !owned.contains(where: { $0["key"] is NSNull }) else { return nil }
+        for binding in owned {
+            guard let key = binding["key"] as? String,
+                  !bindings.contains(where: { $0["command"] as? String != id && ($0["key"] as? String).map(CodexActionBindings.normalized) == CodexActionBindings.normalized(key) }),
+                  let shortcut = parse(key, characterCode: characterCode) else { continue }
+            return shortcut
+        }
+        guard let alias = ActionShortcut.forCommand(id, bindings: bindings) else { return nil }
+        return Self(accelerator: alias.accelerator, keyCode: alias.keyCode, flags: alias.flags)
+    }
+}
+
 struct CodexActionBindings {
     let home: String
     var url: URL { URL(fileURLWithPath: home).appendingPathComponent("keybindings.json") }
@@ -93,7 +147,7 @@ struct CodexActionBindings {
         return bindings
     }
     static func normalized(_ key: String) -> String {
-        let aliases = ["cmdorctrl": "command", "cmd": "command", "meta": "command", "super": "command", "ctrl": "control", "alt": "option"]
+        let aliases = ["commandorcontrol": "command", "cmdorctrl": "command", "cmd": "command", "meta": "command", "super": "command", "ctrl": "control", "alt": "option"]
         return key.lowercased().split(separator: "+").map { aliases[String($0)] ?? String($0) }.sorted().joined(separator: "+")
     }
     func prepared(_ layout: KeyboardLayout) throws -> [[String: Any]] {
@@ -130,10 +184,11 @@ struct CodexActionBindings {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
     }
-    func execute(_ id: String) throws {
+    @discardableResult
+    func execute(_ id: String) throws -> String {
         guard let action = CodexAction.catalog.first(where: { $0.id == id }) else { throw CLIError.usage("Unknown action") }
         let bindings = try read()
-        guard let shortcut = ActionShortcut.forCommand(action.id, bindings: bindings) else { throw CLIError.runtime("レイアウトを再適用してください") }
+        guard let shortcut = CodexKeyboardShortcut.forCommand(action.id, bindings: bindings) else { throw CLIError.runtime("レイアウトを再適用してください") }
         let key = Self.normalized(shortcut.accelerator)
         let owners = bindings.filter { ($0["key"] as? String).map(Self.normalized) == key }
         guard !owners.isEmpty && owners.allSatisfy({ $0["command"] as? String == id }) else {
@@ -143,9 +198,15 @@ struct CodexActionBindings {
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == CodexNavigator.bundleIdentifier else {
             throw CLIError.runtime("アクションを実行するには Codex / ChatGPT を前面にしてください")
         }
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: shortcut.keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: shortcut.keyCode, keyDown: false) else { throw CLIError.runtime("キーイベントを作成できませんでした") }
+        guard let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: shortcut.keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: shortcut.keyCode, keyDown: false) else { throw CLIError.runtime("キーイベントを作成できませんでした") }
         down.flags = shortcut.flags; up.flags = shortcut.flags
-        down.postToPid(app.processIdentifier); up.postToPid(app.processIdentifier)
+        // Use the login session keyboard pipeline, including native menu/key
+        // equivalents, rather than relying on PID-directed delivery.
+        // The foreground guard above prevents deliberate delivery to other apps.
+        down.post(tap: .cgSessionEventTap)
+        up.post(tap: .cgSessionEventTap)
+        return shortcut.accelerator
     }
 }

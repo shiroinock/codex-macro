@@ -9,6 +9,14 @@ enum KeyboardLayoutTests {
             do { try layout.validate() } catch { return }
             throw CLIError.runtime("Layout self-test: accepted " + message)
         }
+        try check(ActionShortcut(slot: 0).flags.contains(.maskSecondaryFn), "dedicated function keys carry the macOS function flag")
+        let archiveBindings: [[String: Any]] = [["command": "archiveThread", "key": "CmdOrCtrl+Shift+A"], ["command": "archiveThread", "key": "Control+F13"]]
+        let archive = CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings, characterCode: { $0 == "a" ? 0 : nil })
+        try check(archive?.keyCode == 0 && archive?.flags == [.maskCommand, .maskShift], "use existing archive shortcut before dedicated alias")
+        let conflictBindings = archiveBindings + [["command": "other", "key": "Command+Shift+A"]]
+        try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: conflictBindings, characterCode: { _ in 0 })?.keyCode == 105, "conflicting primary shortcut falls back to isolated alias")
+        try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings + [["command": "archiveThread", "key": NSNull()]]) == nil, "disabled command is never dispatched")
+        try check(CodexKeyboardShortcut.parse("Enter") == nil && CodexKeyboardShortcut.parse("Escape") == nil && CodexKeyboardShortcut.parse("Cmd+K Cmd+C") == nil, "bare keys and chords are not dispatched as another action")
         var layout = KeyboardLayout.standard
         try layout.validate()
         try check(layout.arrows == GridViewport.arrows && layout.enabledSources.count == 4, "legacy default")

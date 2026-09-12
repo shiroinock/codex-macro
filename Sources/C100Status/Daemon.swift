@@ -1279,9 +1279,9 @@ final class StatusDaemon {
             return
         case .action:
             do {
-                try CodexActionBindings(home: codexPaths.home).execute(part.action!)
+                let shortcut = try CodexActionBindings(home: codexPaths.home).execute(part.action!)
                 actionError = nil
-                logger.log(.info, "action dispatched id=\(part.action!)")
+                logger.log(.info, "action key_posted id=\(part.action!) shortcut=\(shortcut) route=session execution=unconfirmed")
             } catch {
                 actionError = String(describing: error)
                 logger.log(.error, "action failed id=\(part.action!) error=\(error)")
