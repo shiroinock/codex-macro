@@ -1509,7 +1509,8 @@ final class StatusDaemon {
                 let unified = UnifiedLayout.compute(
                     sessions: sourceSessions,
                     previousPlacements: sourcePreviousPlacements,
-                    maxRows: GridState.rowCapacity
+                    maxRows: GridState.rowCapacity,
+                    reserveLastRowForProjectless: source == .codex
                 )
                 for placement in unified.placements {
                     nextSessionNavigationBySession[placement.session.sessionID] = placement.session.navigation

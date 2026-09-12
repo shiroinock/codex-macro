@@ -44,6 +44,24 @@ enum ProjectGroupingTests {
         guard rows == expected, layout.warnings.isEmpty else {
             throw CLIError.runtime("project grouping regression: \(rows), warnings=\(layout.warnings)")
         }
+        let previous = Dictionary(uniqueKeysWithValues: layout.placements.map {
+            ($0.session.sessionID, UnifiedLayout.PreviousSlot(row: $0.row, column: $0.column))
+        })
+        let bottom = UnifiedLayout.compute(sessions: sessions, previousPlacements: previous, maxRows: 9, reserveLastRowForProjectless: true)
+        guard bottom.projectRows[CodexCatalog.projectlessKey] == 8,
+              bottom.placements.filter({ $0.projectKey != CodexCatalog.projectlessKey }).allSatisfy({ $0.row < 8 }) else {
+            throw CLIError.runtime("projectless must occupy the last task row regardless of previous placement")
+        }
+        // Even an explicit/sticky named-project claim cannot take the reserved row.
+        let collision = sessions.map { session in
+            AgentSession(sourceKind: session.sourceKind, sessionID: session.sessionID, cwd: session.cwd,
+                         rowHints: session.rowHints, recency: session.recency,
+                         rowRank: session.rowHints.codexProjectID == "project:home" ? 8 : session.rowRank,
+                         columnRank: session.columnRank, seedStatus: nil, navigation: session.navigation)
+        }
+        let reserved = UnifiedLayout.compute(sessions: collision, previousPlacements: ["assigned-home": .init(row: 8, column: 0)], maxRows: 9, reserveLastRowForProjectless: true)
+        guard reserved.projectRows[CodexCatalog.projectlessKey] == 8, reserved.projectRows["project:home"] != 8,
+              reserved.placements.count == sessions.count else { throw CLIError.runtime("reserved row collision regression") }
         var ambiguous = CodexSidebarOrdering.empty
         ambiguous.projectRoots = ["a": ["/shared"], "b": ["/shared"]]
         guard ambiguous.resolvedProjectID(sessionID: "x", cwd: "/shared", catalogProjectID: nil) == nil else {
