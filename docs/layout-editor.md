@@ -111,3 +111,22 @@ saved behavior, are displayed as legacy settings, and can be reset to the built-
 mapping. New assignments store only the action ID. The hardware transport and
 foreground process recheck are unchanged. All self-tests pass; physical Claude
 validation and a working Claude archive execution route remain pending.
+
+
+### Service selection and the Actions tab
+
+The Services tab limits both action candidates and actual dispatch. Disabling
+Codex prevents Codex key output even while Codex is foreground, and saving a
+layout does not install Codex bindings while that service is disabled. A legacy
+per-button Claude override cannot bypass the enabled-service check. Claude CLI,
+herdr and Claude Desktop are distinct services; the terminal services currently
+have no supported keyboard action routes.
+
+The Actions tab lists actions against the selected services with their outgoing
+shortcuts, distinguishing imported Codex settings, bundled Claude defaults,
+legacy per-key overrides and unsupported routes. Assigned but unavailable
+actions remain visible for diagnosis. Service draft edits immediately filter
+UI candidates; saving the Services tab applies them to the daemon. Layout
+inspection only selects and positions the semantic action; shortcut details
+now live in the Actions tab. Claude Desktop settings import remains pending
+validation on the other machine.

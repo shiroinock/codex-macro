@@ -3,6 +3,8 @@ import SwiftUI
 
 @MainActor
 final class LayoutEditorModel: ObservableObject {
+    @Published var enabledActionServices = Set(SessionSourceKind.allCases)
+    var actionCandidates: [CodexAction] { DesktopActionCatalog.candidates(services: enabledActionServices) }
     @Published var layout = KeyboardLayout.standard
     @Published var selected: String? = "tasks"
     @Published var message = "読み込み中…"
@@ -68,7 +70,7 @@ final class LayoutEditorModel: ObservableObject {
         if kind == .tasks, let existing = layout.parts.first(where: { $0.kind == .tasks }) { selected = existing.id; return }
         if kind == .source, let existing = layout.parts.first(where: { $0.kind == .source }) { selected = existing.id; return }
         guard let key = (0..<100).first(where: { layout.part(at: $0) == nil }) else { message = "空きキーがありません。タスクエリアを縮めるか、パーツを無効にしてください"; return }
-        _ = assign(at: key, kind: kind, source: source, direction: direction, action: kind == .action ? DesktopActionCatalog.catalog[0].id : nil)
+        _ = assign(at: key, kind: kind, source: source, direction: direction, action: kind == .action ? actionCandidates.first?.id : nil)
     }
     /// Commit a key assignment only after the candidate passes layout validation.
     func assign(at key: Int, kind: LayoutPart.Kind, source: SessionSourceKind?, direction: String?, action: String?, services: [SessionSourceKind] = SessionSourceKind.allCases) -> Bool {
@@ -206,7 +208,7 @@ struct LayoutEditorView: View {
             KeyAssignmentView(model: model, key: target.key)
         }
         .sheet(isPresented: $choosingAction) {
-            CodexActionChooser(selected: model.layout.parts.first { $0.id == model.selected }?.action) { action in
+            CodexActionChooser(selected: model.layout.parts.first { $0.id == model.selected }?.action, enabledServices: model.enabledActionServices) { action in
                 model.update { if $0.action != action { $0.claudeShortcut = nil }; $0.action = action }; choosingAction = false
             }
         }
@@ -267,39 +269,11 @@ struct LayoutEditorView: View {
                 Button { choosingAction = true } label: {
                     Label("操作を検索・変更…", systemImage: "magnifyingglass")
                 }
-                Text("前面のアプリに応じて、同じ操作の送信キーを自動選択します。").font(.caption).foregroundStyle(.secondary)
-                Text(DesktopActionCatalog.supportLabel(part.action)).font(.caption)
-                GroupBox("Claude Desktop に送信するキー") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let key = part.claudeShortcut ?? DesktopActionCatalog.claudeKey(for: part.action) {
-                            Text(ActionShortcutDisplay(accelerator: key, dedicated: false).label).font(.title2.monospaced().bold())
-                            Text(part.claudeShortcut == nil ? "Code タブ用の内蔵対応" : "以前に保存した手動設定").font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Text("送信方法は未対応です。このアプリが前面のときは実行しません。").font(.caption).foregroundStyle(.secondary)
-                        }
-                        if part.claudeShortcut != nil {
-                            Button("内蔵の対応に戻す") { model.update { $0.claudeShortcut = nil } }.font(.caption)
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
+                Text("有効なサービスのうち、前面のアプリに操作を送ります。送信キーは「アクション」タブで確認できます。").font(.caption).foregroundStyle(.secondary)
+                if !model.actionCandidates.contains(where: { $0.id == part.action }) {
+                    Text("現在のサービス設定では、この操作の送信先がありません。").font(.caption).foregroundStyle(.orange)
                 }
-                GroupBox("Codex に送信するキー") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let error = model.shortcutError {
-                            Text(error).font(.caption).foregroundStyle(.secondary)
-                        } else if let shortcut = model.shortcuts[part.action ?? ""] {
-                            Text(shortcut.label).font(.system(.title2, design: .monospaced).bold()).textSelection(.enabled)
-                            Text(shortcut.dedicated ? "C100 専用ショートカット" : "Codex の既存ショートカット").font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Text(DesktopActionCatalog.supportsCodex(part.action) ? "送信キーが未設定です。「保存して反映」で割り当てます。" : "この操作の送信方法は未対応です。").font(.caption)
-                        }
-                        Button("送信キーを再確認") { model.refreshShortcuts() }.font(.caption)
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
-                }
-                Text(model.hardwareKeyOutput ? "送信元: C100（USB キーボード）" : "送信元: macOS（アクセシビリティ）").font(.caption).foregroundStyle(.secondary)
-                Text("キーには操作を1つだけ割り当てます。送信キーの表示は確認用です。その他のアプリには送信しません。").font(.caption).foregroundStyle(.secondary)
-                if !model.hardwareKeyOutput { Button("アクセシビリティ設定を開く") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }.font(.caption) }
+
             }
             Button("パーツを削除", role: .destructive) { model.remove() }
         }
@@ -313,11 +287,12 @@ private struct AssignmentKey: Identifiable {
 
 struct CodexActionChooser: View {
     var selected: String?
+    var enabledServices = Set(SessionSourceKind.allCases)
     var choose: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     @FocusState private var searchFocused: Bool
-    private var results: [CodexAction] { Self.search(query, in: DesktopActionCatalog.catalog) }
+    private var results: [CodexAction] { Self.search(query, in: DesktopActionCatalog.candidates(services: enabledServices)) }
     static func search(_ query: String, in actions: [CodexAction]) -> [CodexAction] {
         let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
         return actions.filter { action in words.allSatisfy { action.title.localizedCaseInsensitiveContains($0) || action.id.localizedCaseInsensitiveContains($0) } }
@@ -336,7 +311,7 @@ struct CodexActionChooser: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(action.title).font(.body)
-                                    Text(DesktopActionCatalog.supportLabel(action.id)).font(.caption).foregroundStyle(.secondary)
+                                    Text(SessionSourceKind.allCases.filter { enabledServices.contains($0) && DesktopActionCatalog.supports(action.id, service: $0) }.map(\.displayName).joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if action.id == selected { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
@@ -413,7 +388,7 @@ private struct KeyAssignmentView: View {
             }
         }.padding(24).frame(width: 560)
             .onAppear { if let occupied { kind = occupied.kind; services = Set(occupied.selectedServices); direction = occupied.direction ?? "up"; action = occupied.action } }
-            .sheet(isPresented: $searching) { CodexActionChooser(selected: action) { action = $0; searching = false } }
+            .sheet(isPresented: $searching) { CodexActionChooser(selected: action, enabledServices: model.enabledActionServices) { action = $0; searching = false } }
     }
 }
 
@@ -427,12 +402,15 @@ final class LayoutEditorWindow: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 870, height: 710), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "C100 設定"; window.isReleasedWhenClosed = false
         let layoutModel = model, serviceModel = services
+        model.enabledActionServices = []
+        services.onServicesChanged = { [weak layoutModel] sources in layoutModel?.enabledActionServices = sources }
         window.contentView = NSHostingView(rootView: TabView {
             LayoutEditorView(model: layoutModel).tabItem { Text("レイアウト") }
+            ActionSettingsView(model: layoutModel).tabItem { Text("アクション") }
             ServiceSettingsView(model: serviceModel).tabItem { Text("サービス") }
         })
         super.init(window: window)
-        window.delegate = self; window.center(); model.load()
+        window.delegate = self; window.center(); model.load(); services.load()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -453,6 +431,7 @@ extension LayoutEditorWindow {
         if mode == "services" { model.selected = layout.parts.first { $0.kind == .source }?.id }
         let content: AnyView
         switch mode {
+        case "actions": content = AnyView(ActionSettingsView(model: model))
         case "service-settings":
             let services = ServiceSettingsModel(execute: { _ in "" })
             services.loaded = true; services.configuration = Configuration.example

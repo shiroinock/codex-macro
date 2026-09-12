@@ -10,6 +10,10 @@ enum LayoutEditorTests {
         services.setEnabled(.codex, false)
         try check(services.configuration.enabledServices == [.claudeTerminal] && services.configuration.defaultLayer == "claude-terminal", "disabling the selected service selects an available default")
         try services.configuration.validate()
+        var changedServices = Set<SessionSourceKind>()
+        services.onServicesChanged = { changedServices = $0 }
+        services.setEnabled(.claudeDesktop, true)
+        try check(changedServices.contains(.claudeDesktop), "service tab changes update action candidates")
         let model = LayoutEditorModel(execute: { _ in "" })
         try check(model.assign(at: 80, kind: .action, source: nil, direction: nil, action: "toggleSidebar"), "assign clicked empty key")
         try check(model.assign(at: 81, kind: .action, source: nil, direction: nil, action: "toggleSidebar"), "duplicate action on another key")

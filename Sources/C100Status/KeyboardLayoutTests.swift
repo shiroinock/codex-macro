@@ -29,6 +29,19 @@ enum KeyboardLayoutTests {
             let resolved = try ForegroundAction.resolve(part, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] })
             try check(USBShortcut(resolved.shortcut) != nil && resolved.shortcut.accelerator == preset.accelerator, "built-in Claude action resolves to supported USB output: " + preset.id)
         }
+        let claudeCandidates = DesktopActionCatalog.candidates(services: [.claudeDesktop])
+        try check(claudeCandidates.contains { $0.id == "composer.openModelPicker" } && !claudeCandidates.contains { $0.id == "archiveThread" }, "Claude-only candidates exclude Codex-only routes")
+        try check(DesktopActionCatalog.candidates(services: [.claudeTerminal]).isEmpty, "Claude CLI never implies Claude Desktop or Codex support")
+        var disabledRejected = false
+        do {
+            _ = try ForegroundAction.resolve(LayoutPart(kind: .action, x: 0, y: 0, action: "archiveThread"), foreground: CodexNavigator.bundleIdentifier, enabledServices: [.claudeDesktop], bindings: { throw CLIError.runtime("must not read disabled service") })
+        } catch { disabledRejected = String(describing: error).contains("無効") }
+        try check(disabledRejected, "disabled Codex is rejected before resolving a shortcut")
+        disabledRejected = false
+        do {
+            _ = try ForegroundAction.resolve(LayoutPart(kind: .action, x: 0, y: 0, action: "newTask", claudeShortcut: "Command+N"), foreground: NavigationRouter.claudeDesktopBundleIdentifier, enabledServices: [.codex], bindings: { [] })
+        } catch { disabledRejected = String(describing: error).contains("無効") }
+        try check(disabledRejected, "legacy per-button override cannot enable a disabled service")
         let sharedModel = LayoutPart(kind: .action, x: 0, y: 0, action: "composer.openModelPicker")
         let automatic = try ForegroundAction.resolve(sharedModel, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] })
         try check(automatic.shortcut.accelerator == "Command+Shift+I", "one semantic action selects Claude binding without per-button configuration")
@@ -130,6 +143,9 @@ enum KeyboardLayoutTests {
         layout.parts.append(LayoutPart(kind: .action, x: 3, y: 0, action: CodexAction.catalog[0].id))
         let resolved = try bindings.prepared(layout)
         try check(ActionShortcut.forCommand(CodexAction.catalog[0].id, bindings: resolved) != nil, "existing shortcut collision avoided")
+        let disabledBindings = CodexActionBindings(home: dir.appendingPathComponent("disabled-codex").path)
+        try store.apply(layout, bindings: disabledBindings, installCodex: false)
+        try check(!FileManager.default.fileExists(atPath: disabledBindings.url.path), "saving Claude-only service layout never creates Codex bindings")
         let beforeFailure = try Data(contentsOf: bindings.url)
         do { try LayoutStore(path: dir.path).apply(layout, bindings: bindings) } catch {}
         try check(try Data(contentsOf: bindings.url) == beforeFailure, "failed layout save rolls back keymap")

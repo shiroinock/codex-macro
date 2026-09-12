@@ -5,8 +5,9 @@ struct ForegroundAction {
     let bundleIdentifier: String
     let shortcut: CodexKeyboardShortcut
 
-    static func resolve(_ part: LayoutPart, foreground: String?, bindings: () throws -> [[String: Any]]) throws -> Self {
+    static func resolve(_ part: LayoutPart, foreground: String?, enabledServices: Set<SessionSourceKind> = Set(SessionSourceKind.allCases), bindings: () throws -> [[String: Any]]) throws -> Self {
         if foreground == NavigationRouter.claudeDesktopBundleIdentifier {
+            guard enabledServices.contains(.claudeDesktop) else { throw CLIError.runtime("Claude Desktop はサービス設定で無効です") }
             guard let key = part.claudeShortcut ?? DesktopActionCatalog.claudeKey(for: part.action) else {
                 throw CLIError.runtime("この操作の Claude Desktop 向け送信方法は未対応です")
             }
@@ -18,6 +19,7 @@ struct ForegroundAction {
         guard foreground == CodexNavigator.bundleIdentifier else {
             throw CLIError.runtime("Codex または Claude Desktop を前面にしてください")
         }
+        guard enabledServices.contains(.codex) else { throw CLIError.runtime("Codex はサービス設定で無効です") }
         guard DesktopActionCatalog.supportsCodex(part.action) else {
             throw CLIError.runtime("この操作の Codex 向け送信方法は未対応です")
         }

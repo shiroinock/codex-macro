@@ -372,7 +372,7 @@ final class StatusDaemon {
                 if let layout = request.layout {
                     try layout.validate()
                     let bindings = CodexActionBindings(home: codexPaths.home)
-                    try layoutStore.apply(layout, bindings: bindings)
+                    try layoutStore.apply(layout, bindings: bindings, installCodex: enabledSources.contains(.codex))
                     try connection?.cancelKeyboardOutput()
                     hardwareActionProcess = nil
                     keyboardLayout = layout
@@ -1289,7 +1289,7 @@ final class StatusDaemon {
             do {
                 let bindings = CodexActionBindings(home: codexPaths.home)
                 let app = NSWorkspace.shared.frontmostApplication
-                let resolved = try ForegroundAction.resolve(part, foreground: app?.bundleIdentifier, bindings: bindings.read)
+                let resolved = try ForegroundAction.resolve(part, foreground: app?.bundleIdentifier, enabledServices: enabledSources, bindings: bindings.read)
                 guard let process = app?.processIdentifier else { throw CLIError.runtime("前面アプリを取得できません") }
                 let shortcut = resolved.shortcut
                 if let connection, connection.supportsKeyboardOutput {

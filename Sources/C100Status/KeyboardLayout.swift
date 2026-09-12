@@ -111,9 +111,9 @@ struct LayoutStore {
         try layout.validate(); layout.migrateParts(); try layout.validate(); return layout
     }
     /// Both files remain unchanged if persistence fails before the live swap.
-    func apply(_ layout: KeyboardLayout, bindings: CodexActionBindings) throws {
+    func apply(_ layout: KeyboardLayout, bindings: CodexActionBindings, installCodex: Bool = true) throws {
         try layout.validate()
-        guard layout.parts.contains(where: { $0.enabled && $0.kind == .action }) else { try save(layout); return }
+        guard installCodex && layout.parts.contains(where: { $0.enabled && $0.kind == .action && DesktopActionCatalog.supportsCodex($0.action) }) else { try save(layout); return }
         let previousBindings = FileManager.default.fileExists(atPath: bindings.url.path) ? try Data(contentsOf: bindings.url) : nil
         try bindings.install(for: layout)
         do { try save(layout) }

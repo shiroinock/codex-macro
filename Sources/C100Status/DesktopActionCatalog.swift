@@ -22,6 +22,18 @@ enum DesktopActionCatalog {
         CodexAction.catalog.contains { $0.id == id }
     }
 
+    static func supports(_ id: String?, service: SessionSourceKind) -> Bool {
+        switch service {
+        case .codex: return supportsCodex(id)
+        case .claudeDesktop: return claudeKey(for: id) != nil
+        case .claudeHerdr, .claudeTerminal: return false
+        }
+    }
+
+    static func candidates(services: Set<SessionSourceKind>) -> [CodexAction] {
+        catalog.filter { action in services.contains { supports(action.id, service: $0) } }
+    }
+
     static func supportLabel(_ id: String?) -> String {
         let codex = supportsCodex(id), claude = claudeKey(for: id) != nil
         if codex && claude { return "Codex · Claude Desktop（Code）" }

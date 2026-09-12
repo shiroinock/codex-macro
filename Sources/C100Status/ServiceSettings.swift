@@ -3,7 +3,10 @@ import SwiftUI
 
 @MainActor
 final class ServiceSettingsModel: ObservableObject {
-    @Published var configuration = Configuration()
+    @Published var configuration = Configuration() {
+        didSet { onServicesChanged(Set(configuration.enabledServices ?? [])) }
+    }
+    var onServicesChanged: (Set<SessionSourceKind>) -> Void = { _ in }
     @Published var message = "読み込み中…"
     @Published var busy = false
     @Published var loaded = false
