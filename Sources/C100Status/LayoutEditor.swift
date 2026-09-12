@@ -68,7 +68,7 @@ final class LayoutEditorModel: ObservableObject {
         if kind == .tasks, let existing = layout.parts.first(where: { $0.kind == .tasks }) { selected = existing.id; return }
         if kind == .source, let existing = layout.parts.first(where: { $0.kind == .source }) { selected = existing.id; return }
         guard let key = (0..<100).first(where: { layout.part(at: $0) == nil }) else { message = "空きキーがありません。タスクエリアを縮めるか、パーツを無効にしてください"; return }
-        _ = assign(at: key, kind: kind, source: source, direction: direction, action: kind == .action ? CodexAction.catalog[0].id : nil)
+        _ = assign(at: key, kind: kind, source: source, direction: direction, action: kind == .action ? DesktopActionCatalog.catalog[0].id : nil)
     }
     /// Commit a key assignment only after the candidate passes layout validation.
     func assign(at key: Int, kind: LayoutPart.Kind, source: SessionSourceKind?, direction: String?, action: String?, services: [SessionSourceKind] = SessionSourceKind.allCases) -> Bool {
@@ -137,7 +137,7 @@ struct LayoutEditorView: View {
                                 Button(["up":"↑ 上","down":"↓ 下","left":"← 左","right":"→ 右"][dir]!) { model.add(.scroll, direction: dir) }
                             } }
                             Button("サービス切り替え") { model.add(.source) }
-                            Button("Codex アクション") { model.add(.action) }
+                            Button("アクション") { model.add(.action) }
                         }.disabled(model.busy || !model.loaded)
                     }
                     ZStack(alignment: .topLeading) {
@@ -267,31 +267,20 @@ struct LayoutEditorView: View {
                 Button { choosingAction = true } label: {
                     Label("操作を検索・変更…", systemImage: "magnifyingglass")
                 }
-                Text(CodexAction.installed.isEmpty ? "標準の操作一覧を使用中" : "Codex から読み込んだ \(CodexAction.catalog.count) 操作").font(.caption).foregroundStyle(.secondary)
-                Toggle("前面アプリに合わせる", isOn: Binding(get: { part.claudeShortcut != nil }, set: { enabled in
-                    model.update { $0.claudeShortcut = enabled ? (ClaudeDesktopAction.equivalent(to: $0.action)?.accelerator ?? "") : nil }
-                }))
-                if part.claudeShortcut != nil {
-                    Menu("Claude の内蔵操作から選ぶ…") {
-                        ForEach(ClaudeDesktopAction.catalog) { action in
-                            Button(action.title + "  " + ActionShortcutDisplay(accelerator: action.accelerator, dedicated: false).label) {
-                                model.update { $0.claudeShortcut = action.accelerator }
-                            }
+                Text("前面のアプリに応じて、同じ操作の送信キーを自動選択します。").font(.caption).foregroundStyle(.secondary)
+                Text(DesktopActionCatalog.supportLabel(part.action)).font(.caption)
+                GroupBox("Claude Desktop に送信するキー") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let key = part.claudeShortcut ?? DesktopActionCatalog.claudeKey(for: part.action) {
+                            Text(ActionShortcutDisplay(accelerator: key, dedicated: false).label).font(.title2.monospaced().bold())
+                            Text(part.claudeShortcut == nil ? "Code タブ用の内蔵対応" : "以前に保存した手動設定").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("送信方法は未対応です。このアプリが前面のときは実行しません。").font(.caption).foregroundStyle(.secondary)
                         }
-                    }
-                    if let preset = ClaudeDesktopAction.catalog.first(where: { $0.accelerator == part.claudeShortcut }) {
-                        Text(preset.title).font(.caption.bold())
-                    }
-                    Text("内蔵操作は Claude Desktop の Code タブ用です。Chat・Cowork の操作は手動指定してください。").font(.caption).foregroundStyle(.secondary)
-                    TextField("Claude Desktop: Command+N など", text: Binding(get: { part.claudeShortcut ?? "" }, set: { value in
-                        model.update { $0.claudeShortcut = value.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    }))
-                    if let key = part.claudeShortcut, CodexKeyboardShortcut.parse(key, allowUnmodified: true).flatMap(USBShortcut.init) != nil {
-                        Text("Claude Desktop → " + ActionShortcutDisplay(accelerator: key, dedicated: false).label).font(.caption.monospaced())
-                    } else {
-                        Text("Claude 側で同じ役割を持つ操作のキーを入力してください。").font(.caption).foregroundStyle(.orange)
-                    }
-                    Text("Claude の対象タブで使えるキーを指定します。対応する操作がない場合は自動切り替えを OFF にしてください。").font(.caption).foregroundStyle(.secondary)
+                        if part.claudeShortcut != nil {
+                            Button("内蔵の対応に戻す") { model.update { $0.claudeShortcut = nil } }.font(.caption)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
                 }
                 GroupBox("Codex に送信するキー") {
                     VStack(alignment: .leading, spacing: 6) {
@@ -300,15 +289,14 @@ struct LayoutEditorView: View {
                         } else if let shortcut = model.shortcuts[part.action ?? ""] {
                             Text(shortcut.label).font(.system(.title2, design: .monospaced).bold()).textSelection(.enabled)
                             Text(shortcut.dedicated ? "C100 専用ショートカット" : "Codex の既存ショートカット").font(.caption).foregroundStyle(.secondary)
-                            Text(model.hardwareKeyOutput ? "送信元: C100（USB キーボード）" : "送信元: macOS（アクセシビリティ）").font(.caption).foregroundStyle(.secondary)
-                            Text(shortcut.accelerator).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                         } else {
-                            Text("送信キーが未設定です。「保存して反映」で割り当てます。").font(.caption)
+                            Text(DesktopActionCatalog.supportsCodex(part.action) ? "送信キーが未設定です。「保存して反映」で割り当てます。" : "この操作の送信方法は未対応です。").font(.caption)
                         }
                         Button("送信キーを再確認") { model.refreshShortcuts() }.font(.caption)
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
                 }
-                Text(part.claudeShortcut == nil ? "保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。" : "押した瞬間の前面アプリで送信キーを選びます。その他のアプリには送信しません。Codex のキーは本体の設定に追従します。").font(.caption).foregroundStyle(.secondary)
+                Text(model.hardwareKeyOutput ? "送信元: C100（USB キーボード）" : "送信元: macOS（アクセシビリティ）").font(.caption).foregroundStyle(.secondary)
+                Text("キーには操作を1つだけ割り当てます。送信キーの表示は確認用です。その他のアプリには送信しません。").font(.caption).foregroundStyle(.secondary)
                 if !model.hardwareKeyOutput { Button("アクセシビリティ設定を開く") {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                 }.font(.caption) }
@@ -329,14 +317,14 @@ struct CodexActionChooser: View {
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     @FocusState private var searchFocused: Bool
-    private var results: [CodexAction] { Self.search(query, in: CodexAction.catalog) }
+    private var results: [CodexAction] { Self.search(query, in: DesktopActionCatalog.catalog) }
     static func search(_ query: String, in actions: [CodexAction]) -> [CodexAction] {
         let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
         return actions.filter { action in words.allSatisfy { action.title.localizedCaseInsensitiveContains($0) || action.id.localizedCaseInsensitiveContains($0) } }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack { Text("Codex アクションを選択").font(.title3.bold()); Spacer(); Button("閉じる") { dismiss() }.keyboardShortcut(.cancelAction) }
+            HStack { Text("アクションを選択").font(.title3.bold()); Spacer(); Button("閉じる") { dismiss() }.keyboardShortcut(.cancelAction) }
             TextField("操作名やキーワードで検索（例：サイドバー、git、音声）", text: $query)
                 .textFieldStyle(.roundedBorder).focused($searchFocused)
                 .onSubmit { if let first = results.first { choose(first.id) } }
@@ -348,7 +336,7 @@ struct CodexActionChooser: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(action.title).font(.body)
-                                    Text(action.id).font(.caption).foregroundStyle(.secondary)
+                                    Text(DesktopActionCatalog.supportLabel(action.id)).font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if action.id == selected { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
@@ -390,7 +378,7 @@ private struct KeyAssignmentView: View {
             }
             Text("どの機能を割り当てますか？").font(.headline)
             Picker("機能", selection: $kind) {
-                Text("Codex アクション").tag(LayoutPart.Kind.action)
+                Text("アクション").tag(LayoutPart.Kind.action)
                 Text("矢印").tag(LayoutPart.Kind.scroll)
                 Text("サービス切り替え").tag(LayoutPart.Kind.source)
                 Text("タスクエリア").tag(LayoutPart.Kind.tasks)
@@ -398,7 +386,7 @@ private struct KeyAssignmentView: View {
             switch kind {
             case .action:
                 Button { searching = true } label: {
-                    Label(action.flatMap { id in CodexAction.catalog.first { $0.id == id }?.title } ?? "Codex アクションを検索…", systemImage: "magnifyingglass")
+                    Label(action.flatMap { id in DesktopActionCatalog.catalog.first { $0.id == id }?.title } ?? "アクションを検索…", systemImage: "magnifyingglass")
                 }
             case .scroll:
                 Picker("方向", selection: $direction) {

@@ -6,14 +6,20 @@ struct ForegroundAction {
     let shortcut: CodexKeyboardShortcut
 
     static func resolve(_ part: LayoutPart, foreground: String?, bindings: () throws -> [[String: Any]]) throws -> Self {
-        if foreground == NavigationRouter.claudeDesktopBundleIdentifier, let key = part.claudeShortcut {
+        if foreground == NavigationRouter.claudeDesktopBundleIdentifier {
+            guard let key = part.claudeShortcut ?? DesktopActionCatalog.claudeKey(for: part.action) else {
+                throw CLIError.runtime("この操作の Claude Desktop 向け送信方法は未対応です")
+            }
             guard let shortcut = CodexKeyboardShortcut.parse(key, allowUnmodified: true) else {
                 throw CLIError.runtime("Claude Desktop の送信キーが不正です")
             }
             return Self(bundleIdentifier: NavigationRouter.claudeDesktopBundleIdentifier, shortcut: shortcut)
         }
         guard foreground == CodexNavigator.bundleIdentifier else {
-            throw CLIError.runtime(part.claudeShortcut == nil ? "Codex / ChatGPT を前面にしてください" : "Codex または Claude Desktop を前面にしてください")
+            throw CLIError.runtime("Codex または Claude Desktop を前面にしてください")
+        }
+        guard DesktopActionCatalog.supportsCodex(part.action) else {
+            throw CLIError.runtime("この操作の Codex 向け送信方法は未対応です")
         }
         guard let id = part.action, let shortcut = CodexKeyboardShortcut.forCommand(id, bindings: try bindings()) else {
             throw CLIError.runtime("Codex の送信キーが未設定です。レイアウトを再適用してください")

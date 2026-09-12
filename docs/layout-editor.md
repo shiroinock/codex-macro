@@ -89,34 +89,25 @@ to a USB HID usage and modifiers. It authorizes physical presses only while Code
 is foreground and revokes pending output when it observes another foreground app.
 
 
-### Foreground app routing
+### Shared actions and foreground app routing
 
-An action button can opt into **前面アプリに合わせる**. Set the equivalent
-Claude Desktop shortcut on that button (for example `Command+N`, `Control+Tab`,
-or `Escape`, only where the target Claude tab supports that operation). Codex
-continues to resolve its actual configured binding. Claude's mapping is explicit:
-we do not infer equivalence or copy Codex shortcuts into Claude. The inspector
-shows both keys, and the daemon logs the selected recipient and accelerator.
-The optional `claudeShortcut` layout field preserves Codex-only behavior when
-absent; changing the selected operation clears the old Claude mapping.
+Assign one semantic action, such as **タスクをアーカイブ** or **モデル選択**,
+to a button. The foreground app selects the internal binding. There is no
+per-button app selector or second action to configure. The inspector shows the
+resolved keys and support status for both apps. Model selection, for example,
+uses Codex's configured binding (normally Control+Shift+M) and Command+Shift+I
+in Claude Desktop's Code tab. The selected service layer is independent.
 
-The foreground process at the physical press selects the recipient, independently
-of the task/service layer. Other apps receive no action. A process change during
-USB configuration cancels the press, including a switch between Codex and Claude.
-The firmware is unchanged and the hardware path needs no Accessibility access.
-Claude mappings can contain a single key or modified key, but not multi-step
-chords. Empty/invalid mappings prevent saving. Claude shortcuts depend on the tab;
-see the [official Code tab shortcuts](https://code.claude.com/docs/en/desktop#keyboard-shortcuts).
-Physical verification in Claude remains pending because Claude Desktop is not
-installed in this machine's standard application directories.
+`DesktopActionCatalog` unifies the action list; existing Codex action IDs stay
+stable and Claude-only operations use `desktop.*` IDs. App-specific mappings
+remain in the internal catalogs. Unsupported routes fail explicitly without
+sending keys. Claude archive exists as a feature, but its keyboard execution
+route is not established, so it is marked unsupported rather than mapped to
+closing a session. The official [Code tab shortcut list](https://code.claude.com/docs/en/desktop#keyboard-shortcuts)
+is the source for bundled Claude bindings; Chat/Cowork are not covered.
 
-
-The inspector now includes 16 built-in **Claude Desktop Code tab** operations,
-selectable by name, with their outgoing keys shown. Enabling foreground routing
-prefills the matching operation for `newTask`, `composer.openModelPicker`, and
-`toggleTerminal`. Other operations require explicit selection; archive is not
-mapped to closing a session. Chat/Cowork bindings are not inferred from Code-tab
-documentation. Manual overrides remain available. Presets store their resolved
-accelerator in the existing `claudeShortcut` field, so existing layouts and
-custom mappings retain their behavior without migration. The catalog is bundled,
-not scraped from a locally installed Claude app.
+Legacy `claudeShortcut` overrides remain effective to avoid silently changing
+saved behavior, are displayed as legacy settings, and can be reset to the built-in
+mapping. New assignments store only the action ID. The hardware transport and
+foreground process recheck are unchanged. All self-tests pass; physical Claude
+validation and a working Claude archive execution route remain pending.

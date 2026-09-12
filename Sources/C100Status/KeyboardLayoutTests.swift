@@ -29,6 +29,15 @@ enum KeyboardLayoutTests {
             let resolved = try ForegroundAction.resolve(part, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] })
             try check(USBShortcut(resolved.shortcut) != nil && resolved.shortcut.accelerator == preset.accelerator, "built-in Claude action resolves to supported USB output: " + preset.id)
         }
+        let sharedModel = LayoutPart(kind: .action, x: 0, y: 0, action: "composer.openModelPicker")
+        let automatic = try ForegroundAction.resolve(sharedModel, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] })
+        try check(automatic.shortcut.accelerator == "Command+Shift+I", "one semantic action selects Claude binding without per-button configuration")
+        let codexModel = try ForegroundAction.resolve(sharedModel, foreground: CodexNavigator.bundleIdentifier, bindings: { [["command": "composer.openModelPicker", "key": "Control+Shift+M"]] })
+        try check(codexModel.shortcut.accelerator == "Control+Shift+M", "same semantic action selects a different Codex key")
+        let stop = LayoutPart(kind: .action, x: 0, y: 0, action: "desktop.stopResponse")
+        try KeyboardLayout(parts: [stop]).validate()
+        try check(try ForegroundAction.resolve(stop, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { [] }).shortcut.accelerator == "Escape", "Claude-only semantic action is assignable")
+        try check(Set(DesktopActionCatalog.catalog.map(\.id)).count == DesktopActionCatalog.catalog.count, "semantic action IDs are unique")
         var adaptive = LayoutPart(kind: .action, x: 0, y: 0, action: "archiveThread", claudeShortcut: "Control+Tab")
         let claude = try ForegroundAction.resolve(adaptive, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { throw CLIError.runtime("must not read Codex settings for Claude") })
         try check(claude.shortcut.keyCode == 48 && claude.shortcut.flags == [.maskControl], "foreground Claude selects explicitly configured mapping without Codex settings")
@@ -42,7 +51,7 @@ enum KeyboardLayoutTests {
         adaptive.claudeShortcut = nil
         var rejected = false
         do { _ = try ForegroundAction.resolve(adaptive, foreground: NavigationRouter.claudeDesktopBundleIdentifier, bindings: { archiveBindings }) } catch { rejected = true }
-        try check(rejected, "legacy Codex-only action stays inactive in Claude")
+        try check(rejected, "unsupported Claude archive never sends an unrelated shortcut")
         adaptive.claudeShortcut = "Escape"
         try KeyboardLayout(parts: [adaptive]).validate()
         try check(try JSONDecoder().decode(LayoutPart.self, from: JSONEncoder().encode(adaptive)) == adaptive, "per-button foreground mapping survives persistence")

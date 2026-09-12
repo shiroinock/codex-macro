@@ -14,7 +14,7 @@ struct LayoutPart: Codable, Equatable, Identifiable {
     var source: SessionSourceKind?
     var services: [SessionSourceKind]?
     var action: String?
-    /// nil preserves Codex-only behavior; a value opts into foreground routing.
+    /// Legacy explicit override; nil uses the shared action catalog.
     var claudeShortcut: String?
 
     var title: String {
@@ -22,7 +22,7 @@ struct LayoutPart: Codable, Equatable, Identifiable {
         case .tasks: return "タスクエリア"
         case .scroll: return ["up": "↑", "down": "↓", "left": "←", "right": "→"][direction ?? ""] ?? "矢印"
         case .source: return "サービス切り替え"
-        case .action: return CodexAction.catalog.first { $0.id == action }?.title ?? "アクション"
+        case .action: return DesktopActionCatalog.catalog.first { $0.id == action }?.title ?? "アクション"
         }
     }
     var selectedServices: [SessionSourceKind] { services ?? source.map { [$0] } ?? [] }
@@ -70,7 +70,7 @@ struct KeyboardLayout: Codable, Equatable {
                 try require(part.selectedServices.count <= part.width * part.height, "サービス数に合わせてパーツの幅・高さを広げてください")
                 for source in part.selectedServices { try require(sources.insert(source).inserted, "同じサービスは1つまで配置できます") }
             case .action:
-                try require(CodexAction.catalog.contains { $0.id == part.action }, "アクションを選んでください")
+                try require(DesktopActionCatalog.catalog.contains { $0.id == part.action }, "アクションを選んでください")
                 if let key = part.claudeShortcut {
                     try require(CodexKeyboardShortcut.parse(key, allowUnmodified: true).flatMap(USBShortcut.init) != nil, "Claude Desktop の送信キーを指定してください（例: Command+N、Escape）")
                 }
