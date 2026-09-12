@@ -1,8 +1,9 @@
 # C100 companion firmware (experimental)
 
 A dedicated task controller for the **Keychron C100 8K, VID 3434 / PID 042c**.
-Normal keyboard output is suppressed at all times, including when the daemon
-is absent. The host receives debounced physical matrix snapshots over Raw HID.
+Physical switches do not emit ordinary keyboard input automatically. With the
+keyboard-output extension, the daemon can authorize a mapped shortcut after a
+physical press; without the daemon the switches remain silent. The host receives debounced physical matrix snapshots over Raw HID.
 The existing stock-firmware daemon remains the default; select this backend
 explicitly with `run --companion` after flashing. When moving this flashed
 keyboard to another machine, update that machine's daemon and enable
@@ -55,10 +56,13 @@ Replies use `command | 80` and echo the request sequence. Payload starts at byte
 | `03` | Stage HSV colors: start index, count 1–7, then H/S/V triples. A chunk at index 0 begins a new frame. |
 | `04` | Commit only if all 100 colors have been staged. Partial frames never change the displayed frame. |
 | `05` | Release control, clear display and staging buffers. |
+| `06` | Keyboard extension: configure RAM slot (index, USB modifier byte, keyboard usage). Usage zero clears a slot. |
+| `07` | Keyboard extension: authorize one tap of a configured slot after a fresh physical press. |
+| `08` | Keyboard extension: release held output, clear queued taps and RAM assignments. |
 | `40` | Unsolicited full matrix bitmap on change; byte 6 is an event counter. |
 
 Status values: `0` success, `1` malformed/unsupported, `2` inactive,
-`3` incomplete frame. Bitmap index is `row * 10 + column`; bit zero is the
+`3` incomplete frame, `4` keyboard queue full, `5` no fresh physical press. Bitmap index is `row * 10 + column`; bit zero is the
 low bit of each byte. Unused high bits of the last bitmap byte are zero.
 HSV uses the existing host's 0–255 scale. The renderer maps physical positions
 through QMK's LED map and respects each key's value, including zero.
@@ -71,6 +75,22 @@ Startup-held keys are seeded without navigating them. A lost watchdog causes the
 host to exit so a restart can repaint the entire display; it does not silently
 keep a stale frame cache. A per-user, per-location lock prevents this backend's
 watcher and daemon from controlling the same device simultaneously.
+
+The optional keyboard-output extension advertises version `1` in capability
+reply byte 12; older firmware returns zero and the host retains its software
+shortcut path. Slot configuration is lazy on the first press or a changed
+shortcut, and cached until a revoke/reconnect. The host resolves current Codex
+bindings, verifies Codex is foreground, configures the slot, rechecks foreground,
+and authorizes that slot. Physical presses alone never send ordinary keys.
+Each authorization consumes one physical press ticket no older than 500 ms;
+replayed commands cannot mint new tickets. The queue is bounded to eight taps,
+with 20 ms down and at least 5 ms release between taps. Overflow is reported.
+Leaving Codex's foreground cancels output at the next daemon input poll; as with
+ordinary keyboards, focus changes at the instant of delivery can race input.
+Release, watchdog expiry and USB suspend cancel held output and queued taps,
+forget mappings and invalidate tickets. No EEPROM writes are used. New mappings
+are re-established by the daemon as needed. This path needs no macOS synthetic
+keyboard/Accessibility permission; it still needs the existing USB connection.
 
 After 3 seconds without a heartbeat or valid color/commit operation, the device
 blacks out. It continues suppressing keyboard input. Suspend follows QMK's RGB

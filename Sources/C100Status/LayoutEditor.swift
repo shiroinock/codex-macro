@@ -9,6 +9,7 @@ final class LayoutEditorModel: ObservableObject {
     @Published var busy = false
     @Published var loaded = false
     @Published var shortcuts: [String: ActionShortcutDisplay] = [:]
+    @Published var hardwareKeyOutput = false
     @Published var shortcutError: String? = "読み込み中…"
     private var refreshingShortcuts = false
     func refreshShortcuts() {
@@ -20,6 +21,9 @@ final class LayoutEditorModel: ObservableObject {
                 let text = try await execute(["layout", "shortcuts"])
                 shortcuts = try JSONDecoder().decode([String: ActionShortcutDisplay].self, from: Data(text.utf8))
                 shortcutError = nil
+                if let status = try? await execute(["inspect"]), let data = status.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    hardwareKeyOutput = object["actionTransport"] as? String == "keyboard-hid"
+                }
             } catch { shortcuts = [:]; shortcutError = "送信キーを確認できません: \(error)" }
         }
     }
@@ -270,6 +274,7 @@ struct LayoutEditorView: View {
                         } else if let shortcut = model.shortcuts[part.action ?? ""] {
                             Text(shortcut.label).font(.system(.title2, design: .monospaced).bold()).textSelection(.enabled)
                             Text(shortcut.dedicated ? "C100 専用ショートカット" : "Codex の既存ショートカット").font(.caption).foregroundStyle(.secondary)
+                            Text(model.hardwareKeyOutput ? "送信元: C100（USB キーボード）" : "送信元: macOS（アクセシビリティ）").font(.caption).foregroundStyle(.secondary)
                             Text(shortcut.accelerator).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                         } else {
                             Text("送信キーが未設定です。「保存して反映」で割り当てます。").font(.caption)
@@ -278,9 +283,9 @@ struct LayoutEditorView: View {
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
                 }
                 Text("保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。").font(.caption).foregroundStyle(.secondary)
-                Button("アクセシビリティ設定を開く") {
+                if !model.hardwareKeyOutput { Button("アクセシビリティ設定を開く") {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }.font(.caption)
+                }.font(.caption) }
             }
             Button("パーツを削除", role: .destructive) { model.remove() }
         }

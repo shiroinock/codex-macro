@@ -60,6 +60,7 @@ final class StatusDaemon {
     /// on keys 0-79. Loaded from `layerStore` at startup (defaults to
     /// `.claudeHerdr`) and persisted every time it changes so a daemon
     /// restart resumes on the same layer.
+    private var hardwareActionArmed = false
     private var activeLayer: SessionSourceKind = LayerSelectionStore.defaultLayer
     private let layerStore = LayerSelectionStore()
     /// Colors last written to the 4 layer keys (90-93), so the ~600ms blink
@@ -372,6 +373,8 @@ final class StatusDaemon {
                     try layout.validate()
                     let bindings = CodexActionBindings(home: codexPaths.home)
                     try layoutStore.apply(layout, bindings: bindings)
+                    try connection?.cancelKeyboardOutput()
+                    hardwareActionArmed = false
                     keyboardLayout = layout
                     herdrCatalog.setEnabled(enabledSources.contains(.claudeHerdr))
                     claudeSessions = claudeSessions.filter { enabledSources.contains($0.value.sourceKind) }
@@ -398,6 +401,7 @@ final class StatusDaemon {
                 let info: [String: Any] = ["connected": connection != nil, "backend": companion ? "companion" : "stock", "layer": activeLayer.rawValue, "brightness": brightnessPercent,
                     "topRow": viewport.topRow, "leftColumn": viewport.leftColumn, "viewportRows": viewport.rowCount, "viewportColumns": viewport.columnCount,
                     "enabledSources": enabledSources.map(\.rawValue).sorted(), "actionError": actionError ?? "",
+                    "actionTransport": connection?.supportsKeyboardOutput == true ? "keyboard-hid" : "accessibility",
                     "accessibilityTrusted": AXIsProcessTrusted(), "layoutPath": layoutStore.path,
                     "projectRows": virtualProjects[activeLayer] ?? [:],
                     "visible": visible.map { ["key": $0.key, "sessionID": $0.sessionID, "project": $0.slot.projectKey, "column": $0.slot.column, "status": $0.slot.status.rawValue] as [String: Any] }]
@@ -1252,6 +1256,10 @@ final class StatusDaemon {
         guard let connection else {
             throw CLIError.runtime("C100 vendor HID connection is unavailable during matrix polling")
         }
+        if hardwareActionArmed && NSWorkspace.shared.frontmostApplication?.bundleIdentifier != CodexNavigator.bundleIdentifier {
+            try connection.cancelKeyboardOutput()
+            hardwareActionArmed = false
+        }
         let states = companion ? try connection.drainCompanionStates() : [try connection.pressedKeyIndexes(protocolVersion: protocolVersion)]
         for current in states {
             let newlyPressed = current.subtracting(pressedKeyIndexes)
@@ -1279,9 +1287,24 @@ final class StatusDaemon {
             return
         case .action:
             do {
-                let shortcut = try CodexActionBindings(home: codexPaths.home).execute(part.action!)
+                let bindings = CodexActionBindings(home: codexPaths.home)
+                if let connection, connection.supportsKeyboardOutput {
+                    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == CodexNavigator.bundleIdentifier else { throw CLIError.runtime("アクションを実行するには Codex / ChatGPT を前面にしてください") }
+                    guard let shortcut = CodexKeyboardShortcut.forCommand(part.action!, bindings: try bindings.read()), let usb = USBShortcut(shortcut) else { throw CLIError.runtime("送信できる USB ショートカットがありません。レイアウトを再適用してください") }
+                    try connection.configureShortcut(key: keyIndex, shortcut: usb)
+                    hardwareActionArmed = true
+                    // Recheck after the USB configuration round trip.
+                    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == CodexNavigator.bundleIdentifier else {
+                        try connection.cancelKeyboardOutput(); hardwareActionArmed = false
+                        throw CLIError.runtime("Codex が前面ではなくなったため送信を中止しました")
+                    }
+                    try connection.tapShortcut(key: keyIndex)
+                    logger.log(.info, "action key_queued id=\(part.action!) shortcut=\(shortcut.accelerator) route=keyboard-hid execution=unconfirmed")
+                } else {
+                    let shortcut = try bindings.execute(part.action!)
+                    logger.log(.info, "action key_posted id=\(part.action!) shortcut=\(shortcut) route=session execution=unconfirmed")
+                }
                 actionError = nil
-                logger.log(.info, "action key_posted id=\(part.action!) shortcut=\(shortcut) route=session execution=unconfirmed")
             } catch {
                 actionError = String(describing: error)
                 logger.log(.error, "action failed id=\(part.action!) error=\(error)")

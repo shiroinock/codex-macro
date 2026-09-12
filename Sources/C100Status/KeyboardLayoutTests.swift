@@ -13,6 +13,9 @@ enum KeyboardLayoutTests {
         let archiveBindings: [[String: Any]] = [["command": "archiveThread", "key": "CmdOrCtrl+Shift+A"], ["command": "archiveThread", "key": "Control+F13"]]
         let archive = CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings, characterCode: { $0 == "a" ? 0 : nil })
         try check(archive?.keyCode == 0 && archive?.flags == [.maskCommand, .maskShift], "use existing archive shortcut before dedicated alias")
+        try check(archive.flatMap(USBShortcut.init)?.usage == 4 && archive.flatMap(USBShortcut.init)?.modifiers == 10, "archive maps to USB A plus GUI and Shift")
+        let f13 = CodexKeyboardShortcut.parse("Control+F13").flatMap(USBShortcut.init)
+        try check(f13?.usage == 104 && f13?.modifiers == 1, "function flag does not become a USB modifier")
         let conflictBindings = archiveBindings + [["command": "other", "key": "Command+Shift+A"]]
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: conflictBindings, characterCode: { _ in 0 })?.keyCode == 105, "conflicting primary shortcut falls back to isolated alias")
         try check(CodexKeyboardShortcut.forCommand("archiveThread", bindings: archiveBindings + [["command": "archiveThread", "key": NSNull()]]) == nil, "disabled command is never dispatched")

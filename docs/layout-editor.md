@@ -78,3 +78,12 @@ execution use `CodexKeyboardShortcut.forCommand`; viewing the setting never send
 keys. The editor refreshes on load and after saving; use the refresh button after
 changing Codex's keybindings externally. Missing mappings and read errors are
 shown explicitly rather than presenting defaults as an actual binding.
+
+
+With keyboard-output firmware, the inspector labels the sender `C100（USB
+キーボード）` and hides the Accessibility shortcut. The daemon's `inspect` returns
+`actionTransport: keyboard-hid`. Older firmware retains the software sender and
+its permission requirement. Shortcut resolution and displayed key are shared
+between the transports; the hardware path additionally converts the virtual key
+to a USB HID usage and modifiers. It authorizes physical presses only while Codex
+is foreground and revokes pending output when it observes another foreground app.

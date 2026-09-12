@@ -8,6 +8,9 @@ enum CompanionProtocol {
     static let colors: UInt8 = 3
     static let commit: UInt8 = 4
     static let release: UInt8 = 5
+    static let shortcut: UInt8 = 6
+    static let tap: UInt8 = 7
+    static let cancelOutput: UInt8 = 8
     static let state: UInt8 = 0x40
 
     static func report(_ command: UInt8, sequence: UInt8, payload: [UInt8] = []) -> [UInt8] {
@@ -58,5 +61,33 @@ enum CompanionProtocol {
             _ = try pressedKeys(bitmap[...])
         } catch { return }
         throw CLIError.runtime("Companion accepted an invalid bitmap")
+    }
+}
+
+
+struct USBShortcut: Equatable {
+    let modifiers: UInt8
+    let usage: UInt8
+    init?(_ shortcut: CodexKeyboardShortcut) {
+        // macOS virtual key codes -> USB HID Keyboard/Keypad usage IDs.
+        let usages: [UInt16: UInt8] = [
+            0:4, 11:5, 8:6, 2:7, 14:8, 3:9, 5:10, 4:11, 34:12,
+            38:13, 40:14, 37:15, 46:16, 45:17, 31:18, 35:19, 12:20,
+            15:21, 1:22, 17:23, 32:24, 9:25, 13:26, 7:27, 16:28, 6:29,
+            18:30, 19:31, 20:32, 21:33, 23:34, 22:35, 26:36, 28:37, 25:38, 29:39,
+            36:40, 53:41, 51:42, 48:43, 49:44, 27:45, 24:46, 33:47, 30:48,
+            42:49, 41:51, 39:52, 50:53, 43:54, 47:55, 44:56,
+            122:58, 120:59, 99:60, 118:61, 96:62, 97:63, 98:64, 100:65,
+            101:66, 109:67, 103:68, 111:69, 124:79, 123:80, 125:81, 126:82,
+            105:104, 107:105, 113:106, 106:107, 64:108, 79:109, 80:110, 90:111
+        ]
+        guard let usage = usages[shortcut.keyCode] else { return nil }
+        self.usage = usage
+        var modifiers: UInt8 = 0
+        if shortcut.flags.contains(.maskControl) { modifiers |= 1 }
+        if shortcut.flags.contains(.maskShift) { modifiers |= 2 }
+        if shortcut.flags.contains(.maskAlternate) { modifiers |= 4 }
+        if shortcut.flags.contains(.maskCommand) { modifiers |= 8 }
+        self.modifiers = modifiers
     }
 }

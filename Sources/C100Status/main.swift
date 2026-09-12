@@ -144,7 +144,7 @@ enum C100StatusCLI {
         case "companion-info":
             let connection = try C100Connection.connect(locationID: options.locationID)
             try connection.checkCompanion()
-            print("companion protocol=1 layout=10x10 input=suppressed events=enabled hsv=per_key watchdog=3s")
+            print("companion protocol=1 layout=10x10 input=suppressed events=enabled hsv=per_key watchdog=3s keyboard_output=\(connection.supportsKeyboardOutput)")
         case "companion-test":
             let seconds = positionals.first.flatMap(Double.init) ?? 45
             guard seconds > 0 && seconds <= 300 else {

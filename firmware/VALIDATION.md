@@ -43,3 +43,21 @@ already completed successfully.
 Not tested in this run: physical unplug/replug while the daemon is active,
 sleep/wake, other Macs/OS versions, and a fresh macOS privacy-permission profile.
 No new lifecycle hooks were installed as part of this firmware validation.
+
+## Keyboard-output extension — 2026-09-13
+
+- Firmware and host release builds succeeded; firmware handler tests and the
+  full host self-test suite passed.
+- Saved the pre-update 262,144-byte flash separately. Original-device backup
+  remains untouched.
+- Flashed `keyboard-output-v1.bin` and read back 61,036 payload bytes; exact
+  equality was verified against the binary excluding its 16-byte DFU suffix.
+- Device returned to normal USB mode and reported keyboard-output extension v1.
+- Updated daemon reports `actionTransport=keyboard-hid`, `connected=true`, and
+  `accessibilityTrusted=false`.
+- Physical archive execution without Accessibility is pending user validation.
+  Queue/release/revoke/suspend/ticket expiry behavior is covered by firmware
+  tests; real unplug/suspend during an active output pulse remains untested.
+
+Evidence: ignored `firmware/build/keyboard-output-*` files and
+`pre-keyboard-output-flash.bin`. The manifest records image/readback/backup hashes.

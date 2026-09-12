@@ -52,6 +52,8 @@ final class C100Connection {
     private var reportObserver: (([UInt8]) -> Void)?
     private var cachedLedCount: Int?
     private(set) var isCompanion = false
+    private(set) var supportsKeyboardOutput = false
+    private var shortcutCache: [Int: USBShortcut] = [:]
     private var companionSequence: UInt8 = 0
     private var companionLock: DaemonInstanceLock?
     private var companionStates: [Set<Int>] = []
@@ -358,15 +360,35 @@ final class C100Connection {
 
     func checkCompanion() throws {
         let reply = try companionRequest(CompanionProtocol.hello)
+        supportsKeyboardOutput = reply[12] == 1
         guard Array(reply[8..<12]) == [10, 10, 7, 3] else {
             throw CLIError.runtime("Incompatible companion capabilities; expected 10x10, input suppression, events, HSV and 3s watchdog")
         }
+    }
+
+    func configureShortcut(key: Int, shortcut: USBShortcut) throws {
+        guard supportsKeyboardOutput, (0..<100).contains(key) else { throw CLIError.runtime("Firmware keyboard output is unavailable") }
+        if shortcutCache[key] == shortcut { return }
+        _ = try companionRequest(CompanionProtocol.shortcut, payload: [UInt8(key), shortcut.modifiers, shortcut.usage])
+        shortcutCache[key] = shortcut
+    }
+
+    func tapShortcut(key: Int) throws {
+        guard supportsKeyboardOutput, shortcutCache[key] != nil else { throw CLIError.runtime("Firmware shortcut is not configured") }
+        _ = try companionRequest(CompanionProtocol.tap, payload: [UInt8(key)])
+    }
+
+    func cancelKeyboardOutput() throws {
+        guard supportsKeyboardOutput else { return }
+        _ = try companionRequest(CompanionProtocol.cancelOutput)
+        shortcutCache.removeAll()
     }
 
     private func startCompanion() throws {
         companionLock = try DaemonInstanceLock(socketPath: "/tmp/c100-companion-\(getuid())-\(locationID)")
         try checkCompanion()
         isCompanion = true
+        try cancelKeyboardOutput()
         // Seed held keys without navigating them at startup.
         let snapshot = try companionRequest(CompanionProtocol.heartbeat)
         companionStates = [try CompanionProtocol.pressedKeys(snapshot[8..<21])]

@@ -6,7 +6,11 @@
 static uint32_t now;
 static matrix_row_t rows[10];
 static uint8_t reply[32];
-static unsigned sends;
+static unsigned sends, key_downs;
+static uint8_t output_mods, output_key;
+void clear_keyboard(void) { output_mods = output_key = 0; }
+void register_mods(uint8_t mods) { output_mods = mods; }
+void register_code(uint8_t key) { output_key = key; ++key_downs; }
 struct led_config g_led_config;
 matrix_row_t matrix_get_row(uint8_t row) { return rows[row]; }
 uint32_t timer_read32(void) { return now; }
@@ -27,6 +31,11 @@ static void command(uint8_t op) {
 static void dispatch(void) {
     assert(c100_companion_receive(request, 32));
     assert(reply[5] == (request[5] | 0x80) && reply[6] == 123);
+}
+static void physical_tap(uint8_t index) {
+    rows[index/10] &= ~(1 << (index%10)); matrix_scan_user();
+    rows[index/10] |= 1 << (index%10); matrix_scan_user();
+    rows[index/10] &= ~(1 << (index%10)); matrix_scan_user();
 }
 static void full_frame(uint8_t value) {
     for (int start = 0; start < 100; start += 7) {
@@ -63,5 +72,31 @@ int main(void) {
     command(5); dispatch(); assert(!active);
     now = UINT32_MAX - 100; command(2); dispatch();
     now = 2900; matrix_scan_user(); assert(!active); // watchdog handles timer wrap
-    puts("firmware tests passed: handshake, bounds, atomic frames, input, blackout, watchdog, timer wrap");
+    command(6); request[8] = 90; request[9] = 10; request[10] = 4; dispatch(); assert(reply[7] == 2);
+    command(2); dispatch();
+    command(6); request[8] = 100; dispatch(); assert(reply[7] == 1);
+    command(6); request[8] = 90; request[9] = 10; request[10] = 4; dispatch(); assert(reply[7] == 0);
+    // Physical presses alone never emit normal keyboard reports.
+    now += 10; rows[9] = 1; matrix_scan_user(); assert(key_downs == 0);
+    command(7); request[8] = 90; dispatch(); matrix_scan_user(); assert(output_mods == 10 && output_key == 4);
+    now += 20; matrix_scan_user(); assert(!output_key && !output_mods);
+    // Two authorized taps of the same key have a release gap.
+    physical_tap(90); physical_tap(90);
+    command(7); request[8] = 90; dispatch(); dispatch();
+    now += 5; matrix_scan_user(); assert(output_key == 4);
+    now += 20; matrix_scan_user(); assert(!output_key);
+    now += 5; matrix_scan_user(); assert(output_key == 4);
+    command(8); dispatch(); assert(!output_key && !output_mods && !pending_count);
+    command(7); request[8] = 90; dispatch(); assert(reply[7] == 1);
+    command(6); request[8] = 90; request[9] = 10; request[10] = 4; dispatch();
+    command(7); request[8] = 90; dispatch(); assert(reply[7] == 5); // no physical authorization
+    for (int i=0; i<8; ++i) physical_tap(90);
+    command(7); request[8] = 90; for (int i=0; i<8; ++i) dispatch(); dispatch(); assert(reply[7] == 4);
+    now += 3000; matrix_scan_user(); assert(!active && !output_key && !pending_count && !shortcuts[90].key);
+    command(2); dispatch();
+    command(6); request[8] = 90; request[9] = 10; request[10] = 4; dispatch();
+    physical_tap(90); now += 501;
+    command(7); request[8] = 90; dispatch(); assert(reply[7] == 5);
+    suspend_power_down_user(); assert(!active && !output_key);
+    puts("firmware tests passed: keyboard mapping, physical press tickets, tap release, cancel, queue bounds, suspend, handshake, bounds, atomic frames, input, blackout, watchdog, timer wrap");
 }

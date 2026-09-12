@@ -21,3 +21,7 @@ void rgb_matrix_mode_noeeprom(uint8_t mode);
 void rgb_matrix_sethsv_noeeprom(uint8_t h, uint8_t s, uint8_t v);
 void rgb_matrix_set_color(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 RGB hsv_to_rgb(HSV color);
+
+void clear_keyboard(void);
+void register_mods(uint8_t mods);
+void register_code(uint8_t key);
