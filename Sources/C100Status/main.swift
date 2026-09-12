@@ -76,6 +76,11 @@ enum C100StatusCLI {
         switch command {
         case "layout":
             let operation = positionals.first ?? "show"
+            if operation == "shortcuts" {
+                let values = try ActionShortcutDisplay.read(home: options.codexPaths.home)
+                FileHandle.standardOutput.write(try JSONEncoder().encode(values))
+                return
+            }
             if operation == "actions" {
                 let values = CodexAction.catalog.map { ["id": $0.id, "title": $0.title, "shortcuts": $0.defaults] as [String: Any] }
                 print(String(decoding: try JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
@@ -84,7 +89,7 @@ enum C100StatusCLI {
             if operation == "preview" {
                 guard (2...3).contains(positionals.count) else { throw CLIError.usage("layout preview OUTPUT.png [layout|services|search|assignment]") }
                 let layout = try LayoutStore(path: options.layoutPath).load()
-                try MainActor.assumeIsolated { try LayoutEditorWindow.render(layout, path: positionals[1], mode: positionals.count == 3 ? positionals[2] : "layout") }
+                try MainActor.assumeIsolated { try LayoutEditorWindow.render(layout, path: positionals[1], mode: positionals.count == 3 ? positionals[2] : "layout", codexHome: options.codexPaths.home) }
                 return
             }
             var request = DaemonRequest(kind: .layout, hook: nil, status: nil, keyIndex: nil, color: nil)

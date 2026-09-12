@@ -70,3 +70,11 @@ hash that changes on rebuild. Updating it can invalidate Accessibility permissio
 If the daemon reports untrusted despite the Settings switch being on, removing
 and re-adding the installed app can restore it. Avoid reinstalling an unchanged
 validated build. A stable signing identity remains a separate deployment issue.
+
+The action inspector shows the resolved outgoing shortcut (for example `⌘⇧A`),
+its accelerator string, and whether it is an existing Codex shortcut or a C100
+alias. `layout shortcuts` exposes the same read-only data. Both the display and
+execution use `CodexKeyboardShortcut.forCommand`; viewing the setting never sends
+keys. The editor refreshes on load and after saving; use the refresh button after
+changing Codex's keybindings externally. Missing mappings and read errors are
+shown explicitly rather than presenting defaults as an actual binding.

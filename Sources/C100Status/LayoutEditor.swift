@@ -8,6 +8,21 @@ final class LayoutEditorModel: ObservableObject {
     @Published var message = "読み込み中…"
     @Published var busy = false
     @Published var loaded = false
+    @Published var shortcuts: [String: ActionShortcutDisplay] = [:]
+    @Published var shortcutError: String? = "読み込み中…"
+    private var refreshingShortcuts = false
+    func refreshShortcuts() {
+        guard !refreshingShortcuts else { return }
+        refreshingShortcuts = true
+        Task {
+            defer { refreshingShortcuts = false }
+            do {
+                let text = try await execute(["layout", "shortcuts"])
+                shortcuts = try JSONDecoder().decode([String: ActionShortcutDisplay].self, from: Data(text.utf8))
+                shortcutError = nil
+            } catch { shortcuts = [:]; shortcutError = "送信キーを確認できません: \(error)" }
+        }
+    }
     private var saved = KeyboardLayout.standard
     private let execute: ([String]) async throws -> String
     init(execute: @escaping ([String]) async throws -> String) { self.execute = execute }
@@ -20,6 +35,7 @@ final class LayoutEditorModel: ObservableObject {
                 let data = try await execute(["layout", "show"])
                 layout = try JSONDecoder().decode(KeyboardLayout.self, from: Data(data.utf8))
                 layout.migrateParts()
+                refreshShortcuts()
                 saved = layout; selected = layout.parts.first?.id; loaded = true; message = "パーツを選び、ドラッグで移動できます"
             } catch { message = String(describing: error) }
             busy = false
@@ -35,6 +51,7 @@ final class LayoutEditorModel: ObservableObject {
             do {
                 try snapshot.json().write(to: url, options: .atomic)
                 _ = try await execute(["layout", "apply", url.path])
+                refreshShortcuts()
                 saved = snapshot; message = "保存して C100 に反映しました"
             } catch { message = String(describing: error) }
         }
@@ -246,6 +263,20 @@ struct LayoutEditorView: View {
                     Label("操作を検索・変更…", systemImage: "magnifyingglass")
                 }
                 Text(CodexAction.installed.isEmpty ? "標準の操作一覧を使用中" : "Codex から読み込んだ \(CodexAction.catalog.count) 操作").font(.caption).foregroundStyle(.secondary)
+                GroupBox("送信するキー") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let error = model.shortcutError {
+                            Text(error).font(.caption).foregroundStyle(.secondary)
+                        } else if let shortcut = model.shortcuts[part.action ?? ""] {
+                            Text(shortcut.label).font(.system(.title2, design: .monospaced).bold()).textSelection(.enabled)
+                            Text(shortcut.dedicated ? "C100 専用ショートカット" : "Codex の既存ショートカット").font(.caption).foregroundStyle(.secondary)
+                            Text(shortcut.accelerator).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        } else {
+                            Text("送信キーが未設定です。「保存して反映」で割り当てます。").font(.caption)
+                        }
+                        Button("送信キーを再確認") { model.refreshShortcuts() }.font(.caption)
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(4)
+                }
                 Text("保存時に Codex の専用ショートカットを追加します。Codex / ChatGPT が前面のとき、現在のタスクに実行します。").font(.caption).foregroundStyle(.secondary)
                 Button("アクセシビリティ設定を開く") {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
@@ -395,9 +426,10 @@ final class LayoutEditorWindow: NSWindowController, NSWindowDelegate {
 }
 
 extension LayoutEditorWindow {
-    static func render(_ layout: KeyboardLayout, path: String, mode: String = "layout") throws {
+    static func render(_ layout: KeyboardLayout, path: String, mode: String = "layout", codexHome: String = CodexPaths().home) throws {
         _ = NSApplication.shared
         let model = LayoutEditorModel(execute: { _ in "" })
+        model.shortcuts = try ActionShortcutDisplay.read(home: codexHome); model.shortcutError = nil
         model.layout = layout; model.selected = layout.parts.first(where: { $0.kind == .action })?.id ?? layout.parts.first?.id; model.loaded = true; model.message = "パーツを選び、ドラッグで移動できます"
         if mode == "services" { model.selected = layout.parts.first { $0.kind == .source }?.id }
         let content: AnyView

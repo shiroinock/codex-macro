@@ -135,6 +135,25 @@ struct CodexKeyboardShortcut {
     }
 }
 
+struct ActionShortcutDisplay: Codable {
+    let accelerator: String
+    let dedicated: Bool
+    var label: String {
+        let symbols = ["cmdorctrl": "⌘", "commandorcontrol": "⌘", "command": "⌘", "cmd": "⌘", "meta": "⌘", "super": "⌘", "control": "⌃", "ctrl": "⌃", "alt": "⌥", "option": "⌥", "shift": "⇧"]
+        return accelerator.split(separator: "+").map { symbols[$0.lowercased()] ?? String($0).uppercased() }.joined()
+    }
+    static func read(home: String) throws -> [String: Self] {
+        let bindings = try CodexActionBindings(home: home).read()
+        var result: [String: Self] = [:]
+        for action in CodexAction.catalog {
+            guard let shortcut = CodexKeyboardShortcut.forCommand(action.id, bindings: bindings) else { continue }
+            let alias = ActionShortcut.forCommand(action.id, bindings: bindings)
+            result[action.id] = Self(accelerator: shortcut.accelerator, dedicated: alias.map { CodexActionBindings.normalized($0.accelerator) == CodexActionBindings.normalized(shortcut.accelerator) } ?? false)
+        }
+        return result
+    }
+}
+
 struct CodexActionBindings {
     let home: String
     var url: URL { URL(fileURLWithPath: home).appendingPathComponent("keybindings.json") }
