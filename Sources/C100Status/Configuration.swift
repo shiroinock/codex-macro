@@ -31,6 +31,7 @@ struct Configuration: Codable {
     var codexStateDatabase: String?
     var codexSidebarState: String?
     var herdrBinary: String?
+    var herdrRowGrouping: HerdrRowGrouping?
     var defaultLayer: String?
     var socketPath: String?
     var logPath: String?
@@ -40,7 +41,7 @@ struct Configuration: Codable {
         "enabledServices", "schemaVersion", "layoutPath", "backend", "locationID", "claudeConfigDirs",
         "claudeDesktopSessionsDir", "claudeDesktopConfigDir", "codexHome",
         "codexCatalogDatabase", "codexStateDatabase", "codexSidebarState",
-        "herdrBinary", "defaultLayer", "socketPath", "logPath", "grabberSocketPath"
+        "herdrBinary", "herdrRowGrouping", "defaultLayer", "socketPath", "logPath", "grabberSocketPath"
     ]
 
     static func path(_ raw: String, relativeTo base: String, home: String = NSHomeDirectory()) throws -> String {
@@ -151,6 +152,7 @@ extension Options {
         if !providedFlags.contains("--claude-desktop-dir") { claudeDesktopDir = configuration.claudeDesktopSessionsDir ?? ClaudeDesktopCatalog.defaultSessionsDir(homeDirectory: home) }
         if !providedFlags.contains("--claude-desktop-config-dir") { claudeDesktopConfigDir = configuration.claudeDesktopConfigDir ?? home + "/.claude" }
         if !providedFlags.contains("--herdr-bin") { herdrBinaryPath = configuration.herdrBinary ?? environment["HERDR_BIN"] }
+        herdrRowGrouping = configuration.herdrRowGrouping ?? .workspace
         if !providedFlags.contains("--codex-home") { codexHome = configuration.codexHome ?? environment["CODEX_HOME"] ?? home + "/.codex" }
         if !providedFlags.contains("--default-layer") { defaultLayer = SessionSourceKind(rawValue: configuration.defaultLayer ?? configuration.enabledServices?.first?.rawValue ?? "codex")! }
         if !providedFlags.contains("--socket"), let path = configuration.socketPath { socketPath = path }
@@ -177,6 +179,7 @@ extension Options {
         c.locationID = locationID.map { "0x" + String($0, radix: 16) } ?? "auto"
         c.claudeConfigDirs = claudeConfigDirs; c.claudeDesktopSessionsDir = claudeDesktopDir
         c.claudeDesktopConfigDir = claudeDesktopConfigDir; c.herdrBinary = herdrBinaryPath
+        c.herdrRowGrouping = herdrRowGrouping
         c.codexHome = codexPaths.home; c.codexCatalogDatabase = codexPaths.catalogDatabase
         c.codexStateDatabase = codexPaths.stateDatabase; c.codexSidebarState = codexPaths.sidebarState
         c.defaultLayer = defaultLayer.rawValue

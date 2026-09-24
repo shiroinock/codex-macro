@@ -284,15 +284,40 @@ struct HerdrWorkspaceListResponse: Decodable {
 }
 
 struct HerdrWorkspaceEntry: Decodable {
+    /// Present only for workspaces herdr itself opened as a Git worktree
+    /// checkout. herdr's sidebar nests every `is_linked_worktree` workspace
+    /// under the non-linked workspace sharing its `repo_key`; that is the
+    /// only parent/child signal herdr exposes (no explicit parent field).
+    struct Worktree: Decodable {
+        let repoKey: String
+        let isLinkedWorktree: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case repoKey = "repo_key"
+            case isLinkedWorktree = "is_linked_worktree"
+        }
+    }
+
     let workspaceID: String
     let number: Int
     let label: String
+    let worktree: Worktree?
 
     enum CodingKeys: String, CodingKey {
         case workspaceID = "workspace_id"
         case number
         case label
+        case worktree
     }
+}
+
+/// How herdr workspaces map onto grid rows. `workspace` gives every herdr
+/// workspace its own row at its display number; `repository` mirrors
+/// herdr's sidebar tree, folding linked-worktree workspaces into their
+/// parent checkout's row (for a one-session-per-worktree workflow).
+enum HerdrRowGrouping: String, Codable, CaseIterable {
+    case workspace
+    case repository
 }
 
 /// A thread-safe last-known-good snapshot holder. Decoupled from process
@@ -336,11 +361,18 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         let cwd: String
         let workspaceID: String
         let workspaceNumber: Int
+        /// Workspace id whose row this session lands on: its own id, or the
+        /// parent checkout's id under `HerdrRowGrouping.repository`.
+        let rowGroupID: String
+        /// 1-based display position of `rowGroupID`'s row (see
+        /// `rowGroups(for:grouping:)`).
+        let rowNumber: Int
         let paneID: String
         let paneNumber: Int?
-        /// 0-based ordinal among this workspace's Claude sessions, packed by
-        /// on-screen order (tab number, then pane rect y/x, then pane number
-        /// as a last-resort tiebreak) -- see `columnRanks(for:)`. `nil` only
+        /// 0-based ordinal among this row group's Claude sessions, packed by
+        /// on-screen order (member workspace, then tab number, then pane
+        /// rect y/x, then pane number as a last-resort tiebreak) -- see
+        /// `columnRanks(for:)`. `nil` only
         /// if the pane couldn't be placed at all (shouldn't happen in
         /// practice since `parsePaneNumber` covers the final fallback).
         let columnRank: Int?
@@ -355,6 +387,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     private let refreshInterval: TimeInterval
     private let staleGrace: TimeInterval
     private let processTimeout: TimeInterval
+    private let grouping: HerdrRowGrouping
     private let store = HerdrSnapshotStore()
     private let log: (StatusLogger.Level, String) -> Void
 
@@ -367,6 +400,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         refreshInterval: TimeInterval = 2,
         staleGrace: TimeInterval = 15,
         processTimeout: TimeInterval = 2,
+        grouping: HerdrRowGrouping = .workspace,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         log: @escaping (StatusLogger.Level, String) -> Void = { _, _ in }
     ) {
@@ -374,10 +408,11 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         self.refreshInterval = refreshInterval
         self.staleGrace = staleGrace
         self.processTimeout = processTimeout
+        self.grouping = grouping
         self.log = log
         binaryPath = HerdrBinaryResolver.resolve(explicitPath: herdrBinaryPath, environment: environment)
         if let binaryPath {
-            log(.info, "herdr binary=\(binaryPath) polling=enabled interval_s=\(refreshInterval)")
+            log(.info, "herdr binary=\(binaryPath) polling=enabled interval_s=\(refreshInterval) row_grouping=\(grouping.rawValue)")
             startBackgroundRefresh()
         } else {
             log(.info, "herdr binary not found; herdr source disabled (checked --herdr-bin, HERDR_BIN, and PATH candidates)")
@@ -396,9 +431,9 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
                 sourceKind: .claudeHerdr,
                 sessionID: entry.sessionID,
                 cwd: URL(fileURLWithPath: entry.cwd.isEmpty ? "/" : entry.cwd).standardizedFileURL.path,
-                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: entry.workspaceID),
+                rowHints: RowGroupingHints(codexProjectID: nil, herdrWorkspaceID: entry.rowGroupID),
                 recency: recency,
-                rowRank: Self.rowRank(forWorkspaceNumber: entry.workspaceNumber),
+                rowRank: Self.rowRank(forWorkspaceNumber: entry.rowNumber),
                 columnRank: entry.columnRank,
                 seedStatus: entry.seedStatus,
                 navigation: .herdrPane(paneID: entry.paneID)
@@ -420,6 +455,57 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     /// `namedRowLimit`.
     static func rowRank(forWorkspaceNumber number: Int) -> Int {
         number - 1
+    }
+
+    struct RowGroup: Equatable {
+        let groupID: String
+        /// 1-based row position, fed to `rowRank(forWorkspaceNumber:)`.
+        let rowNumber: Int
+        /// Orders member workspaces within the row: the parent checkout
+        /// first, then children by workspace number (herdr's sidebar order).
+        let memberOrder: Int
+    }
+
+    /// Row placement for every workspace. `.workspace` is the identity
+    /// (own row at own number). `.repository` folds each linked worktree
+    /// into the non-linked workspace sharing its `repo_key` -- exactly the
+    /// nesting herdr's sidebar shows -- and renumbers the remaining
+    /// top-level workspaces densely in number order. A linked worktree
+    /// whose parent checkout isn't open in herdr stays top-level, as does
+    /// any workspace without worktree metadata (herdr doesn't nest those
+    /// even when they sit in the same repository).
+    static func rowGroups(for workspaces: [HerdrWorkspaceEntry], grouping: HerdrRowGrouping) -> [String: RowGroup] {
+        guard grouping == .repository else {
+            return Dictionary(uniqueKeysWithValues: workspaces.map {
+                ($0.workspaceID, RowGroup(groupID: $0.workspaceID, rowNumber: $0.number, memberOrder: 0))
+            })
+        }
+        let ordered = workspaces.sorted { ($0.number, $0.workspaceID) < ($1.number, $1.workspaceID) }
+        var parentByRepoKey: [String: String] = [:]
+        for workspace in ordered {
+            guard let worktree = workspace.worktree, !worktree.isLinkedWorktree,
+                  parentByRepoKey[worktree.repoKey] == nil else { continue }
+            parentByRepoKey[worktree.repoKey] = workspace.workspaceID
+        }
+        let groupIDByWorkspace = Dictionary(uniqueKeysWithValues: ordered.map { workspace -> (String, String) in
+            if let worktree = workspace.worktree, worktree.isLinkedWorktree,
+               let parent = parentByRepoKey[worktree.repoKey] {
+                return (workspace.workspaceID, parent)
+            }
+            return (workspace.workspaceID, workspace.workspaceID)
+        })
+        var rowNumberByGroup: [String: Int] = [:]
+        for workspace in ordered where groupIDByWorkspace[workspace.workspaceID] == workspace.workspaceID {
+            rowNumberByGroup[workspace.workspaceID] = rowNumberByGroup.count + 1
+        }
+        return Dictionary(uniqueKeysWithValues: ordered.map { workspace -> (String, RowGroup) in
+            let groupID = groupIDByWorkspace[workspace.workspaceID]!
+            return (workspace.workspaceID, RowGroup(
+                groupID: groupID,
+                rowNumber: rowNumberByGroup[groupID]!,
+                memberOrder: groupID == workspace.workspaceID ? Int.min : workspace.number
+            ))
+        })
     }
 
     static func seedStatus(forHerdrStatus agentStatus: String) -> AgentStatus {
@@ -453,6 +539,10 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         let rectX: Int?
         let rectY: Int?
         let paneNumber: Int?
+        /// Row group the pane packs within; `nil` means its own workspace.
+        var rowGroupID: String? = nil
+        /// Member workspace position within the row group (`RowGroup`).
+        var memberOrder: Int = 0
     }
 
     /// Sort key implementing the spec order: tab display number ascending,
@@ -463,8 +553,9 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     /// `Int.max`, so a pane with no layout/tab data still participates
     /// (falling all the way back to pane-number order) rather than being
     /// dropped.
-    private static func paneOrderingKey(_ pane: PaneOrderingInfo) -> (Int, Int, Int, Int, String) {
+    private static func paneOrderingKey(_ pane: PaneOrderingInfo) -> (Int, Int, Int, Int, Int, String) {
         (
+            pane.memberOrder,
             pane.tabNumber ?? Int.max,
             pane.rectY ?? Int.max,
             pane.rectX ?? Int.max,
@@ -473,14 +564,14 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         )
     }
 
-    /// Packs each workspace's claude panes into a dense `0..<n` column
-    /// ordinal, ordered by `paneOrderingKey`. Grouping by `workspaceID`
-    /// before packing is what closes gaps from closed panes (herdr never
+    /// Packs each row group's (by default: each workspace's) claude panes
+    /// into a dense `0..<n` column ordinal, ordered by `paneOrderingKey`.
+    /// Grouping before packing is what closes gaps from closed panes (herdr never
     /// renumbers panes) without letting one workspace's pane count affect
     /// another's column assignment.
     static func columnRanks(for panes: [PaneOrderingInfo]) -> [String: Int] {
         var result: [String: Int] = [:]
-        let grouped = Dictionary(grouping: panes, by: \.workspaceID)
+        let grouped = Dictionary(grouping: panes) { $0.rowGroupID ?? $0.workspaceID }
         for group in grouped.values {
             let ordered = group.sorted { paneOrderingKey($0) < paneOrderingKey($1) }
             for (index, pane) in ordered.enumerated() {
@@ -503,9 +594,11 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
         panes: [HerdrPaneEntry],
         workspaces: [HerdrWorkspaceEntry],
         tabs: [HerdrTabEntry],
-        layoutByPaneID: [String: (x: Int, y: Int)] = [:]
+        layoutByPaneID: [String: (x: Int, y: Int)] = [:],
+        grouping: HerdrRowGrouping = .workspace
     ) -> [SessionEntry] {
         let workspaceByID = Dictionary(uniqueKeysWithValues: workspaces.map { ($0.workspaceID, $0) })
+        let rowGroupByWorkspace = rowGroups(for: workspaces, grouping: grouping)
         let tabByID = Dictionary(uniqueKeysWithValues: tabs.map { ($0.tabID, $0) })
         let claudePanes = panes.filter { $0.agent == "claude" }
 
@@ -516,19 +609,24 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
                 tabNumber: tabByID[pane.tabID]?.number,
                 rectX: layoutByPaneID[pane.paneID]?.x,
                 rectY: layoutByPaneID[pane.paneID]?.y,
-                paneNumber: parsePaneNumber(pane.paneID)
+                paneNumber: parsePaneNumber(pane.paneID),
+                rowGroupID: rowGroupByWorkspace[pane.workspaceID]?.groupID,
+                memberOrder: rowGroupByWorkspace[pane.workspaceID]?.memberOrder ?? 0
             )
         }
         let columnRanks = Self.columnRanks(for: orderingInfos)
 
         return claudePanes.compactMap { pane -> SessionEntry? in
             guard let session = pane.agentSession else { return nil }
-            guard let workspace = workspaceByID[pane.workspaceID] else { return nil }
+            guard let workspace = workspaceByID[pane.workspaceID],
+                  let rowGroup = rowGroupByWorkspace[pane.workspaceID] else { return nil }
             return SessionEntry(
                 sessionID: session.value,
                 cwd: pane.cwd ?? "",
                 workspaceID: pane.workspaceID,
                 workspaceNumber: workspace.number,
+                rowGroupID: rowGroup.groupID,
+                rowNumber: rowGroup.rowNumber,
                 paneID: pane.paneID,
                 paneNumber: parsePaneNumber(pane.paneID),
                 columnRank: columnRanks[pane.paneID],
@@ -551,6 +649,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     static func fetchOnce(
         binary: String,
         timeout: TimeInterval = 2,
+        grouping: HerdrRowGrouping = .workspace,
         log: (StatusLogger.Level, String) -> Void = { _, _ in }
     ) throws -> [SessionEntry] {
         let workspaceData = try HerdrProcessRunner.run(binary: binary, arguments: ["workspace", "list"], timeout: timeout)
@@ -590,7 +689,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
             }
         }
 
-        return buildSessionEntries(panes: panes, workspaces: workspaces, tabs: tabs, layoutByPaneID: layoutByPaneID)
+        return buildSessionEntries(panes: panes, workspaces: workspaces, tabs: tabs, layoutByPaneID: layoutByPaneID, grouping: grouping)
     }
 
     private func startBackgroundRefresh() {
@@ -608,7 +707,7 @@ final class HerdrCatalog: SessionSourceProvider, @unchecked Sendable {
     private func refreshOnce() {
         guard isEnabled, let binaryPath else { return }
         do {
-            let entries = try Self.fetchOnce(binary: binaryPath, timeout: processTimeout, log: log)
+            let entries = try Self.fetchOnce(binary: binaryPath, timeout: processTimeout, grouping: grouping, log: log)
             store.recordSuccess(entries)
         } catch {
             log(.warning, "herdr sync failed error=\(error)")

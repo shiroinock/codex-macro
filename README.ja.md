@@ -169,8 +169,8 @@ herdr も使う場合、同じ `settings.json` にある `hooks/herdr-agent-stat
 
 `run` の動作中、専用バックグラウンドスレッドが `herdr agent list` と `herdr workspace list` を 2 秒ごとに取得します。10 ms 間隔の HID ポーリングとは独立しているため、herdr の応答が遅くてもキー入力を待たせません。`"agent":"claude"` の項目だけが対象です。
 
-- **行**：workspace の `workspace_id` / `number` を使い、番号順に配置します。
-- **列**：workspace 内でタブ番号、ペインの上→下・左→右、ペイン番号の順に並べ、0 から隙間なく割り当てます。ペイン番号そのものを列番号にはしません。
+- **行**：workspace の `workspace_id` / `number` を使い、番号順に配置します。設定の `herdrRowGrouping` を `"repository"` にすると、herdr のサイドバーのツリーと同じまとめ方になります。herdr の worktree 機能で作った子 workspace（`is_linked_worktree`）は、同じ `repo_key` を持つ親チェックアウトの行にまとめ、行はトップレベルの workspace だけを番号順に詰めて並べます。worktree ごとにセッションを 1 つずつ立てる使い方向けの設定です。
+- **列**：workspace 内でタブ番号、ペインの上→下・左→右、ペイン番号の順に並べ、0 から隙間なく割り当てます。ペイン番号そのものを列番号にはしません。`repository` では親 workspace を先頭に、子 workspace を番号順に続けます。
 - **初期状態**：`agent_status` の `idle` / `working` / `blocked` / `done` / `unknown` を、それぞれ `idle` / `working` / `approval` / `done` / `idle` として扱います。最初のフック以降はフックを優先します。その後フックが届かず、herdr が 2 回連続で `idle` / `done` を返した場合は、取りこぼしからの復旧として herdr の状態を反映します。
 
 herdr の一覧取得が失敗した場合は、最後の正常な結果を 15 秒間保持します。短い障害で画面全体が消えないようにするためです。ペインが閉じるなどして正常な一覧からセッションが消えた場合は、そのキーを直ちに解放します。

@@ -92,7 +92,8 @@ final class StatusDaemon {
         self?.logger.log(level, message)
     }
     private let herdrBinaryPath: String?
-    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath, enabled: enabledSources.contains(.claudeHerdr)) { [weak self] level, message in
+    private let herdrRowGrouping: HerdrRowGrouping
+    private lazy var herdrCatalog = HerdrCatalog(herdrBinaryPath: herdrBinaryPath, enabled: enabledSources.contains(.claudeHerdr), grouping: herdrRowGrouping) { [weak self] level, message in
         self?.logger.log(level, message)
     }
     private let claudeConfigDirs: [String]
@@ -217,6 +218,7 @@ final class StatusDaemon {
         locationID: Int?,
         dryRun: Bool,
         herdrBinaryPath: String? = nil,
+        herdrRowGrouping: HerdrRowGrouping = .workspace,
         claudeConfigDirs: [String]? = nil,
         claudeDesktopDir: String? = nil,
         claudeDesktopConfigDir: String? = nil,
@@ -240,6 +242,7 @@ final class StatusDaemon {
         self.configuredServices = enabledServices
         self.claudeDesktopConfigDir = claudeDesktopConfigDir ?? NSHomeDirectory() + "/.claude"
         self.herdrBinaryPath = herdrBinaryPath
+        self.herdrRowGrouping = herdrRowGrouping
         self.claudeConfigDirs = claudeConfigDirs ?? ClaudeConfigDirs.resolved(additional: [])
         self.claudeDesktopDir = claudeDesktopDir ?? ClaudeDesktopCatalog.defaultSessionsDir()
         logger = try StatusLogger(fileURL: logURL)

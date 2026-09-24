@@ -154,8 +154,8 @@ If you also use herdr, it manages its own `hooks/herdr-agent-state.sh` entries i
 
 While `run` is active, a dedicated background thread polls `herdr agent list` and `herdr workspace list` every two seconds (independent of the daemon's 10 ms HID poll loop, so a slow or hung herdr call never affects key-press responsiveness). Only `"agent":"claude"` entries are tracked. Each herdr-reported session is placed using:
 
-- **Row**: herdr's `workspace_id`/`number` (ascending), within the herdr layer.
-- **Column**: dense position after sorting panes by tab, vertical position, horizontal position, and pane number.
+- **Row**: herdr's `workspace_id`/`number` (ascending), within the herdr layer. With `"herdrRowGrouping": "repository"`, rows mirror herdr's sidebar tree instead: each linked-worktree workspace (`is_linked_worktree`) shares the row of the non-linked checkout with the same `repo_key`, and only top-level workspaces take rows, packed in number order. Meant for one-session-per-worktree workflows.
+- **Column**: dense position after sorting panes by tab, vertical position, horizontal position, and pane number. Under `repository`, the parent workspace comes first, then child workspaces by number.
 - **Initial status**: herdr's `agent_status` (`idle`/`working`/`blocked`/`done`/`unknown` -> `idle`/`working`/`approval`/`done`/`idle`), used only until the session's first Claude Code hook arrives -- after that, hook events are authoritative. If herdr keeps reporting `idle`/`done` for two consecutive polls while no hook has been seen since, the daemon treats the hook as missed and applies herdr's status directly (recovery path).
 
 If `herdr agent list`/`workspace list` fails, the daemon keeps showing the last successful snapshot for 15 seconds before treating herdr as empty (so a brief hiccup doesn't blank the grid). When a pane closes (or herdr stops reporting a session it previously reported), that session's key is released immediately, the same as a Codex session leaving the catalog.

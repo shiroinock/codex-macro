@@ -20,6 +20,7 @@ Setting precedence: explicit CLI flag > JSON field > supported environment varia
 | `codexStateDatabase` | `<codexHome>/state_5.sqlite` |
 | `codexSidebarState` | `<codexHome>/.codex-global-state.json` |
 | `herdrBinary` | `HERDR_BIN`, then absolute `PATH` directories, Homebrew locations, `~/.cargo/bin/herdr` |
+| `herdrRowGrouping` | `workspace` (one row per herdr workspace, at its display number); `repository` folds linked-worktree workspaces into their parent checkout's row, mirroring herdr's sidebar tree |
 | `defaultLayer` | `codex`; alternatives: `claude-herdr`, `claude-terminal`, `claude-desktop`; saved layer selection wins |
 | `socketPath` | `/tmp/keychron-c100-status-<uid>.sock` |
 | `logPath` | `/tmp/keychron-c100-status-<uid>.log` |

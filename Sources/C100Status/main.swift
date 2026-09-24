@@ -35,6 +35,7 @@ struct Options {
     var hookSource = "codex"
     var notificationMatcher: String?
     var herdrBinaryPath: String?
+    var herdrRowGrouping: HerdrRowGrouping = .workspace
     var claudeConfigDirs: [String] = []
     var claudeDesktopDir: String?
     var installClaudeHooksConfigDirs: [String] = []
@@ -209,6 +210,7 @@ enum C100StatusCLI {
                 locationID: options.locationID,
                 dryRun: options.dryRun,
                 herdrBinaryPath: options.herdrBinaryPath,
+                herdrRowGrouping: options.herdrRowGrouping,
                 claudeConfigDirs: options.claudeConfigDirs,
                 claudeDesktopDir: options.claudeDesktopDir,
                 claudeDesktopConfigDir: options.claudeDesktopConfigDir,
@@ -242,11 +244,11 @@ enum C100StatusCLI {
             }
             if let herdrBinary = HerdrBinaryResolver.resolve(explicitPath: options.herdrBinaryPath) {
                 do {
-                    let herdrSessions = try HerdrCatalog.fetchOnce(binary: herdrBinary)
-                    print("herdr sessions (binary=\(herdrBinary)):")
-                    for entry in herdrSessions.sorted(by: { ($0.workspaceNumber, $0.columnRank ?? Int.max) < ($1.workspaceNumber, $1.columnRank ?? Int.max) }) {
+                    let herdrSessions = try HerdrCatalog.fetchOnce(binary: herdrBinary, grouping: options.herdrRowGrouping)
+                    print("herdr sessions (binary=\(herdrBinary) row_grouping=\(options.herdrRowGrouping.rawValue)):")
+                    for entry in herdrSessions.sorted(by: { ($0.rowNumber, $0.columnRank ?? Int.max) < ($1.rowNumber, $1.columnRank ?? Int.max) }) {
                         print(
-                            "  workspace=\(entry.workspaceNumber) col=\(entry.columnRank.map(String.init) ?? "nil") pane=\(entry.paneID) session=\(entry.sessionID) status=\(entry.seedStatus.rawValue) cwd=\(entry.cwd)"
+                            "  row=\(entry.rowNumber) group=\(entry.rowGroupID) workspace=\(entry.workspaceNumber) col=\(entry.columnRank.map(String.init) ?? "nil") pane=\(entry.paneID) session=\(entry.sessionID) status=\(entry.seedStatus.rawValue) cwd=\(entry.cwd)"
                         )
                     }
                     if herdrSessions.isEmpty {
@@ -904,6 +906,49 @@ enum C100StatusCLI {
             throw CLIError.runtime("herdr pane-list/workspace-list/tab-list parse self-test failed (codex agent must be filtered out)")
         }
 
+        // herdr repository row grouping: mirrors herdr's sidebar tree. The
+        // fixture is a live 12-workspace shape -- a non-linked checkout (wE)
+        // with linked worktrees numbered both before (wF) and after (wW) an
+        // unrelated top-level workspace (wT), a same-repo workspace with no
+        // worktree metadata (wA, which herdr keeps top-level), and a linked
+        // worktree whose parent isn't open (wX).
+        let herdrGroupingWorkspacesJSON = #"""
+        {"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+          {"label":"shiro","number":1,"workspace_id":"wB"},
+          {"label":"freee","number":2,"workspace_id":"wA"},
+          {"label":"freee","number":3,"workspace_id":"wE","worktree":{"checkout_path":"/r","is_linked_worktree":false,"repo_key":"/r/.git","repo_name":"r","repo_root":"/r"}},
+          {"label":"HRHDK-320","number":4,"workspace_id":"wF","worktree":{"checkout_path":"/w/320","is_linked_worktree":true,"repo_key":"/r/.git","repo_name":"r","repo_root":"/r"}},
+          {"label":"sandbox","number":5,"workspace_id":"wT"},
+          {"label":"PR-94674","number":6,"workspace_id":"wW","worktree":{"checkout_path":"/w/94674","is_linked_worktree":true,"repo_key":"/r/.git","repo_name":"r","repo_root":"/r"}},
+          {"label":"orphan","number":7,"workspace_id":"wX","worktree":{"checkout_path":"/o/1","is_linked_worktree":true,"repo_key":"/o/.git","repo_name":"o","repo_root":"/o"}}
+        ]}}
+        """#
+        let herdrGroupingWorkspaces = try decoder.decode(HerdrWorkspaceListResponse.self, from: Data(herdrGroupingWorkspacesJSON.utf8)).result.workspaces
+        let herdrGroupingPanes = [("wB", 1), ("wW", 1), ("wF", 1), ("wE", 1), ("wT", 1), ("wX", 1), ("wW", 2)].map { workspaceID, paneNumber in
+            try! decoder.decode(HerdrPaneEntry.self, from: Data(#"{"agent":"claude","agent_session":{"value":"\#(workspaceID)-\#(paneNumber)"},"agent_status":"idle","cwd":"/x","pane_id":"\#(workspaceID):p\#(paneNumber)","tab_id":"\#(workspaceID):t\#(paneNumber)","workspace_id":"\#(workspaceID)"}"#.utf8))
+        }
+        let herdrGroupingTabs = herdrGroupingPanes.map { pane in
+            try! decoder.decode(HerdrTabEntry.self, from: Data(#"{"tab_id":"\#(pane.tabID)","number":\#(HerdrCatalog.parsePaneNumber(pane.paneID)!),"workspace_id":"\#(pane.workspaceID)","pane_count":1}"#.utf8))
+        }
+        let herdrRepositoryEntries = Dictionary(uniqueKeysWithValues: HerdrCatalog.buildSessionEntries(
+            panes: herdrGroupingPanes, workspaces: herdrGroupingWorkspaces, tabs: herdrGroupingTabs, grouping: .repository
+        ).map { ($0.sessionID, "\($0.rowGroupID)/\($0.rowNumber)/\($0.columnRank ?? -1)") })
+        guard herdrRepositoryEntries == [
+            "wB-1": "wB/1/0",
+            "wE-1": "wE/3/0", "wF-1": "wE/3/1", "wW-1": "wE/3/2", "wW-2": "wE/3/3",
+            "wT-1": "wT/4/0",
+            "wX-1": "wX/5/0",
+        ] else {
+            throw CLIError.runtime("herdr repository row grouping self-test failed: \(herdrRepositoryEntries.sorted { $0.key < $1.key })")
+        }
+        let herdrWorkspaceEntries = Dictionary(uniqueKeysWithValues: HerdrCatalog.buildSessionEntries(
+            panes: herdrGroupingPanes, workspaces: herdrGroupingWorkspaces, tabs: herdrGroupingTabs
+        ).map { ($0.sessionID, "\($0.rowGroupID)/\($0.rowNumber)/\($0.columnRank ?? -1)") })
+        guard herdrWorkspaceEntries["wF-1"] == "wF/4/0", herdrWorkspaceEntries["wW-2"] == "wW/6/1",
+              herdrWorkspaceEntries["wX-1"] == "wX/7/0" else {
+            throw CLIError.runtime("herdr workspace row grouping (default) self-test failed: \(herdrWorkspaceEntries.sorted { $0.key < $1.key })")
+        }
+
         // herdr agent_status -> AgentStatus seed mapping (blocked -> approval,
         // unknown -> idle, everything else 1:1).
         let herdrStatusSamples: [(String, AgentStatus)] = [
@@ -1068,6 +1113,8 @@ enum C100StatusCLI {
                 cwd: "/tmp",
                 workspaceID: "w1",
                 workspaceNumber: 1,
+                rowGroupID: "w1",
+                rowNumber: 1,
                 paneID: "w1:p1",
                 paneNumber: 1,
                 columnRank: 0,
