@@ -203,6 +203,30 @@ struct HookInput: Codable {
     }
 }
 
+extension HookInput {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        hookEventName = try container.decode(String.self, forKey: .hookEventName)
+        cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+        turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+        agentID = try container.decodeIfPresent(String.self, forKey: .agentID)
+        agentType = try container.decodeIfPresent(String.self, forKey: .agentType)
+        transcriptPath = try container.decodeIfPresent(String.self, forKey: .transcriptPath)
+        permissionMode = try container.decodeIfPresent(String.self, forKey: .permissionMode)
+        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        // Not `decodeIfPresent(SessionSourceKind.self)`: Claude Code's own
+        // SessionStart payload uses the same `source` key for
+        // startup/resume/clear/compact, which must not fail the whole hook.
+        source = try container.decodeIfPresent(String.self, forKey: .source)
+            .flatMap(SessionSourceKind.init(rawValue:))
+        herdrPaneID = try container.decodeIfPresent(String.self, forKey: .herdrPaneID)
+        herdrWorkspaceID = try container.decodeIfPresent(String.self, forKey: .herdrWorkspaceID)
+        configDir = try container.decodeIfPresent(String.self, forKey: .configDir)
+        notificationMatcher = try container.decodeIfPresent(String.self, forKey: .notificationMatcher)
+    }
+}
+
 struct PendingApproval {
     let hook: HookInput
     let receivedAt: Date
