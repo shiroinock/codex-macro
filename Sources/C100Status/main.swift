@@ -658,6 +658,16 @@ enum C100StatusCLI {
               backCompatInput.notificationMatcher == nil else {
             throw CLIError.runtime("Legacy source-less hook decode self-test failed")
         }
+        for sessionStartSource in ["startup", "resume", "clear", "compact"] {
+            let claudeSessionStart = try decoder.decode(
+                HookInput.self,
+                from: Data(#"{"session_id":"s","cwd":"/tmp","hook_event_name":"SessionStart","source":"SOURCE"}"#
+                    .replacingOccurrences(of: "SOURCE", with: sessionStartSource).utf8)
+            )
+            guard claudeSessionStart.source == nil else {
+                throw CLIError.runtime("Claude SessionStart source=\(sessionStartSource) decode self-test failed")
+            }
+        }
 
         // Claude Code event -> LED status mapping table (M1).
         let claudeMappingSamples: [(event: String, matcher: String?, expected: AgentStatus?)] = [
